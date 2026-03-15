@@ -1,4 +1,22 @@
-/checkpoints
-/training.log
-/models/__pycache__
-/scripts/__pycache__
+# Python Caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Checkpoints and Logs
+checkpoints/
+*.log
+
+# Visualization outputs
+*.png
+visualization_bulge.png
+inference_comparison.png
+
+# Environment files
+.env
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
