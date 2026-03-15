@@ -5,16 +5,16 @@ To develop a machine learning pipeline capable of performing fast, direct point-
 
 ## 2. Input & Output Specifications
 
-### Input (The "Context Pad" Strategy)
+### Input (Edge-to-Edge Prediction)
 *   **Format:** 2D Image Tensor
-*   **Dimensions:** $384 \times 384 \times 1$ (Single-band image chunk).
-*   **Core vs. Context:** The network is tasked with cataloging only the stars whose true centers fall within the central $256 \times 256$ "core". The surrounding 64-pixel border provides the spatial context needed for the Convolutional layers to "see" the diffraction spikes of bright off-image sources without forcing the network to predict them.
+*   **Dimensions:** $256 \times 256 \times 1$ (Single-band image chunk).
+*   **Strategy:** The network performs point source detection across the entire input area. To handle detector-wide catalogs, large images are tiled into $256 \times 256$ chunks with a small overlap (e.g., 16 pixels) to ensure stars on the boundaries are captured correctly.
 *   **Preprocessing:** Minimal to none. Ingest standard Level 2 slope images natively.
 
 ### Output (The Spatial Grid)
 *   **Format:** 4D Tensor
 *   **Dimensions:** $128 \times 128 \times K \times 5$ (where $K=5$ is the max capacity of stars per cell).
-*   **Structure:** The output is a $128 \times 128$ spatial grid. Each cell is responsible for finding stars within a specific $2 \times 2$ pixel region of the core image. With $K=5$, the chunk has a maximum capacity of 81,920 stars.
+*   **Structure:** The output is a $128 \times 128$ spatial grid mapping directly to the $256 \times 256$ input. Each cell is responsible for finding stars within a specific $2 \times 2$ pixel region.
 *   **Slot Values (5):**
     1.  **p:** Probability (Objectness score, $0.0 \to 1.0$)
     2.  **dx:** Sub-pixel offset from the cell's top-left corner ($0.0 \to 2.0$)
@@ -25,9 +25,9 @@ To develop a machine learning pipeline capable of performing fast, direct point-
 ## 3. Neural Network Architecture
 
 ### Stage 1: The Backbone (Feature Extractor)
-A Fully Convolutional Neural Network (CNN) processes the $384 \times 384$ input.
+A Fully Convolutional Neural Network (CNN) processes the $256 \times 256$ input.
 *   **Recommendation:** A standard ResNet-34 or ConvNeXt backbone.
-*   **Output:** A feature map geometrically downsampled by a factor of 2 (instead of 4). Because we only care about the central core, the feature map is centrally cropped to exactly $128 \times 128 \times C$ channels.
+*   **Output:** A feature map geometrically downsampled by a factor of 2. The output dimensions are exactly $128 \times 128 \times C$.
 
 ### Stage 2: The Grid Prediction Head
 The $128 \times 128$ feature map is passed through $1 \times 1$ convolutional layers to map the channel depth directly to the required outputs.
@@ -42,7 +42,7 @@ The $128 \times 128$ feature map is passed through $1 \times 1$ convolutional la
 
 ### Step A: Ground Truth Grid Assignment
 1.  Create a target tensor of zeros: $128 \times 128 \times 5 \times 5$.
-2.  For each real star in the $256 \times 256$ core, calculate which $2 \times 2$ grid cell it falls into.
+2.  For each real star in the $256 \times 256$ chunk, calculate which $2 \times 2$ grid cell it falls into.
 3.  Calculate its local dx, dy offset within that cell.
 4.  Assign this star to the first available $K$-slot in that specific grid cell in the target tensor.
 

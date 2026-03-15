@@ -4,23 +4,21 @@ from torch.utils.data import Dataset
 import matplotlib.pyplot as plt
 
 class GaussianStarDataset(Dataset):
-    def __init__(self, num_samples=1000, min_stars=100, max_stars=1500, image_size=384, core_size=256, max_capacity_per_cell=5):
+    def __init__(self, num_samples=1000, min_stars=100, max_stars=1500, image_size=256, max_capacity_per_cell=5):
         """
         Generates realistic synthetic data for the Roman Bulge Time Domain Survey.
-        Uses a power-law luminosity function and high stellar densities.
+        Edge-to-Edge prediction on 256x256 image with 128x128 grid.
         """
         self.num_samples = num_samples
         self.min_stars = min_stars
         self.max_stars = max_stars
         self.img_size = image_size
-        self.core_size = core_size
         self.K = max_capacity_per_cell
         self.read_noise = 5.0
 
-        # Grid parameters: 2x2 cells for 256x256 core = 128x128 grid
-        self.pad = (self.img_size - self.core_size) // 2  # 64 pixels
-        self.cell_size = 2                                # 2x2 pixels per cell
-        self.grid_size = self.core_size // self.cell_size # 128x128 grid
+        # Grid parameters: 2x2 cells for 256x256 image = 128x128 grid
+        self.cell_size = 2
+        self.grid_size = self.img_size // self.cell_size
 
     def __len__(self):
         return self.num_samples
@@ -30,7 +28,7 @@ class GaussianStarDataset(Dataset):
         return image_tensor, target_tensor
 
     def _add_star_to_image(self, image, x_center, y_center, flux, sigma=1.5):
-        """Adds a 2D Gaussian profile to the image using a local patch for efficiency."""
+        """Adds a 2D Gaussian profile to the image."""
         patch_half_size = int(round(5 * sigma)) 
         ix, iy = int(round(x_center)), int(round(y_center))
         x0, x1 = max(0, ix - patch_half_size), min(self.img_size, ix + patch_half_size + 1)
@@ -42,11 +40,7 @@ class GaussianStarDataset(Dataset):
         image[y0:y1, x0:x1] += patch
 
     def _sample_luminosity_function(self, n_stars, alpha=2.0, f_min=30, f_max=1000):
-        """
-        Samples fluxes from a power-law distribution: dN/df ~ f^-alpha.
-        Typical for stellar populations (Salpeter-like).
-        """
-        # Inverse transform sampling
+        """Samples fluxes from a power-law distribution."""
         u = np.random.uniform(0, 1, n_stars)
         if alpha == 1.0:
             return f_min * np.exp(u * np.log(f_max / f_min))
@@ -54,26 +48,24 @@ class GaussianStarDataset(Dataset):
             return ( (f_max**(1-alpha) - f_min**(1-alpha)) * u + f_min**(1-alpha) )**(1/(1-alpha))
 
     def generate_chunk(self):
-        """Generates a high-density image chunk with realistic LF."""
+        """Generates a 256x256 image chunk."""
         # 1. Background + Noise
         image = np.random.normal(loc=10.0, scale=2.0, size=(self.img_size, self.img_size))
         target_grid = np.zeros((self.grid_size, self.grid_size, self.K, 5), dtype=np.float32)
 
-        # 2. Density: Up to 1500 stars per 384x384 chunk (~60k stars per 4k detector)
         num_stars = np.random.randint(self.min_stars, self.max_stars)
         fluxes = self._sample_luminosity_function(num_stars)
 
         true_catalogue = []
 
         for i in range(num_stars):
-            # Coordinates in core
-            true_x = np.random.uniform(self.pad, self.pad + self.core_size)
-            true_y = np.random.uniform(self.pad, self.pad + self.core_size)
+            # Coordinates anywhere in the image
+            true_x = np.random.uniform(0, self.img_size)
+            true_y = np.random.uniform(0, self.img_size)
             flux = fluxes[i]
 
-            # --- SNR / Completeness ---
+            # SNR / Completeness
             ix, iy = int(true_x), int(true_y)
-            # Clip patch to image bounds
             y_start, y_end = max(0, iy-1), min(self.img_size, iy+2)
             x_start, x_end = max(0, ix-1), min(self.img_size, ix+2)
             local_bg = np.sum(image[y_start:y_end, x_start:x_end])
@@ -81,16 +73,17 @@ class GaussianStarDataset(Dataset):
             snr = flux / np.sqrt(flux + local_bg + self.read_noise**2)
             completeness = float(np.clip((snr - 3.0) / 7.0, 0.0, 1.0))
 
-            # Add star to image (Optimized with local patch)
             self._add_star_to_image(image, true_x, true_y, flux)
             true_catalogue.append((true_x, true_y, flux, completeness))
 
-            # --- Grid Assignment ---
-            core_x, core_y = true_x - self.pad, true_y - self.pad
-            cell_x, cell_y = int(core_x // self.cell_size), int(core_y // self.cell_size)
-            dx, dy = core_x % self.cell_size, core_y % self.cell_size
+            # Grid Assignment
+            cell_x, cell_y = int(true_x // self.cell_size), int(true_y // self.cell_size)
+            # Clip to grid bounds
+            cell_x = min(cell_x, self.grid_size - 1)
+            cell_y = min(cell_y, self.grid_size - 1)
+            
+            dx, dy = true_x % self.cell_size, true_y % self.cell_size
 
-            # Find open slot
             for slot in range(self.K):
                 if target_grid[cell_y, cell_x, slot, 0] == 0.0:
                     target_grid[cell_y, cell_x, slot] = [1.0, dx, dy, flux, completeness]
@@ -111,19 +104,18 @@ class GaussianStarDataset(Dataset):
         im = ax.imshow(img, cmap='inferno', origin='lower', norm=LogNorm())
         fig.colorbar(im, ax=ax, label='Flux')
 
-        # Plot only a sample of stars to keep plot readable
         sample_size = min(200, len(true_catalogue))
         indices = np.random.choice(len(true_catalogue), sample_size, replace=False)
         for idx in indices:
             x, y, flux, comp = true_catalogue[idx]
             ax.plot(x, y, 'g+', markersize=5, alpha=comp)
 
-        ax.set_title(f"Bulge Survey Synthetic Chunk: {len(true_catalogue)} stars\nPower-Law LF (alpha=2.0)")
+        ax.set_title(f"Synthetic Chunk (256x256): {len(true_catalogue)} stars")
         plt.savefig("visualization_bulge.png")
         print(f"Visualization saved to visualization_bulge.png")
 
 if __name__ == "__main__":
-    dataset = GaussianStarDataset(min_stars=800, max_stars=1200)
+    dataset = GaussianStarDataset(min_stars=500, max_stars=1500)
     image, target, catalogue = dataset.generate_chunk()
     print(f"Generated chunk with {len(catalogue)} stars.")
     dataset.visualize_chunk(image, catalogue)

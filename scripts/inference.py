@@ -18,19 +18,14 @@ def run_inference(model_path="checkpoints/dense_grid_final.pth", threshold=0.5):
     
     # 3. Forward Pass
     with torch.no_grad():
-        # Add batch dimension: [1, 1, 384, 384]
         input_tensor = image_tensor.unsqueeze(0).to(device)
         prediction = model(input_tensor).squeeze(0).cpu().numpy() # [128, 128, 5, 5]
     
-    # 4. Post-Processing: Coordinate Reassembly
+    # 4. Post-Processing
     predicted_stars = []
-    
-    # Grid parameters from dataset
-    pad = dataset.pad
     cell_size = dataset.cell_size
     grid_size = dataset.grid_size
     
-    # Iterate through the grid
     for y in range(grid_size):
         for x in range(grid_size):
             for k in range(5):
@@ -38,9 +33,9 @@ def run_inference(model_path="checkpoints/dense_grid_final.pth", threshold=0.5):
                 p, dx, dy, m, c = slot
                 
                 if p > threshold:
-                    # Reconstruct global chunk coordinates
-                    global_x = pad + (x * cell_size) + dx
-                    global_y = pad + (y * cell_size) + dy
+                    # Reconstruct coordinates (no pad)
+                    global_x = (x * cell_size) + dx
+                    global_y = (y * cell_size) + dy
                     predicted_stars.append((global_x, global_y, m, c, p))
 
     print(f"Ground Truth Stars: {len(true_catalogue)}")
@@ -49,28 +44,22 @@ def run_inference(model_path="checkpoints/dense_grid_final.pth", threshold=0.5):
     # 5. Visualization
     from matplotlib.colors import LogNorm
     img = image_tensor.squeeze().numpy()
-    
-    # Fix for LogNorm if background is <= 0
     img_min = img.min()
-    if img_min <= 0:
-        img = img - img_min + 1e-3
+    if img_min <= 0: img = img - img_min + 1e-3
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 10))
     
-    # Plot 1: Ground Truth
     ax1.imshow(img, cmap='inferno', origin='lower', norm=LogNorm())
     ax1.set_title(f"Ground Truth ({len(true_catalogue)} stars)")
     for x, y, m, c in true_catalogue:
         ax1.plot(x, y, 'g+', markersize=10, alpha=0.6)
     
-    # Plot 2: Model Predictions
     ax2.imshow(img, cmap='inferno', origin='lower', norm=LogNorm())
     ax2.set_title(f"Model Predictions ({len(predicted_stars)} stars)")
     for x, y, m, c, p in predicted_stars:
-        # Size/Alpha based on confidence p
         ax2.plot(x, y, 'r+', markersize=10, alpha=min(1.0, p))
 
-    plt.suptitle("Dense Grid Model Inference: Roman Point Source Pipeline (128x128 Grid)", fontsize=16)
+    plt.suptitle("Dense Grid Model Inference: Edge-to-Edge (256x256)", fontsize=16)
     plt.savefig("inference_comparison.png")
     print("Comparison saved to inference_comparison.png")
 

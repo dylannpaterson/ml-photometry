@@ -9,17 +9,15 @@ class DenseGridModel(nn.Module):
         self.K = K
         self.num_output_channels = self.K * 5  # p, dx, dy, m, c
 
-        # Backbone: Using a ResNet-34 as recommended in the design doc
-        # For 128x128 output from 384x384 input, we need downsampling factor of 3, 
-        # but ResNet uses powers of 2. We'll downsample by 2 and then crop.
-        # Input 384x384 -> Stride 2 -> 192x192. Central 128x128 from 192x192.
+        # Backbone: Using a ResNet-34
+        # Input 256x256 -> Stride 2 -> 128x128.
         resnet = models.resnet34(weights=None)
         self.backbone = nn.Sequential(
             nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False),
             resnet.bn1,
             resnet.relu,
-            # resnet.maxpool, # Removing maxpool to keep resolution at stride 2 (192x192)
-            resnet.layer1, # Output stride 2: [B, 64, 192, 192] for 384x384 input
+            # resnet.maxpool, # Removing maxpool to stay at stride 2
+            resnet.layer1, # Output stride 2: [B, 64, 128, 128] for 256x256 input
         )
         
         # Grid Prediction Head
@@ -31,23 +29,19 @@ class DenseGridModel(nn.Module):
 
     def forward(self, x):
         # 1. Feature Extraction (Backbone)
-        # Input: [B, 1, 384, 384] -> Output: [B, 64, 192, 192]
+        # Input: [B, 1, 256, 256] -> Output: [B, 64, 128, 128]
         features = self.backbone(x)
         
-        # 2. Central Crop to 128x128
-        # (192 - 128) / 2 = 32 pixels of padding to remove on each side
-        features_cropped = features[:, :, 32:160, 32:160]
-        
-        # 3. Grid Prediction
+        # 2. Grid Prediction
         # Output: [B, K*5, 128, 128]
-        out = self.head(features_cropped)
+        out = self.head(features)
         
-        # 4. Reshape to [B, 128, 128, K, 5]
+        # 3. Reshape to [B, 128, 128, K, 5]
         B, C, H, W = out.shape
         out = out.view(B, self.K, 5, H, W)
         out = out.permute(0, 3, 4, 1, 2) # [B, 128, 128, K, 5]
         
-        # 5. Apply Activations
+        # 4. Apply Activations
         p = torch.sigmoid(out[..., 0:1])
         dx = torch.sigmoid(out[..., 1:2]) * 2.0 # Cell size is 2.0
         dy = torch.sigmoid(out[..., 2:3]) * 2.0 # Cell size is 2.0
@@ -67,6 +61,9 @@ def compute_loss(pred, target, lambda_prob=1.0, lambda_reg=1.0, alpha=0.25, gamm
     # 1. Focal Loss for Probability (p)
     p_pred = pred[..., 0]
     p_target = target[..., 0]
+    
+    # Clip for stability
+    p_pred = torch.clamp(p_pred, 1e-7, 1.0 - 1e-7)
     
     bce_loss = F.binary_cross_entropy(p_pred, p_target, reduction='none')
     p_t = p_pred * p_target + (1 - p_pred) * (1 - p_target)
@@ -88,7 +85,7 @@ def compute_loss(pred, target, lambda_prob=1.0, lambda_reg=1.0, alpha=0.25, gamm
 
 if __name__ == "__main__":
     model = DenseGridModel()
-    test_input = torch.randn(2, 1, 384, 384)
+    test_input = torch.randn(2, 1, 256, 256)
     output = model(test_input)
     print(f"Model Output Shape: {output.shape}")
     

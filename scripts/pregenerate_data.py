@@ -8,9 +8,8 @@ from scripts.generate_simple_synthetic_data import GaussianStarDataset
 def generate_and_save_sample(args):
     """Worker function to generate a single sample and save it."""
     idx, output_dir, dataset_params = args
-    # Re-instantiate dataset in each worker to avoid seed issues
     dataset = GaussianStarDataset(**dataset_params)
-    image, target = dataset[0] # Get one sample
+    image, target = dataset[0] 
     
     torch.save((image, target), os.path.join(output_dir, f"sample_{idx:05d}.pt"))
 
@@ -37,7 +36,7 @@ class PregeneratedDataset(torch.utils.data.Dataset):
         return torch.load(os.path.join(self.data_dir, self.samples[idx]))
 
 if __name__ == "__main__":
-    # 1. Configuration (Match scripts/train.py)
+    # Match scripts/train.py
     train_dir = "data/train"
     val_dir = "data/val"
     num_train = 5000
@@ -46,13 +45,10 @@ if __name__ == "__main__":
     common_params = {
         "min_stars": 500,
         "max_stars": 1500,
-        "image_size": 384,
-        "core_size": 256,
+        "image_size": 256,
         "max_capacity_per_cell": 5
     }
     
-    # 2. Pregenerate
-    # Use roughly 75% of available CPUs for generation
     num_cpus = os.cpu_count() or 4
     workers = max(1, int(num_cpus * 0.75))
     
