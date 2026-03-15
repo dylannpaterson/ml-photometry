@@ -40,6 +40,11 @@ def evaluate(model_path="checkpoints/dense_grid_final.pth", num_chunks=100, thre
     all_tp, all_fp, all_fn = 0, 0, 0
     pos_errors, flux_errors = [], []
 
+    # Analysis vs Flux
+    flux_bins = [0, 50, 100, 200, 500]
+    flux_tp = [0] * (len(flux_bins) - 1)
+    flux_total = [0] * (len(flux_bins) - 1)
+
     print(f"Evaluating model on {num_chunks} chunks (Edge-to-Edge)...")
 
     for _ in range(num_chunks):
@@ -68,6 +73,16 @@ def evaluate(model_path="checkpoints/dense_grid_final.pth", num_chunks=100, thre
         all_fp += len(unmatched_pred)
         all_fn += len(unmatched_true)
 
+        matched_true_indices = [m[0] for m in matches]
+        for i, star in enumerate(true_catalogue):
+            f = star[2]
+            for b in range(len(flux_bins)-1):
+                if flux_bins[b] <= f < flux_bins[b+1]:
+                    flux_total[b] += 1
+                    if i in matched_true_indices:
+                        flux_tp[b] += 1
+                    break
+
         for t_idx, p_idx, dist in matches:
             pos_errors.append(dist)
             true_flux = true_catalogue[t_idx][2]
@@ -81,8 +96,13 @@ def evaluate(model_path="checkpoints/dense_grid_final.pth", num_chunks=100, thre
     print("\n--- Evaluation Results (Edge-to-Edge) ---")
     print(f"Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
     if pos_errors:
-        print(f"Positional RMSE: {np.sqrt(np.mean(np.array(pos_errors)**2)):.4f} pixels")
+        print(f"Positional RMSE:  {np.sqrt(np.mean(np.array(pos_errors)**2)):.4f} pixels")
         print(f"Flux Relative MAE: {np.mean(np.abs(flux_errors))*100:.2f}%")
+    
+    print("\n--- Recall vs Flux ---")
+    for b in range(len(flux_bins)-1):
+        r = flux_tp[b] / flux_total[b] if flux_total[b] > 0 else 0
+        print(f"Flux {flux_bins[b]:3d}-{flux_bins[b+1]:3d}: {r:.4f} ({flux_tp[b]:5d}/{flux_total[b]:5d})")
 
 if __name__ == "__main__":
     evaluate()
