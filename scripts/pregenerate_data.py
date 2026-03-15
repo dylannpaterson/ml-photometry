@@ -39,8 +39,8 @@ if __name__ == "__main__":
     # Match scripts/train.py
     train_dir = "data/train"
     val_dir = "data/val"
-    num_train = 5000
-    num_val = 500
+    num_train = 25000
+    num_val = 1000
     
     common_params = {
         "min_stars": 500,

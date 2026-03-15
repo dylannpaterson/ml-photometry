@@ -12,7 +12,7 @@ def train():
     # 1. Hyperparameters
     batch_size = 16 
     lr = 1e-4      
-    epochs = 50     
+    epochs = 100     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 

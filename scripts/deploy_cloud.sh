@@ -30,12 +30,38 @@ if [ "$1" == "get-results" ]; then
     echo "🔋 Ensuring VM is started in $ZONE for download..."
     gcloud compute instances start "$INSTANCE_NAME" --zone="$ZONE" --quiet
     
-    echo "🛰️  Downloading results from $ZONE..."
+    echo "⏳ Waiting for SSH service to become available..."
+    # Loop until SSH is ready (up to 60 seconds)
+    for i in {1..12}; do
+        if gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" --command "echo SSH_READY" --quiet &>/dev/null; then
+            echo "✅ SSH is ready."
+            break
+        fi
+        if [ $i -eq 12 ]; then
+            echo "❌ Error: SSH timed out after 60 seconds."
+            exit 1
+        fi
+        echo "..."
+        sleep 5
+    done
+
+    echo "📦 Preparing results on VM..."
+    # Archive on the VM first to make SCP more robust (one single file)
+    gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" << 'EOF'
+        cd ~/ml-photometry
+        tar -czf results_bundle.tar.gz checkpoints/ training_cloud.log
+EOF
+
+    echo "🛰️  Downloading results bundle..."
     mkdir -p checkpoints
-    gcloud compute scp --recurse "$INSTANCE_NAME":~/ml-photometry/checkpoints/* ./checkpoints/ --zone="$ZONE"
-    gcloud compute scp "$INSTANCE_NAME":~/ml-photometry/training_cloud.log ./training_cloud_downloaded.log --zone="$ZONE"
+    gcloud compute scp "$INSTANCE_NAME":~/ml-photometry/results_bundle.tar.gz ./results_bundle.tar.gz --zone="$ZONE"
     
-    echo "✅ Results downloaded to local 'checkpoints/' and 'training_cloud_downloaded.log'."
+    echo "📦 Extracting results locally..."
+    tar -xzf results_bundle.tar.gz
+    cp training_cloud.log training_cloud_downloaded.log
+    rm results_bundle.tar.gz
+    
+    echo "✅ Results updated in local 'checkpoints/' and 'training_cloud_downloaded.log'."
     echo "🔃 Stopping VM to save costs..."
     gcloud compute instances stop "$INSTANCE_NAME" --zone="$ZONE" --quiet
     exit 0
@@ -90,3 +116,4 @@ EOF
 
 echo "--- 🛰️  Workflow Complete! ---"
 echo "Check progress with: gcloud compute ssh $INSTANCE_NAME --zone=$ZONE --command \"tail -f ~/ml-photometry/training_cloud.log\""
+
