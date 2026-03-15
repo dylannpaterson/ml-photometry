@@ -5,6 +5,7 @@ import os
 import time
 
 from scripts.generate_simple_synthetic_data import GaussianStarDataset
+from scripts.pregenerate_data import PregeneratedDataset
 from models.dense_grid_model import DenseGridModel, compute_loss
 
 def train():
@@ -16,9 +17,19 @@ def train():
     print(f"Using device: {device}")
 
     # 2. Data Setup
-    # Bulge Survey settings: high density (up to 1500 stars/chunk)
-    train_dataset = GaussianStarDataset(num_samples=5000, min_stars=500, max_stars=1500)
-    val_dataset = GaussianStarDataset(num_samples=500, min_stars=500, max_stars=1500)
+    # Check for pregenerated data
+    train_dir = "data/train"
+    val_dir = "data/val"
+    
+    if os.path.exists(train_dir) and len(os.listdir(train_dir)) > 0:
+        print(f"Loading PREGENERATED dataset from {train_dir}")
+        train_dataset = PregeneratedDataset(train_dir)
+        val_dataset = PregeneratedDataset(val_dir)
+    else:
+        print("Pregenerated data not found. Falling back to ON-THE-FLY generation.")
+        # Bulge Survey settings: high density (up to 1500 stars/chunk)
+        train_dataset = GaussianStarDataset(num_samples=5000, min_stars=500, max_stars=1500)
+        val_dataset = GaussianStarDataset(num_samples=500, min_stars=500, max_stars=1500)
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
