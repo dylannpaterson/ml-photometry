@@ -7,7 +7,7 @@ echo "--- Starting Cloud Environment Setup ---"
 
 # 1. Update and Install System Dependencies (if any)
 # Vertex AI usually has most of these, but good to be sure
-sudo apt-get update && sudo apt-get install -y htop nvtop
+sudo apt-get update && sudo apt-get install -y htop nvtop screen
 
 # 2. Install Python Dependencies
 echo "Installing Python dependencies..."
