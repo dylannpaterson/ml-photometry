@@ -29,12 +29,17 @@ class GaussianStarDataset(Dataset):
         image_tensor, target_tensor, _ = self.generate_chunk()
         return image_tensor, target_tensor
 
-    def _generate_2d_gaussian(self, x_center, y_center, flux, sigma=1.5):
-        """Generates a 2D Gaussian profile."""
-        x = np.arange(0, self.img_size, 1, float)
-        y = np.arange(0, self.img_size, 1, float)
+    def _add_star_to_image(self, image, x_center, y_center, flux, sigma=1.5):
+        """Adds a 2D Gaussian profile to the image using a local patch for efficiency."""
+        patch_half_size = int(round(5 * sigma)) 
+        ix, iy = int(round(x_center)), int(round(y_center))
+        x0, x1 = max(0, ix - patch_half_size), min(self.img_size, ix + patch_half_size + 1)
+        y0, y1 = max(0, iy - patch_half_size), min(self.img_size, iy + patch_half_size + 1)
+        x = np.arange(x0, x1, 1, float)
+        y = np.arange(y0, y1, 1, float)
         y = y[:, np.newaxis]
-        return flux * np.exp(-((x - x_center)**2 + (y - y_center)**2) / (2 * sigma**2))
+        patch = flux * np.exp(-((x - x_center)**2 + (y - y_center)**2) / (2 * sigma**2))
+        image[y0:y1, x0:x1] += patch
 
     def _sample_luminosity_function(self, n_stars, alpha=2.0, f_min=30, f_max=1000):
         """
@@ -76,8 +81,8 @@ class GaussianStarDataset(Dataset):
             snr = flux / np.sqrt(flux + local_bg + self.read_noise**2)
             completeness = float(np.clip((snr - 3.0) / 7.0, 0.0, 1.0))
 
-            # Add star to image
-            image += self._generate_2d_gaussian(true_x, true_y, flux)
+            # Add star to image (Optimized with local patch)
+            self._add_star_to_image(image, true_x, true_y, flux)
             true_catalogue.append((true_x, true_y, flux, completeness))
 
             # --- Grid Assignment ---
