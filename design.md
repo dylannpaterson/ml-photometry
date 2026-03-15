@@ -64,8 +64,24 @@ The $64 \times 64$ feature map is passed through $1 \times 1$ convolutional laye
     4.  Place this value into the 5th column (c) of the target tensor.
 *   **Strict Augmentation Rules:** Adding synthetic noise and sub-pixel shifting is allowed. No rotations or flips, as this violates the fixed orientation of Roman's diffraction spikes.
 
-## 6. Inference & Post-Processing
-*   **Forward Pass:** Feed the $384 \times 384$ Level 2 image chunk. Extract the $64 \times 64 \times 5 \times 5$ output tensor.
-*   **Confidence Thresholding:** Filter out any prediction where p < 0.5.
-*   **Coordinate Reassembly:** Convert the local cell offsets (dx, dy) back into global chunk coordinates.
-*   **Output Catalog:** The final catalog now natively provides (X, Y, Magnitude, Completeness) for every detected source, allowing you to establish rigorous statistical cutoffs without running external injection-recovery tests.
+## 7. Scaling to Realistic Data (Romanisim Integration)
+
+As the pipeline matures, the synthetic Gaussian sources will be replaced with high-fidelity simulations from `romanisim` to capture the telescope's complex PSF variations, detector effects, and varied backgrounds.
+
+### 7.1 Data Pregeneration Strategy
+To maximize training efficiency, `romanisim` data must be pregenerated and stored on disk. Generating these complex simulations on-the-fly during training is computationally prohibitive.
+*   **Format:** Save chunks as `.npy` or HDF5 files to bypass the overhead of FITS headers during the training loop.
+*   **Target Volume:**
+    *   **Pilot Phase:** 1,000 chunks (for pipeline debugging).
+    *   **Base Phase:** 5,000 chunks (strong baseline for CPU/GPU training).
+    *   **Production Phase:** 15,000 - 20,000 chunks (~15-20 million individual stars). This ensures complete coverage of the PSF variation across all 18 SCAs and the full field of view.
+
+### 7.2 Training Curriculum
+A "Curriculum Learning" approach is recommended to ensure the model converges efficiently:
+1.  **Stage 0 (Gaussian Pre-training):** Train the model on high-density Gaussian sources (the current stage). This allows the network to learn the fundamental geometry of grid assignment and sub-pixel localization on "clean" data.
+2.  **Stage 1 (Ideal PSF Fine-tuning):** Load the Gaussian weights and fine-tune on pregenerated `romanisim` chunks with static PSFs and uniform backgrounds using a reduced learning rate.
+3.  **Stage 2 (Realistic Variation):** Introduce spatially varying PSFs (WFI-wide) and realistic Bulge survey backgrounds.
+4.  **Stage 3 (Detector Effects):** Final fine-tuning on data including cosmic rays, persistence, and non-linearity.
+
+### 7.3 Storage and Memory
+At $384 \times 384$ resolution (float32), a 20,000-chunk dataset requires approximately **8-10 GB** of storage. This footprint is small enough to be cached entirely in System RAM on modern compute nodes, enabling extremely high-throughput data loading.
