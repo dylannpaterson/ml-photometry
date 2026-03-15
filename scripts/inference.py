@@ -13,32 +13,32 @@ def run_inference(model_path="checkpoints/dense_grid_final.pth", threshold=0.5):
     model.eval()
     
     # 2. Generate Test Data
-    dataset = GaussianStarDataset(max_stars_per_chunk=150)
+    dataset = GaussianStarDataset(min_stars=500, max_stars=1500)
     image_tensor, target_tensor, true_catalogue = dataset.generate_chunk()
     
     # 3. Forward Pass
     with torch.no_grad():
         # Add batch dimension: [1, 1, 384, 384]
         input_tensor = image_tensor.unsqueeze(0).to(device)
-        prediction = model(input_tensor).squeeze(0).cpu().numpy() # [64, 64, 5, 5]
+        prediction = model(input_tensor).squeeze(0).cpu().numpy() # [128, 128, 5, 5]
     
-    # 4. Post-Processing: Coordinate Reassembly (Step 6 of Design)
+    # 4. Post-Processing: Coordinate Reassembly
     predicted_stars = []
     
     # Grid parameters from dataset
     pad = dataset.pad
     cell_size = dataset.cell_size
+    grid_size = dataset.grid_size
     
     # Iterate through the grid
-    for y in range(64):
-        for x in range(64):
+    for y in range(grid_size):
+        for x in range(grid_size):
             for k in range(5):
                 slot = prediction[y, x, k]
                 p, dx, dy, m, c = slot
                 
                 if p > threshold:
                     # Reconstruct global chunk coordinates
-                    # Cell (x, y) starts at: pad + (x * cell_size)
                     global_x = pad + (x * cell_size) + dx
                     global_y = pad + (y * cell_size) + dy
                     predicted_stars.append((global_x, global_y, m, c, p))
@@ -70,15 +70,9 @@ def run_inference(model_path="checkpoints/dense_grid_final.pth", threshold=0.5):
         # Size/Alpha based on confidence p
         ax2.plot(x, y, 'r+', markersize=10, alpha=min(1.0, p))
 
-    plt.suptitle("Dense Grid Model Inference: Roman Point Source Pipeline", fontsize=16)
+    plt.suptitle("Dense Grid Model Inference: Roman Point Source Pipeline (128x128 Grid)", fontsize=16)
     plt.savefig("inference_comparison.png")
     print("Comparison saved to inference_comparison.png")
-
-    # Optional: Print first few comparisons
-    print("\nSample Comparisons (First 5 Predictions):")
-    print("X\tY\tMag\tConf")
-    for s in predicted_stars[:5]:
-        print(f"{s[0]:.2f}\t{s[1]:.2f}\t{s[2]:.1f}\t{s[4]:.2f}")
 
 if __name__ == "__main__":
     run_inference()

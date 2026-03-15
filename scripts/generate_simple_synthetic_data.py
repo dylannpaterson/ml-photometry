@@ -17,10 +17,10 @@ class GaussianStarDataset(Dataset):
         self.K = max_capacity_per_cell
         self.read_noise = 5.0
 
-        # Grid parameters
+        # Grid parameters: 2x2 cells for 256x256 core = 128x128 grid
         self.pad = (self.img_size - self.core_size) // 2  # 64 pixels
-        self.grid_size = self.core_size // 4              # 64x64 grid
-        self.cell_size = 4                                # 4x4 pixels per cell
+        self.cell_size = 2                                # 2x2 pixels per cell
+        self.grid_size = self.core_size // self.cell_size # 128x128 grid
 
     def __len__(self):
         return self.num_samples

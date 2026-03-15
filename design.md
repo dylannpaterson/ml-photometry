@@ -13,12 +13,12 @@ To develop a machine learning pipeline capable of performing fast, direct point-
 
 ### Output (The Spatial Grid)
 *   **Format:** 4D Tensor
-*   **Dimensions:** $64 \times 64 \times K \times 5$ (where $K=5$ is the max capacity of stars per cell).
-*   **Structure:** The output is a $64 \times 64$ spatial grid. Each cell is responsible for finding stars within a specific $4 \times 4$ pixel region of the core image. With $K=5$, the chunk has a maximum capacity of 20,480 stars.
+*   **Dimensions:** $128 \times 128 \times K \times 5$ (where $K=5$ is the max capacity of stars per cell).
+*   **Structure:** The output is a $128 \times 128$ spatial grid. Each cell is responsible for finding stars within a specific $2 \times 2$ pixel region of the core image. With $K=5$, the chunk has a maximum capacity of 81,920 stars.
 *   **Slot Values (5):**
     1.  **p:** Probability (Objectness score, $0.0 \to 1.0$)
-    2.  **dx:** Sub-pixel offset from the cell's top-left corner ($0.0 \to 4.0$)
-    3.  **dy:** Sub-pixel offset from the cell's top-left corner ($0.0 \to 4.0$)
+    2.  **dx:** Sub-pixel offset from the cell's top-left corner ($0.0 \to 2.0$)
+    3.  **dy:** Sub-pixel offset from the cell's top-left corner ($0.0 \to 2.0$)
     4.  **m:** Instrumental magnitude or normalized flux
     5.  **c:** Completeness / Recoverability Score ($0.0 \to 1.0$)
 
@@ -27,22 +27,22 @@ To develop a machine learning pipeline capable of performing fast, direct point-
 ### Stage 1: The Backbone (Feature Extractor)
 A Fully Convolutional Neural Network (CNN) processes the $384 \times 384$ input.
 *   **Recommendation:** A standard ResNet-34 or ConvNeXt backbone.
-*   **Output:** A feature map geometrically downsampled by a factor of 4. Because we only care about the central core, the feature map is centrally cropped to exactly $64 \times 64 \times C$ channels.
+*   **Output:** A feature map geometrically downsampled by a factor of 2 (instead of 4). Because we only care about the central core, the feature map is centrally cropped to exactly $128 \times 128 \times C$ channels.
 
 ### Stage 2: The Grid Prediction Head
-The $64 \times 64$ feature map is passed through $1 \times 1$ convolutional layers to map the channel depth directly to the required outputs.
-*   **Output Layer:** A $1 \times 1$ Conv layer outputting $K \times 5$ channels (e.g., 25 channels if $K=5$). The tensor is then reshaped to $64 \times 64 \times 5 \times 5$.
+The $128 \times 128$ feature map is passed through $1 \times 1$ convolutional layers to map the channel depth directly to the required outputs.
+*   **Output Layer:** A $1 \times 1$ Conv layer outputting $K \times 5$ channels (e.g., 25 channels if $K=5$). The tensor is then reshaped to $128 \times 128 \times 5 \times 5$.
 *   **Activations:**
     *   **p (Probability):** Sigmoid (0 to 1).
-    *   **dx, dy (Offsets):** Sigmoid multiplied by 4 (constrains predictions to the local cell).
+    *   **dx, dy (Offsets):** Sigmoid multiplied by 2 (constrains predictions to the local cell).
     *   **m (Magnitude):** Linear or ReLU.
     *   **c (Completeness):** Sigmoid (0 to 1).
 
 ## 4. The Loss Function (Grid Assignment)
 
 ### Step A: Ground Truth Grid Assignment
-1.  Create a target tensor of zeros: $64 \times 64 \times 5 \times 5$.
-2.  For each real star in the $256 \times 256$ core, calculate which $4 \times 4$ grid cell it falls into.
+1.  Create a target tensor of zeros: $128 \times 128 \times 5 \times 5$.
+2.  For each real star in the $256 \times 256$ core, calculate which $2 \times 2$ grid cell it falls into.
 3.  Calculate its local dx, dy offset within that cell.
 4.  Assign this star to the first available $K$-slot in that specific grid cell in the target tensor.
 
@@ -63,6 +63,15 @@ The $64 \times 64$ feature map is passed through $1 \times 1$ convolutional laye
     3.  Map the calculated SNR to a $0.0 \to 1.0$ completeness target score (e.g., clipping at $\text{SNR} < 3 = 0.0$ and saturating at $\text{SNR} > 10 = 1.0$).
     4.  Place this value into the 5th column (c) of the target tensor.
 *   **Strict Augmentation Rules:** Adding synthetic noise and sub-pixel shifting is allowed. No rotations or flips, as this violates the fixed orientation of Roman's diffraction spikes.
+
+## 6. Current Implementation: Cloud Lifecycle
+The current pipeline is optimized for high-throughput training on GCP (L4 GPU) using:
+*   **Pregenerated Datasets:** To eliminate the CPU bottleneck of on-the-fly synthetic data generation, use `scripts/pregenerate_data.py`. This pre-calculates the Gaussian training and validation sets (5,000 and 500 samples respectively) and saves them as `.pt` files.
+*   **Cloud Lifecycle Management:** `scripts/deploy_cloud.sh` manages the full VM lifecycle:
+    1.  **Sync & Setup:** Pulls latest code and installs dependencies.
+    2.  **Auto-Pregen:** Automatically detects if the data directory is empty and runs pre-generation.
+    3.  **Auto-Shutdown:** Launches training and triggers `sudo poweroff` upon completion.
+    4.  **Result Retrieval:** Use `./scripts/deploy_cloud.sh get-results` to automatically start the VM, download models/logs, and shut down.
 
 ## 7. Scaling to Realistic Data (Romanisim Integration)
 

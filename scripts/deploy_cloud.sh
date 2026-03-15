@@ -1,13 +1,28 @@
 #!/bin/bash
 
-# Cloud Deployment Utility for Roman ML Pipeline
+# Cloud Deployment & Lifecycle Utility for Roman ML Pipeline
 # Optimized for Public GitHub Repositories
 
 # --- CONFIGURATION ---
 INSTANCE_NAME="bulge-survey-ml-worker"
-ZONE="us-central1-a" # Change this if you move zones
-REPO_URL="https://github.com/dylannpaterson/ml-photometry.git" # Replace with your actual URL
+ZONE="us-central1-a"
 REMOTE_DIR="ml-photometry"
+
+# --- HELPER: DOWNLOAD RESULTS ---
+if [ "$1" == "get-results" ]; then
+    echo "🔋 Ensuring VM is started for download..."
+    gcloud compute instances start $INSTANCE_NAME --zone=$ZONE --quiet
+    
+    echo "🛰️  Downloading results..."
+    mkdir -p checkpoints
+    gcloud compute scp --recurse $INSTANCE_NAME:~/ml-photometry/checkpoints/* ./checkpoints/ --zone=$ZONE
+    gcloud compute scp $INSTANCE_NAME:~/ml-photometry/training_cloud.log ./training_cloud_downloaded.log --zone=$ZONE
+    
+    echo "✅ Results downloaded to local 'checkpoints/' and 'training_cloud_downloaded.log'."
+    echo "🔃 Stopping VM to save costs..."
+    gcloud compute instances stop $INSTANCE_NAME --zone=$ZONE --quiet
+    exit 0
+fi
 
 echo "--- 🚀 Starting Cloud Workflow ---"
 
@@ -32,7 +47,6 @@ gcloud compute ssh $INSTANCE_NAME --zone=$ZONE --command "
     
     if [ ! -d \"\$TARGET_DIR/.git\" ]; then
         echo '📦 Cloning repository...'
-        # Remove anything that exists but isn't a git repo
         rm -rf \"\$TARGET_DIR\" 
         git clone $REPO_URL \"\$TARGET_DIR\"
     fi
@@ -40,15 +54,14 @@ gcloud compute ssh $INSTANCE_NAME --zone=$ZONE --command "
     cd \"\$TARGET_DIR\"
     echo '📥 Pulling latest changes...'
     git fetch --all
-    git reset --hard origin/main # Force sync to latest main
+    git reset --hard origin/main
 
     echo '⚙️  Running environment setup...'
     chmod +x scripts/cloud_setup.sh
     ./scripts/cloud_setup.sh
 
     # 3. Pregenerate Data (if missing)
-    TARGET_DIR=\$HOME/$REMOTE_DIR
-    if [ ! -d \"\$TARGET_DIR/data/train\" ] || [ -z \"\$(ls -A \$TARGET_DIR/data/train 2>/dev/null)\" ]; then
+    if [ ! -d \"data/train\" ] || [ -z \"\$(ls -A data/train 2>/dev/null)\" ]; then
         echo '📦 Pregenerating synthetic dataset (one-time setup)...'
         export PYTHONPATH=\$PYTHONPATH:.
         python3 scripts/pregenerate_data.py
@@ -56,31 +69,21 @@ gcloud compute ssh $INSTANCE_NAME --zone=$ZONE --command "
         echo '✅ Pregenerated data found. Skipping generation.'
     fi
 
-    echo '🔥 Starting GPU Training...'
+    echo '🔥 Launching training with AUTO-SHUTDOWN...'
     export PYTHONPATH=\$PYTHONPATH:.
     
-    # Kill any existing training runs. 
-    # We use a regex that starts with 'python3' to ensure we don't match this shell script.
-    echo 'Checking for existing training processes...'
+    # Kill any existing training runs
     pkill -f '^python3 .*-m scripts.train' || true
     
-    # Launch in background, fully detached with redirection
-    echo 'Launching nohup process...'
-    nohup python3 -u -m scripts.train > training_cloud.log 2>&1 < /dev/null &
+    # Launch subshell in background: (Run Training -> Poweroff)
+    # Redirecting ALL outputs to log and detaching with nohup
+    nohup bash -c '(python3 -u -m scripts.train && echo \"SUCCESS: Training finished.\" || echo \"FAILURE: Training crashed.\") >> training_cloud.log 2>&1; sudo poweroff' > /dev/null 2>&1 < /dev/null &
     
-    # Give it a moment to start and check if it stayed alive
+    echo '✅ Training successfully launched. VM will power off automatically when done.'
     sleep 3
-    if pgrep -f '^python3 .*-m scripts.train' > /dev/null; then
-        echo '🚀 Training process verified running in background.'
-        echo \"✅ Training successfully launched. PID: \$(pgrep -f '^python3 .*-m scripts.train')\"
-    else
-        echo '❌ Error: Training process failed to start or died immediately.'
-        echo '--- Last 10 lines of training_cloud.log ---'
-        tail -n 10 training_cloud.log
-        exit 1
-    fi
+    pgrep -f '^python3 .*-m scripts.train' > /dev/null && echo '🚀 Process verified running.' || echo '⚠️ Warning: Process not found after launch.'
 "
 
 echo "--- 🛰️  Workflow Complete! ---"
-echo "Monitor logs with:"
-echo "gcloud compute ssh $INSTANCE_NAME --zone=$ZONE --command 'tail -f ~/ml-photometry/training_cloud.log'"
+echo "To check logs: gcloud compute ssh $INSTANCE_NAME --zone=$ZONE --command 'tail -f ~/ml-photometry/training_cloud.log'"
+echo "To collect results later: ./scripts/deploy_cloud.sh get-results"
