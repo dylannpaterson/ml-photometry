@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from scipy.optimize import linear_sum_assignment
-from src.data.synthetic import GaussianSyntheticProvider
+from src.data.stage0_gaussian import GaussianPretrainingProvider
 
 def match_stars(true_stars, pred_stars, dist_threshold=2.0):
     if not true_stars or not pred_stars:
@@ -33,7 +33,7 @@ class Evaluator:
         self.model = model
         self.device = device
         self.config = config
-        self.dataset = GaussianSyntheticProvider(
+        self.dataset = GaussianPretrainingProvider(
             min_stars=config["data_params"]["min_stars"],
             max_stars=config["data_params"]["max_stars"],
             image_size=config["data_params"]["image_size"]
