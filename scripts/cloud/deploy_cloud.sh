@@ -7,6 +7,7 @@
 INSTANCE_NAME="bulge-survey-ml-worker"
 ZONES=("asia-east1-a" "us-central1-c" "us-central1-a")
 REPO_URL="https://github.com/dylannpaterson/ml-photometry.git"
+BRANCH="refactor-for-future-steps"
 
 # Stage index (defaults to 0: Gaussian Pre-training)
 STAGE=${2:-0}
@@ -75,10 +76,12 @@ if [ "$1" == "start" ]; then
 
     gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" << EOF
         cd ~/ml-photometry
-        git fetch --all && git reset --hard origin/main
+        git fetch --all
+        git checkout $BRANCH
+        git reset --hard origin/$BRANCH
         
-        chmod +x scripts/cloud_setup.sh
-        ./scripts/cloud_setup.sh
+        chmod +x scripts/cloud/cloud_setup.sh
+        ./scripts/cloud/cloud_setup.sh
         
         export PYTHONPATH=\$PYTHONPATH:.
         
