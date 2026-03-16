@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Cloud Curriculum Deployer for Roman ML Pipeline
-# Usage: ./scripts/deploy_cloud.sh [get-results | start] [stage_index]
+# Usage: ./scripts/deploy_cloud.sh [get-results | start | get-zone] [stage_index]
 
 # --- CONFIGURATION ---
 INSTANCE_NAME="bulge-survey-ml-worker"
@@ -22,6 +22,11 @@ get_current_zone() {
     done
     return 1
 }
+
+if [ "$1" == "get-zone" ]; then
+    get_current_zone
+    exit 0
+fi
 
 # --- HELPER: DOWNLOAD RESULTS ---
 if [ "$1" == "get-results" ]; then
@@ -91,7 +96,7 @@ if [ "$1" == "start" ]; then
         
         # 2. Launch Training for this specific stage
         echo "Launching Training for Stage $STAGE..."
-        pkill -f 'scripts.run_stage' || true
+        pkill -9 -f 'scripts.run_stage' || true
         nohup bash -c "python3 -u -m scripts.run_stage $STAGE train >> training_cloud.log 2>&1" < /dev/null &
         disown
         
@@ -102,4 +107,4 @@ EOF
     exit 0
 fi
 
-echo "Usage: ./scripts/deploy_cloud.sh [get-results | start] [stage_index]"
+echo "Usage: ./scripts/deploy_cloud.sh [get-results | start | get-zone] [stage_index]"
