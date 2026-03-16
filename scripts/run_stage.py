@@ -55,9 +55,16 @@ def run_train(stage_idx, config, device):
     
     # Custom Trainer Setup
     stage_prefix = f"stage{stage_idx}"
-    trainer = Trainer(model, train_loader, val_loader, config, device, checkpoint_prefix=stage_prefix)
-    trainer.epochs = stage_cfg["epochs"]
-    trainer.lr = stage_cfg["learning_rate"]
+    trainer = Trainer(
+        model, 
+        train_loader, 
+        val_loader, 
+        config, 
+        device, 
+        epochs=stage_cfg["epochs"],
+        lr=stage_cfg["learning_rate"],
+        checkpoint_prefix=stage_prefix
+    )
     
     if stage_cfg.get("resume_from_last_stage", False) and stage_idx > 0:
         last_stage_model = f"checkpoints/stage{stage_idx-1}_final.pth"

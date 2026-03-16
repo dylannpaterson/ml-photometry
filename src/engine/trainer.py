@@ -28,17 +28,15 @@ def find_latest_checkpoint(checkpoint_dir="checkpoints", prefix="stage0"):
     return latest_file, latest_epoch
 
 class Trainer:
-    def __init__(self, model, train_loader, val_loader, config, device, checkpoint_prefix="stage0"):
+    def __init__(self, model, train_loader, val_loader, config, device, epochs=100, lr=0.0001, checkpoint_prefix="stage0"):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.config = config
         self.device = device
         self.checkpoint_prefix = checkpoint_prefix
-        
-        hyper_cfg = config["training_hyperparams"]
-        self.epochs = hyper_cfg["epochs"]
-        self.lr = hyper_cfg["learning_rate"]
+        self.epochs = epochs
+        self.lr = lr
         
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
         self.start_epoch = 0
