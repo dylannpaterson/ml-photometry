@@ -1,6 +1,6 @@
 run_config:
   resume_from_checkpoint: false
-  force_regenerate_data: false 
+  force_regenerate_data: false
 
 training_hyperparams:
   epochs: 100
