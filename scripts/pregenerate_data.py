@@ -13,8 +13,19 @@ def generate_and_save_sample(args):
     
     torch.save((image, target), os.path.join(output_dir, f"sample_{idx:05d}.pt"))
 
-def pregenerate_dataset(num_samples, output_dir, dataset_params, num_workers=4):
+from scripts.config_utils import load_config
+import shutil
+
+def pregenerate_dataset(num_samples, output_dir, dataset_params, num_workers=4, force_regenerate=False):
     """Parallel pre-generation of the dataset."""
+    if force_regenerate and os.path.exists(output_dir):
+        print(f"Force regenerate: Deleting existing directory {output_dir}")
+        shutil.rmtree(output_dir)
+        
+    if os.path.exists(output_dir) and len(os.listdir(output_dir)) > 0:
+        print(f"Directory {output_dir} already exists and is not empty. Skipping pre-generation.")
+        return
+
     os.makedirs(output_dir, exist_ok=True)
     print(f"Pregenerating {num_samples} samples into {output_dir}...")
     
@@ -23,36 +34,30 @@ def pregenerate_dataset(num_samples, output_dir, dataset_params, num_workers=4):
     with Pool(num_workers) as p:
         list(tqdm(p.imap(generate_and_save_sample, tasks), total=num_samples))
 
-class PregeneratedDataset(torch.utils.data.Dataset):
-    """PyTorch Dataset that loads samples from pre-generated .pt files."""
-    def __init__(self, data_dir):
-        self.data_dir = data_dir
-        self.samples = sorted([f for f in os.listdir(data_dir) if f.endswith('.pt')])
-        
-    def __len__(self):
-        return len(self.samples)
-        
-    def __getitem__(self, idx):
-        return torch.load(os.path.join(self.data_dir, self.samples[idx]))
-
 if __name__ == "__main__":
-    # Match scripts/train.py
+    config = load_config()
+    
+    run_cfg = config["run_config"]
+    data_cfg = config["data_params"]
+    
     train_dir = "data/train"
     val_dir = "data/val"
-    num_train = 25000
-    num_val = 1000
+    num_train = data_cfg["num_train_samples"]
+    num_val = data_cfg["num_val_samples"]
     
     common_params = {
-        "min_stars": 500,
-        "max_stars": 1500,
-        "image_size": 256,
-        "max_capacity_per_cell": 5
+        "min_stars": data_cfg["min_stars"],
+        "max_stars": data_cfg["max_stars"],
+        "image_size": data_cfg["image_size"],
+        "max_capacity_per_cell": data_cfg["max_capacity_per_cell"]
     }
     
     num_cpus = os.cpu_count() or 4
     workers = max(1, int(num_cpus * 0.75))
     
-    pregenerate_dataset(num_train, train_dir, common_params, num_workers=workers)
-    pregenerate_dataset(num_val, val_dir, common_params, num_workers=workers)
+    force = run_cfg["force_regenerate_data"]
+    
+    pregenerate_dataset(num_train, train_dir, common_params, num_workers=workers, force_regenerate=force)
+    pregenerate_dataset(num_val, val_dir, common_params, num_workers=workers, force_regenerate=force)
     
     print("Dataset pre-generation complete!")

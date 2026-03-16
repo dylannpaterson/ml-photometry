@@ -82,7 +82,11 @@ if [ "$STATUS" != "RUNNING" ]; then
     gcloud compute instances start "$INSTANCE_NAME" --zone="$ZONE" --quiet
 fi
 
-# 2. Remote Command: Sync Code and Launch
+# 2. Sync config.yaml before starting
+echo "🛰️  Syncing config.yaml to VM..."
+gcloud compute scp config.yaml "$INSTANCE_NAME":~/ml-photometry/config.yaml --zone="$ZONE"
+
+# 3. Remote Command: Sync Code and Launch
 echo "🛰️  Connecting to VM in $ZONE and launching training..."
 
 # The << 'EOF' tells SSH to just read the following lines as if you were typing them
@@ -96,11 +100,9 @@ gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" << 'EOF'
     chmod +x scripts/cloud_setup.sh
     source scripts/cloud_setup.sh
     
-    # 3. Pregenerate Data
-    if [ ! -d "data/train" ] || [ -z "$(ls -A data/train 2>/dev/null)" ]; then
-        export PYTHONPATH=$PYTHONPATH:.
-        python3 scripts/pregenerate_data.py
-    fi
+    # 3. Pregenerate Data (Always run, it will check if it needs to regenerate)
+    export PYTHONPATH=$PYTHONPATH:.
+    python3 scripts/pregenerate_data.py
     
     # 4. Clean up old runs and launch!
     pkill -f 'scripts.train' || true
