@@ -1,1 +1,0 @@
-# Roman ML Photometry models package
