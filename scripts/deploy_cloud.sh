@@ -4,7 +4,7 @@
 
 # --- CONFIGURATION ---
 INSTANCE_NAME="bulge-survey-ml-worker"
-ZONES=("us-central1-c" "us-central1-a") # MATCHING YOUR EXACT ORDER
+ZONES=("asia-east1-a" "us-central1-c" "us-central1-a") # MATCHING YOUR EXACT ORDER
 REPO_URL="https://github.com/dylannpaterson/ml-photometry.git"
 REMOTE_DIR="ml-photometry"
 
@@ -82,11 +82,29 @@ if [ "$STATUS" != "RUNNING" ]; then
     gcloud compute instances start "$INSTANCE_NAME" --zone="$ZONE" --quiet
 fi
 
-# 2. Sync config.yaml before starting
+echo "⏳ Waiting for SSH service to become available..."
+for i in {1..12}; do
+    if gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" --command "echo SSH_READY" --quiet &>/dev/null; then
+        echo "✅ SSH is ready."
+        break
+    fi
+    if [ $i -eq 12 ]; then
+        echo "❌ Error: SSH timed out after 60 seconds."
+        exit 1
+    fi
+    echo "..."
+    sleep 5
+done
+
+# 2. Ensure Remote Directory and Sync Code
+echo "🛰️  Ensuring remote directory exists..."
+gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" --command "mkdir -p ~/ml-photometry && [ ! -d ~/ml-photometry/.git ] && git clone $REPO_URL ~/ml-photometry || true"
+
+# 3. Sync config.yaml before starting
 echo "🛰️  Syncing config.yaml to VM..."
 gcloud compute scp config.yaml "$INSTANCE_NAME":~/ml-photometry/config.yaml --zone="$ZONE"
 
-# 3. Remote Command: Sync Code and Launch
+# 4. Remote Command: Sync Code and Launch
 echo "🛰️  Connecting to VM in $ZONE and launching training..."
 
 # The << 'EOF' tells SSH to just read the following lines as if you were typing them
@@ -96,9 +114,9 @@ gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" << 'EOF'
     git fetch --all
     git reset --hard origin/main
     
-    # 2. Setup environment (source it so it persists)
+    # 2. Setup environment (ensure setup script runs)
     chmod +x scripts/cloud_setup.sh
-    source scripts/cloud_setup.sh
+    ./scripts/cloud_setup.sh
     
     # 3. Pregenerate Data (Always run, it will check if it needs to regenerate)
     export PYTHONPATH=$PYTHONPATH:.
@@ -108,8 +126,8 @@ gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" << 'EOF'
     pkill -f 'scripts.train' || true
     export PYTHONPATH=$PYTHONPATH:.
     
-    # Launch in background with auto-shutdown
-    nohup bash -c "(python3 -u -m scripts.train || echo 'TRAINING_CRASHED') >> training_cloud.log 2>&1; sudo poweroff" < /dev/null &
+    # Launch in background (Auto-shutdown REMOVED for debugging)
+    nohup bash -c "(python3 -u -m scripts.train || echo 'TRAINING_CRASHED') >> training_cloud.log 2>&1" < /dev/null &
     disown -h %1
     
     echo "✅ Training launched with auto-shutdown. Closing SSH connection..."
