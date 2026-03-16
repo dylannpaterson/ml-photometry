@@ -91,8 +91,8 @@ if [ "$1" == "start" ]; then
         export PYTHONPATH=\$PYTHONPATH:.
         
         # 1. Pregenerate data for this specific stage (if needed)
-        echo "Checking data for Stage $STAGE..."
-        python3 scripts/pregenerate_data.py $STAGE
+        echo "Checking data for Stage $STAGE (Logging to pregen_cloud.log)..."
+        python3 scripts/pregenerate_data.py $STAGE >> pregen_cloud.log 2>&1
         
         # 2. Launch Training for this specific stage
         echo "Launching Training for Stage $STAGE..."
