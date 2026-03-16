@@ -71,19 +71,24 @@ if [ "$1" == "start" ]; then
         gcloud compute instances start "$INSTANCE_NAME" --zone="$ZONE" --quiet
     fi
 
-    # Sync config
-    echo "🛰️  Syncing config/config.yaml..."
-    gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" --command "mkdir -p ~/ml-photometry/config"
-    gcloud compute scp config/config.yaml "$INSTANCE_NAME":~/ml-photometry/config/config.yaml --zone="$ZONE"
-
-    # Launch Stage
-    echo "🛰️  Connecting and starting Stage $STAGE..."
-
+    # 1. Connect and Reset Repo to $BRANCH
+    echo "🛰️  Syncing repository to $BRANCH..."
     gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" << EOF
         cd ~/ml-photometry
         git fetch --all
         git checkout $BRANCH
         git reset --hard origin/$BRANCH
+EOF
+
+    # 2. Sync local config (Overwrites the version from the repo)
+    echo "🛰️  Syncing local config/config.yaml..."
+    gcloud compute scp config/config.yaml "$INSTANCE_NAME":~/ml-photometry/config/config.yaml --zone="$ZONE"
+
+    # 3. Launch Stage
+    echo "🛰️  Connecting and starting Stage $STAGE..."
+
+    gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" << EOF
+        cd ~/ml-photometry
         
         chmod +x scripts/cloud/cloud_setup.sh
         ./scripts/cloud/cloud_setup.sh
@@ -97,7 +102,7 @@ if [ "$1" == "start" ]; then
         # 2. Launch Training for this specific stage
         echo "Launching Training for Stage $STAGE..."
         pkill -9 -f 'scripts.run_stage' || true
-        nohup bash -c "python3 -u -m scripts.run_stage $STAGE train >> training_cloud.log 2>&1" < /dev/null &
+        nohup bash -c "python3 -u -m scripts.run_stage $STAGE train >> training.log 2>&1" < /dev/null &
         disown
         
         echo "✅ Stage $STAGE dispatched. Logs at training_cloud.log"
