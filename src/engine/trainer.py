@@ -43,10 +43,10 @@ class Trainer:
                 images, targets = images.to(self.device), targets.to(self.device)
                 self.optimizer.zero_grad()
                 preds = self.model(images)
-                loss, p_loss, po_loss, f_loss, s_loss, b_loss, tv_loss = compute_grid_loss(preds, targets)
+                loss, p_loss, po_loss, f_loss, s_loss, b_loss = compute_grid_loss(preds, targets)
                 loss.backward(); self.optimizer.step(); epoch_loss += loss.item()
                 if i % 100 == 0:
-                    print(f"Epoch [{epoch+1}/{self.epochs}], Step [{i}/{len(self.train_loader)}], Loss: {loss.item():.4f} (P:{p_loss.item():.4f}, Pos:{po_loss.item():.4f}, F:{f_loss.item():.4f}, S:{s_loss.item():.4f}, B:{b_loss.item():.4f}, TV:{tv_loss.item():.4f})")
+                    print(f"Epoch [{epoch+1}/{self.epochs}], Step [{i}/{len(self.train_loader)}], Loss: {loss.item():.4f} (P:{p_loss.item():.4f}, Pos:{po_loss.item():.4f}, F:{f_loss.item():.4f}, S:{s_loss.item():.4f}, B:{b_loss.item():.4f})")
             print(f"==> Epoch {epoch+1} Complete | Avg Loss: {epoch_loss/len(self.train_loader):.4f} | Time: {time.time()-start_time:.1f}s")
             val_loss = self.validate(); print(f"Validation Loss: {val_loss:.4f}")
             os.makedirs("checkpoints", exist_ok=True)
@@ -59,6 +59,6 @@ class Trainer:
             for images, targets in self.val_loader:
                 images, targets = images.to(self.device), targets.to(self.device)
                 preds = self.model(images)
-                loss, _, _, _, _, _, _ = compute_grid_loss(preds, targets)
+                loss, _, _, _, _, _ = compute_grid_loss(preds, targets)
                 val_loss += loss.item()
         return val_loss / len(self.val_loader)

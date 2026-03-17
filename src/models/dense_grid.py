@@ -55,10 +55,10 @@ class DenseGridModel(nn.Module):
             "background": bg
         }
 
-def compute_grid_loss(preds, targets, lambda_prob=1.0, lambda_pos=5.0, lambda_flux=1.0, lambda_shape=1.0, lambda_bg=0.01, lambda_tv=0.1, alpha=0.25, gamma=2.0):
+def compute_grid_loss(preds, targets, lambda_prob=1.0, lambda_pos=5.0, lambda_flux=1.0, lambda_shape=1.0, lambda_bg=0.01, alpha=0.25, gamma=2.0):
     """
-    Enhanced Loss Function with TV Regularization for the background.
-    - lambda_tv=0.1: Penalizes sharp gradients in the background map to prevent star absorption.
+    Standard Generative Loss without TV regularization (optimized for speed).
+    Maintains positional weighting and faint-star boost.
     """
     star_preds = preds["stars"]
     bg_preds = preds["background"]
@@ -108,18 +108,11 @@ def compute_grid_loss(preds, targets, lambda_prob=1.0, lambda_pos=5.0, lambda_fl
         
     # 3. Background Loss (Global MSE)
     bg_loss = F.mse_loss(bg_preds, bg_targets, reduction='mean')
-    
-    # 4. TV Regularization (Smoothness)
-    # Penalize the difference between adjacent background pixels
-    tv_h = torch.abs(bg_preds[:, 1:, :, :] - bg_preds[:, :-1, :, :]).mean()
-    tv_w = torch.abs(bg_preds[:, :, 1:, :] - bg_preds[:, :, :-1, :]).mean()
-    tv_loss = tv_h + tv_w
         
     total_loss = (lambda_prob * prob_loss + 
                   lambda_pos * pos_loss + 
                   lambda_flux * (flux_loss + comp_loss) + 
                   lambda_shape * shape_loss + 
-                  lambda_bg * bg_loss +
-                  lambda_tv * tv_loss)
+                  lambda_bg * bg_loss)
                   
-    return total_loss, prob_loss, pos_loss, flux_loss, shape_loss, bg_loss, tv_loss
+    return total_loss, prob_loss, pos_loss, flux_loss, shape_loss, bg_loss
