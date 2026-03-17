@@ -29,7 +29,10 @@ class GaussianPretrainingProvider(Dataset):
         return image_tensor, target_tensor
 
     def _add_star_to_image(self, image, x_center, y_center, flux, sigma=1.5):
-        """Adds a 2D Gaussian profile to the image."""
+        """Adds a normalized 2D Gaussian profile to the image."""
+        # Standard normalization constant so 'flux' is total volume
+        norm_const = flux / (2 * np.pi * sigma**2)
+        
         patch_half_size = int(round(5 * sigma)) 
         ix, iy = int(round(x_center)), int(round(y_center))
         x0, x1 = max(0, ix - patch_half_size), min(self.img_size, ix + patch_half_size + 1)
@@ -37,10 +40,11 @@ class GaussianPretrainingProvider(Dataset):
         x = np.arange(x0, x1, 1, float)
         y = np.arange(y0, y1, 1, float)
         y = y[:, np.newaxis]
-        patch = flux * np.exp(-((x - x_center)**2 + (y - y_center)**2) / (2 * sigma**2))
+        
+        patch = norm_const * np.exp(-((x - x_center)**2 + (y - y_center)**2) / (2 * sigma**2))
         image[y0:y1, x0:x1] += patch
 
-    def _sample_luminosity_function(self, n_stars, alpha=2.0, f_min=30, f_max=1000):
+    def _sample_luminosity_function(self, n_stars, alpha=2.0, f_min=30, f_max=10000):
         """Samples fluxes from a power-law distribution."""
         u = np.random.uniform(0, 1, n_stars)
         if alpha == 1.0:
@@ -48,16 +52,15 @@ class GaussianPretrainingProvider(Dataset):
         else:
             return ( (f_max**(1-alpha) - f_min**(1-alpha)) * u + f_min**(1-alpha) )**(1/(1-alpha))
 
-    def _generate_psf_7x7(self, x_center, y_center, sigma=1.5):
-        """Generates a normalized 7x7 local PSF cutout exactly centered in the window."""
-        # 7x7 grid centered on (0,0) relative to the star's integer pixel
+    def _generate_psf_shape(self, sigma=1.5):
+        """Generates a normalized local PSF cutout exactly centered in the window."""
+        # window centered on (0,0)
         half = self.S // 2
-        # Creating a grid from -3 to 3
         x = np.arange(-half, half + 1)
         y = np.arange(-half, half + 1)
         xx, yy = np.meshgrid(x, y)
         
-        # Evaluate relative to 0.0 (the center pixel) instead of the sub-pixel center
+        # Evaluate relative to 0.0 (the center pixel)
         psf = np.exp(-(xx**2 + yy**2) / (2 * sigma**2))
         psf /= (psf.sum() + 1e-9)
         return psf.astype(np.float32).flatten()
@@ -69,7 +72,9 @@ class GaussianPretrainingProvider(Dataset):
         # Base grid: [128, 128, K, 5] (p, dx, dy, m, c)
         base_grid = np.zeros((self.grid_size, self.grid_size, self.K, 5), dtype=np.float32)
         
-        # Sparse shapes list: [[shape_49], ...] and their indices [[y, x, slot], ...]
+        # Pre-calculate the stationary PSF shape once
+        psf_shape = self._generate_psf_shape()
+        
         shapes = []
         indices = []
 
@@ -101,13 +106,43 @@ class GaussianPretrainingProvider(Dataset):
 
             for slot in range(self.K):
                 if base_grid[cell_y, cell_x, slot, 0] == 0.0:
-                    base_grid[cell_y, cell_x, slot] = [1.0, dx, dy, flux, completeness]
+                    # m is now log10(flux)
+                    base_grid[cell_y, cell_x, slot] = [1.0, dx, dy, np.log10(flux + 1e-9), completeness]
                     
                     # Store sparse shape and its mapping
-                    psf_shape = self._generate_psf_7x7(true_x, true_y)
                     shapes.append(psf_shape)
                     indices.append([cell_y, cell_x, slot])
                     break
+
+        # Package as sparse dictionary for efficient storage
+        sparse_target = {
+            "image": torch.tensor(image, dtype=torch.float32).unsqueeze(0),
+            "base_grid": torch.tensor(base_grid, dtype=torch.float32),
+            "shapes": torch.tensor(np.array(shapes), dtype=torch.float32) if shapes else torch.tensor([]),
+            "indices": torch.tensor(np.array(indices), dtype=torch.long) if indices else torch.tensor([])
+        }
+
+        return sparse_target
+
+    def visualize_chunk(self, image_tensor, true_catalogue, output_path="visualization_bulge.png"):
+        from matplotlib.colors import LogNorm
+        img = image_tensor.squeeze().numpy()
+        img_min = img.min()
+        if img_min <= 0: img = img - img_min + 1e-3
+
+        fig, ax = plt.subplots(figsize=(10, 10))
+        im = ax.imshow(img, cmap='inferno', origin='lower', norm=LogNorm())
+        fig.colorbar(im, ax=ax, label='Flux')
+
+        sample_size = min(200, len(true_catalogue))
+        indices = np.random.choice(len(true_catalogue), sample_size, replace=False)
+        for idx in indices:
+            x, y, flux, comp = true_catalogue[idx]
+            ax.plot(x, y, 'g+', markersize=5, alpha=comp)
+
+        ax.set_title(f"Synthetic Chunk (256x256): {len(true_catalogue)} stars")
+        plt.savefig(output_path)
+        print(f"Visualization saved to {output_path}")
 
         # Package as sparse dictionary for efficient storage
         sparse_target = {
