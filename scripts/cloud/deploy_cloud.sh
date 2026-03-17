@@ -5,7 +5,7 @@
 
 # --- CONFIGURATION ---
 INSTANCE_NAME="bulge-survey-ml-worker"
-ZONES=("asia-east1-a" "us-central1-c" "us-central1-a")
+ZONES=("us-east4-c" "asia-east1-c" "asia-east1-a" "us-central1-c" "us-central1-a")
 REPO_URL="https://github.com/dylannpaterson/ml-photometry.git"
 BRANCH="refactor-for-future-steps"
 
@@ -23,6 +23,29 @@ get_current_zone() {
     return 1
 }
 
+# Function to safely start the instance with retries for resource exhaustion
+safe_start_instance() {
+    local ZONE=$1
+    echo "🔃 Attempting to start instance $INSTANCE_NAME in $ZONE..."
+    while true; do
+        # Capture stderr to check for resource exhaustion
+        ERROR_MSG=$(gcloud compute instances start "$INSTANCE_NAME" --zone="$ZONE" --quiet 2>&1)
+        if [ $? -eq 0 ]; then
+            echo "✅ Instance started successfully."
+            return 0
+        fi
+        
+        echo "$ERROR_MSG"
+        if [[ "$ERROR_MSG" == *"ZONE_RESOURCE_POOL_EXHAUSTED"* ]]; then
+            echo "🕒 Zone resource pool exhausted. Retrying in 60 seconds... (Ctrl+C to cancel)"
+            sleep 60
+        else
+            echo "❌ Failed to start instance due to an unexpected error."
+            return 1
+        fi
+    done
+}
+
 if [ "$1" == "get-zone" ]; then
     get_current_zone
     exit 0
@@ -36,8 +59,8 @@ if [ "$1" == "get-results" ]; then
         exit 1
     fi
     
-    echo "🔋 Starting VM in $ZONE for download..."
-    gcloud compute instances start "$INSTANCE_NAME" --zone="$ZONE" --quiet
+    echo "🔋 Preparing VM in $ZONE for download..."
+    safe_start_instance "$ZONE" || exit 1
     
     echo "⏳ Waiting for SSH..."
     for i in {1..10}; do
@@ -67,13 +90,16 @@ if [ "$1" == "start" ]; then
     # Ensure VM is running
     STATUS=$(gcloud compute instances describe "$INSTANCE_NAME" --zone="$ZONE" --format='get(status)')
     if [ "$STATUS" != "RUNNING" ]; then
-        echo "🔃 Starting instance $INSTANCE_NAME..."
-        gcloud compute instances start "$INSTANCE_NAME" --zone="$ZONE" --quiet
+        safe_start_instance "$ZONE" || exit 1
     fi
 
     # 1. Connect and Reset Repo to $BRANCH
     echo "🛰️  Syncing repository to $BRANCH..."
     gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" << EOF
+        if [ ! -d "~/ml-photometry" ]; then
+            echo "📦 Directory ~/ml-photometry not found. Cloning repository..."
+            git clone $REPO_URL ~/ml-photometry
+        fi
         cd ~/ml-photometry
         git fetch --all
         git checkout $BRANCH

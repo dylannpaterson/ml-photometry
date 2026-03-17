@@ -1,6 +1,6 @@
 run_config:
-  resume_from_checkpoint: false
-  force_regenerate_data: true 
+  resume_from_checkpoint: true
+  force_regenerate_data: false
 
 curriculum:
   # Stage 0: Gaussian Pre-training (The Base Model)
