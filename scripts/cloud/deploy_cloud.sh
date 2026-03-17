@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Cloud Curriculum Deployer for Roman ML Pipeline
-# Usage: ./scripts/deploy_cloud.sh [get-results | start | get-zone] [stage_index]
+# Usage: ./scripts/deploy_cloud.sh [start | get-zone] [stage_index]
 
 # --- CONFIGURATION ---
 INSTANCE_NAME="bulge-survey-ml-worker"
@@ -51,33 +51,6 @@ if [ "$1" == "get-zone" ]; then
     exit 0
 fi
 
-# --- HELPER: DOWNLOAD RESULTS ---
-if [ "$1" == "get-results" ]; then
-    ZONE=$(get_current_zone)
-    if [ -z "$ZONE" ]; then
-        echo "❌ Error: Could not find instance $INSTANCE_NAME."
-        exit 1
-    fi
-    
-    echo "🔋 Preparing VM in $ZONE for download..."
-    safe_start_instance "$ZONE" || exit 1
-    
-    echo "⏳ Waiting for SSH..."
-    for i in {1..10}; do
-        if gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" --command "echo SSH_READY" --quiet &>/dev/null; then break; fi
-        sleep 5
-    done
-
-    echo "📦 Downloading results..."
-    gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" --command "cd ~/ml-photometry && tar -czf results_bundle.tar.gz checkpoints/ training_cloud.log"
-    gcloud compute scp "$INSTANCE_NAME":~/ml-photometry/results_bundle.tar.gz ./results_bundle.tar.gz --zone="$ZONE"
-    tar -xzf results_bundle.tar.gz && rm results_bundle.tar.gz
-    
-    echo "✅ Results updated. Stopping VM..."
-    gcloud compute instances stop "$INSTANCE_NAME" --zone="$ZONE" --quiet
-    exit 0
-fi
-
 if [ "$1" == "start" ]; then
     echo "--- 🚀 Launching Curriculum Stage $STAGE ---"
 
@@ -117,25 +90,27 @@ EOF
         cd ~/ml-photometry
         
         chmod +x scripts/cloud/cloud_setup.sh
-        ./scripts/cloud/cloud_setup.sh
+        ./scripts/cloud/cloud_setup.sh >> setup.log
         
         export PYTHONPATH=\$PYTHONPATH:.
-        
+        export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
         # 1. Pregenerate data for this specific stage (if needed)
         echo "Checking data for Stage $STAGE (Logging to pregen_cloud.log)..."
         python3 scripts/pregenerate_data.py $STAGE >> pregen_cloud.log 2>&1
-        
+
         # 2. Launch Training for this specific stage
         echo "Launching Training for Stage $STAGE..."
         pkill -9 -f 'scripts.run_stage' || true
-        nohup bash -c "python3 -u -m scripts.run_stage $STAGE train >> training.log 2>&1" < /dev/null &
-        disown
-        
-        echo "✅ Stage $STAGE dispatched. Logs at training_cloud.log"
+        nohup python3 -u -m scripts.run_stage $STAGE train >> training.log 2>&1 < /dev/null &
+
+        sleep 2
+        echo "✅ Stage $STAGE dispatched. Logs at training.log"
         exit
 EOF
+
     echo "--- 🛰️  Workflow Dispatched! ---"
     exit 0
 fi
 
-echo "Usage: ./scripts/deploy_cloud.sh [get-results | start | get-zone] [stage_index]"
+echo "Usage: ./scripts/deploy_cloud.sh [start | get-zone] [stage_index]"
