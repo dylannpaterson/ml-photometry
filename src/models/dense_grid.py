@@ -50,7 +50,7 @@ class DenseGridModel(nn.Module):
         
         return torch.cat([p, dx, dy, m, c], dim=-1)
 
-def compute_loss(pred, target, lambda_prob=1.0, lambda_reg=1.0, alpha=0.25, gamma=2.0):
+def compute_grid_loss(pred, target, lambda_prob=1.0, lambda_reg=1.0, alpha=0.25, gamma=2.0):
     """
     Implements Step 4.B: The Masked Loss with Focal Loss for Probability.
     pred, target: [B, 128, 128, 5, 5]
@@ -82,17 +82,3 @@ def compute_loss(pred, target, lambda_prob=1.0, lambda_reg=1.0, alpha=0.25, gamm
         
     total_loss = lambda_prob * prob_loss + lambda_reg * reg_loss
     return total_loss, prob_loss, reg_loss
-
-if __name__ == "__main__":
-    model = DenseGridModel()
-    test_input = torch.randn(2, 1, 256, 256)
-    output = model(test_input)
-    print(f"Model Output Shape: {output.shape}")
-    
-    target = torch.zeros_like(output)
-    # Put a fake star in one slot
-    target[0, 64, 64, 0, 0] = 1.0 
-    target[0, 64, 64, 0, 1:5] = torch.tensor([1.0, 1.0, 100.0, 0.8])
-    
-    total, prob, reg = compute_loss(output, target)
-    print(f"Loss Test - Total: {total.item():.4f}, Prob: {prob.item():.4f}, Reg: {reg.item():.4f}")

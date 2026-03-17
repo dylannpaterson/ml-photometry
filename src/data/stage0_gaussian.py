@@ -3,7 +3,7 @@ import torch
 from torch.utils.data import Dataset
 import matplotlib.pyplot as plt
 
-class GaussianStarDataset(Dataset):
+class GaussianPretrainingProvider(Dataset):
     def __init__(self, num_samples=1000, min_stars=100, max_stars=1500, image_size=256, max_capacity_per_cell=5):
         """
         Generates realistic synthetic data for the Roman Bulge Time Domain Survey.
@@ -94,7 +94,7 @@ class GaussianStarDataset(Dataset):
 
         return image_tensor, target_tensor, true_catalogue
 
-    def visualize_chunk(self, image_tensor, true_catalogue):
+    def visualize_chunk(self, image_tensor, true_catalogue, output_path="visualization_bulge.png"):
         from matplotlib.colors import LogNorm
         img = image_tensor.squeeze().numpy()
         img_min = img.min()
@@ -111,11 +111,5 @@ class GaussianStarDataset(Dataset):
             ax.plot(x, y, 'g+', markersize=5, alpha=comp)
 
         ax.set_title(f"Synthetic Chunk (256x256): {len(true_catalogue)} stars")
-        plt.savefig("visualization_bulge.png")
-        print(f"Visualization saved to visualization_bulge.png")
-
-if __name__ == "__main__":
-    dataset = GaussianStarDataset(min_stars=500, max_stars=1500)
-    image, target, catalogue = dataset.generate_chunk()
-    print(f"Generated chunk with {len(catalogue)} stars.")
-    dataset.visualize_chunk(image, catalogue)
+        plt.savefig(output_path)
+        print(f"Visualization saved to {output_path}")
