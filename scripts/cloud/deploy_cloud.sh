@@ -7,7 +7,7 @@
 INSTANCE_NAME="bulge-survey-ml-worker"
 ZONES=("us-east4-c" "asia-east1-c" "asia-east1-a" "us-central1-c" "us-central1-a")
 REPO_URL="https://github.com/dylannpaterson/ml-photometry.git"
-BRANCH="refactor-for-future-steps"
+BRANCH="add-psf"
 
 # Stage index (defaults to 0: Gaussian Pre-training)
 STAGE=${2:-0}

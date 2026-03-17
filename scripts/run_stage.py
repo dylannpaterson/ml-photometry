@@ -73,8 +73,9 @@ def run_train(stage_idx, config, device):
     val_dataset = PregeneratedDataset(val_dir, K=K, shape_size=S)
     
     batch_size = stage_cfg["batch_size"]
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    num_workers = stage_cfg.get("num_workers", 0)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
     # Model Setup
     model = DenseGridModel(K=K, shape_size=S).to(device)
