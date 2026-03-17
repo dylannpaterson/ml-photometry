@@ -16,7 +16,7 @@ class InferenceEngine:
         
         with torch.no_grad():
             input_tensor = image_tensor.unsqueeze(0).to(self.device)
-            # Output: [1, H/2, W/2, K, 5]
+            # Output: [1, H/2, W/2, K, 54]
             prediction = self.model(input_tensor).squeeze(0).cpu().numpy()
             
         predicted_stars = []
@@ -26,10 +26,13 @@ class InferenceEngine:
         for y in range(grid_h):
             for x in range(grid_w):
                 for k in range(K):
-                    p, dx, dy, m, c = prediction[y, x, k]
+                    # Correctly slice first 5: p, dx, dy, m, c
+                    p, dx, dy, m, c = prediction[y, x, k, :5]
                     if p > threshold:
                         global_x = (x * cell_size) + dx
                         global_y = (y * cell_size) + dy
+                        # Extract shape for potential future use (optional)
+                        # psf_shape = prediction[y, x, k, 5:]
                         predicted_stars.append((global_x, global_y, m, c, p))
                         
         return predicted_stars

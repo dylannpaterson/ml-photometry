@@ -13,14 +13,15 @@ To develop a machine learning pipeline capable of performing fast, direct point-
 
 ### Output (The Spatial Grid)
 *   **Format:** 4D Tensor
-*   **Dimensions:** $128 \times 128 \times K \times 5$ (where $K=5$ is the max capacity of stars per cell).
+*   **Dimensions:** $128 \times 128 \times K \times 54$ (where $K=3$ is the optimized capacity for Bulge densities).
 *   **Structure:** The output is a $128 \times 128$ spatial grid mapping directly to the $256 \times 256$ input. Each cell is responsible for finding stars within a specific $2 \times 2$ pixel region.
-*   **Slot Values (5):**
+*   **Slot Values (54):**
     1.  **p:** Probability (Objectness score, $0.0 \to 1.0$)
     2.  **dx:** Sub-pixel offset from the cell's top-left corner ($0.0 \to 2.0$)
     3.  **dy:** Sub-pixel offset from the cell's top-left corner ($0.0 \to 2.0$)
     4.  **m:** Instrumental magnitude or normalized flux
     5.  **c:** Completeness / Recoverability Score ($0.0 \to 1.0$)
+    6.  **S (Shape):** 7x7 Point Source Profile (49 values). Represents the isolated, field-dependent PSF shape, exactly centered within the 7x7 window to decouple shape estimation from sub-pixel localization.
 
 ## 3. Neural Network Architecture
 
@@ -31,17 +32,18 @@ A Fully Convolutional Neural Network (CNN) processes the $256 \times 256$ input.
 
 ### Stage 2: The Grid Prediction Head
 The $128 \times 128$ feature map is passed through $1 \times 1$ convolutional layers to map the channel depth directly to the required outputs.
-*   **Output Layer:** A $1 \times 1$ Conv layer outputting $K \times 5$ channels (e.g., 25 channels if $K=5$). The tensor is then reshaped to $128 \times 128 \times 5 \times 5$.
+*   **Output Layer:** A $1 \times 1$ Conv layer outputting $K \times 54$ channels (e.g., 162 channels for $K=3$). The tensor is then reshaped to $128 \times 128 \times 3 \times 54$.
 *   **Activations:**
     *   **p (Probability):** Sigmoid (0 to 1).
     *   **dx, dy (Offsets):** Sigmoid multiplied by 2 (constrains predictions to the local cell).
     *   **m (Magnitude):** Linear or ReLU.
     *   **c (Completeness):** Sigmoid (0 to 1).
+    *   **S (Shape):** Softmax over the 49 values per slot. This ensures the predicted profile is normalized (sums to 1.0), forcing the `m` parameter to handle all flux scaling.
 
 ## 4. The Loss Function (Grid Assignment)
 
 ### Step A: Ground Truth Grid Assignment
-1.  Create a target tensor of zeros: $128 \times 128 \times 5 \times 5$.
+1.  Create a target tensor of zeros: $128 \times 128 \times 3 \times 54$.
 2.  For each real star in the $256 \times 256$ chunk, calculate which $2 \times 2$ grid cell it falls into.
 3.  Calculate its local dx, dy offset within that cell.
 4.  Assign this star to the first available $K$-slot in that specific grid cell in the target tensor.
@@ -49,8 +51,9 @@ The $128 \times 128$ feature map is passed through $1 \times 1$ convolutional la
 ### Step B: The Masked Loss
 *   **Probability Loss (Every cell, every slot):** Focal Loss (FL) between predicted p and target p. Focal Loss is used to address the extreme class imbalance between star-filled and empty grid cells, and to force the model to focus on "hard" examples (faint, low-SNR stars).
     $$\text{FL}(p_t) = -\alpha_t (1 - p_t)^\gamma \log(p_t)$$
-*   **Regression Loss (Masked):** Mean Squared Error (MSE) for dx, dy, m, and c. Multiplied by the target p mask so the network is only penalized for coordinate/flux/completeness errors in slots that actually contain a star.
-*   **Total Loss:** $\mathcal{L}_{Total} = \lambda_1 \mathcal{L}_{Focal\_Prob} + \lambda_2 \mathcal{L}_{Masked\_MSE}$
+*   **Regression Loss (Masked):** Mean Squared Error (MSE) for dx, dy, m, and c.
+*   **Shape Loss (Masked):** Mean Squared Error (MSE) between the predicted 7x7 normalized profile and the ground-truth PSF cutout.
+*   **Total Loss:** $\mathcal{L}_{Total} = \lambda_1 \mathcal{L}_{Prob} + \lambda_2 \mathcal{L}_{Reg} + \lambda_3 \mathcal{L}_{Shape}$
 
 ## 5. Training Data Strategy
 *   **Generation:** Synthetic Roman images generated via `romanisim` utilizing spatially varying PSFs.
@@ -65,8 +68,10 @@ The $128 \times 128$ feature map is passed through $1 \times 1$ convolutional la
 *   **Strict Augmentation Rules:** Adding synthetic noise and sub-pixel shifting is allowed. No rotations or flips, as this violates the fixed orientation of Roman's diffraction spikes.
 
 ## 6. Current Implementation: Cloud Lifecycle
-The current pipeline is optimized for high-throughput training on GCP (L4 GPU) using:
-*   **Pregenerated Datasets:** To eliminate the CPU bottleneck of on-the-fly synthetic data generation, use `scripts/pregenerate_data.py`. This pre-calculates the Gaussian training and validation sets (5,000 and 500 samples respectively) and saves them as `.pt` files.
+The current pipeline is optimized for high-throughput training on GCP (T4/L4 GPU) using:
+*   **Pregenerated Datasets:** To eliminate the CPU bottleneck of on-the-fly synthetic data generation, use `scripts/pregenerate_data.py`. 
+*   **Sparse Target Storage:** To handle the increased dimensionality of the 7x7 shape while staying within a **100 GB disk limit**, target tensors are stored sparsely on disk. Each sample consists of the input image, the 5-channel base grid, and a compressed list of the 49-value shapes for active stars only.
+*   **JIT Re-densification:** The `Dataset` class re-densifies the sparse shape data into the full $128 \times 128 \times 3 \times 54$ tensor during the `__getitem__` call. This move minimizes disk space (~65GB total for 25,000 samples) while ensuring minimal CPU overhead during training.
 *   **Cloud Lifecycle Management:** `scripts/deploy_cloud.sh` manages the full VM lifecycle:
     1.  **Sync & Setup:** Pulls latest code and installs dependencies.
     2.  **Auto-Pregen:** Automatically detects if the data directory is empty and runs pre-generation.

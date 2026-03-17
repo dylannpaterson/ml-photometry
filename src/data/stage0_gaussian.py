@@ -4,7 +4,7 @@ from torch.utils.data import Dataset
 import matplotlib.pyplot as plt
 
 class GaussianPretrainingProvider(Dataset):
-    def __init__(self, num_samples=1000, min_stars=100, max_stars=1500, image_size=256, max_capacity_per_cell=5):
+    def __init__(self, num_samples=1000, min_stars=100, max_stars=1500, image_size=256, max_capacity_per_cell=3, shape_size=7):
         """
         Generates realistic synthetic data for the Roman Bulge Time Domain Survey.
         Edge-to-Edge prediction on 256x256 image with 128x128 grid.
@@ -14,6 +14,7 @@ class GaussianPretrainingProvider(Dataset):
         self.max_stars = max_stars
         self.img_size = image_size
         self.K = max_capacity_per_cell
+        self.S = shape_size
         self.read_noise = 5.0
 
         # Grid parameters: 2x2 cells for 256x256 image = 128x128 grid
@@ -47,19 +48,35 @@ class GaussianPretrainingProvider(Dataset):
         else:
             return ( (f_max**(1-alpha) - f_min**(1-alpha)) * u + f_min**(1-alpha) )**(1/(1-alpha))
 
+    def _generate_psf_7x7(self, x_center, y_center, sigma=1.5):
+        """Generates a normalized 7x7 local PSF cutout exactly centered in the window."""
+        # 7x7 grid centered on (0,0) relative to the star's integer pixel
+        half = self.S // 2
+        # Creating a grid from -3 to 3
+        x = np.arange(-half, half + 1)
+        y = np.arange(-half, half + 1)
+        xx, yy = np.meshgrid(x, y)
+        
+        # Evaluate relative to 0.0 (the center pixel) instead of the sub-pixel center
+        psf = np.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+        psf /= (psf.sum() + 1e-9)
+        return psf.astype(np.float32).flatten()
+
     def generate_chunk(self):
-        """Generates a 256x256 image chunk."""
-        # 1. Background + Noise
+        """Generates a sparse 256x256 image chunk and target data."""
         image = np.random.normal(loc=10.0, scale=2.0, size=(self.img_size, self.img_size))
-        target_grid = np.zeros((self.grid_size, self.grid_size, self.K, 5), dtype=np.float32)
+        
+        # Base grid: [128, 128, K, 5] (p, dx, dy, m, c)
+        base_grid = np.zeros((self.grid_size, self.grid_size, self.K, 5), dtype=np.float32)
+        
+        # Sparse shapes list: [[shape_49], ...] and their indices [[y, x, slot], ...]
+        shapes = []
+        indices = []
 
         num_stars = np.random.randint(self.min_stars, self.max_stars)
         fluxes = self._sample_luminosity_function(num_stars)
 
-        true_catalogue = []
-
         for i in range(num_stars):
-            # Coordinates anywhere in the image
             true_x = np.random.uniform(0, self.img_size)
             true_y = np.random.uniform(0, self.img_size)
             flux = fluxes[i]
@@ -74,25 +91,33 @@ class GaussianPretrainingProvider(Dataset):
             completeness = float(np.clip((snr - 3.0) / 7.0, 0.0, 1.0))
 
             self._add_star_to_image(image, true_x, true_y, flux)
-            true_catalogue.append((true_x, true_y, flux, completeness))
-
+            
             # Grid Assignment
             cell_x, cell_y = int(true_x // self.cell_size), int(true_y // self.cell_size)
-            # Clip to grid bounds
             cell_x = min(cell_x, self.grid_size - 1)
             cell_y = min(cell_y, self.grid_size - 1)
             
             dx, dy = true_x % self.cell_size, true_y % self.cell_size
 
             for slot in range(self.K):
-                if target_grid[cell_y, cell_x, slot, 0] == 0.0:
-                    target_grid[cell_y, cell_x, slot] = [1.0, dx, dy, flux, completeness]
+                if base_grid[cell_y, cell_x, slot, 0] == 0.0:
+                    base_grid[cell_y, cell_x, slot] = [1.0, dx, dy, flux, completeness]
+                    
+                    # Store sparse shape and its mapping
+                    psf_shape = self._generate_psf_7x7(true_x, true_y)
+                    shapes.append(psf_shape)
+                    indices.append([cell_y, cell_x, slot])
                     break
 
-        image_tensor = torch.tensor(image, dtype=torch.float32).unsqueeze(0)
-        target_tensor = torch.tensor(target_grid, dtype=torch.float32)
+        # Package as sparse dictionary for efficient storage
+        sparse_target = {
+            "image": torch.tensor(image, dtype=torch.float32).unsqueeze(0),
+            "base_grid": torch.tensor(base_grid, dtype=torch.float32),
+            "shapes": torch.tensor(np.array(shapes), dtype=torch.float32) if shapes else torch.tensor([]),
+            "indices": torch.tensor(np.array(indices), dtype=torch.long) if indices else torch.tensor([])
+        }
 
-        return image_tensor, target_tensor, true_catalogue
+        return sparse_target
 
     def visualize_chunk(self, image_tensor, true_catalogue, output_path="visualization_bulge.png"):
         from matplotlib.colors import LogNorm

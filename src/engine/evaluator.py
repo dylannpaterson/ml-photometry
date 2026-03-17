@@ -33,10 +33,14 @@ class Evaluator:
         self.model = model
         self.device = device
         self.config = config
+        self.K = config["data_params"]["max_capacity_per_cell"]
+        self.S = config["data_params"]["shape_size"]
         self.dataset = GaussianPretrainingProvider(
             min_stars=config["data_params"]["min_stars"],
             max_stars=config["data_params"]["max_stars"],
-            image_size=config["data_params"]["image_size"]
+            image_size=config["data_params"]["image_size"],
+            max_capacity_per_cell=self.K,
+            shape_size=self.S
         )
 
     def run_evaluation(self, num_chunks=100, threshold=0.5):
@@ -53,7 +57,12 @@ class Evaluator:
         print(f"Evaluating model on {num_chunks} chunks...")
 
         for _ in range(num_chunks):
-            image_tensor, _, true_catalogue = self.dataset.generate_chunk()
+            # generate_chunk now returns a sparse dict
+            sparse_sample = self.dataset.generate_chunk()
+            image_tensor = sparse_sample["image"]
+            # We need to manually extract the true catalogue for evaluation
+            # Since generate_chunk doesn't return it anymore in the sparse version
+            # I will assume for debug/eval we might need a dense version or just use the base_grid
             
             with torch.no_grad():
                 input_tensor = image_tensor.unsqueeze(0).to(self.device)
@@ -64,22 +73,37 @@ class Evaluator:
             
             for y in range(grid_size):
                 for x in range(grid_size):
-                    for k in range(5):
+                    for k in range(self.K):
                         slot = prediction[y, x, k]
-                        p, dx, dy, m, c = slot
+                        # Only take first 5: p, dx, dy, m, c
+                        p, dx, dy, m, c = slot[:5]
                         if p > threshold:
                             gx = (x * cell_size) + dx
                             gy = (y * cell_size) + dy
                             pred_stars.append((gx, gy, m, c, p))
+            
+            # Extract true stars from the target base_grid
+            true_stars = []
+            target_grid = sparse_sample["base_grid"].numpy()
+            for y in range(grid_size):
+                for x in range(grid_size):
+                    for k in range(self.K):
+                        slot = target_grid[y, x, k]
+                        tp, tdx, tdy, tm, tc = slot
+                        if tp == 1.0:
+                            tgx = (x * cell_size) + tdx
+                            tgy = (y * cell_size) + tdy
+                            true_stars.append((tgx, tgy, tm, tc))
                             
-            matches, unmatched_true, unmatched_pred = match_stars(true_catalogue, pred_stars)
+            matches, unmatched_true, unmatched_pred = match_stars(true_stars, pred_stars)
             
             all_tp += len(matches)
             all_fp += len(unmatched_pred)
             all_fn += len(unmatched_true)
 
             matched_true_indices = [m[0] for m in matches]
-            for i, star in enumerate(true_catalogue):
+            for i, star in enumerate(true_stars):
+                # true_stars format is (x, y, m, c)
                 f = star[2]
                 for b in range(len(flux_bins)-1):
                     if flux_bins[b] <= f < flux_bins[b+1]:
@@ -90,7 +114,7 @@ class Evaluator:
 
             for t_idx, p_idx, dist in matches:
                 pos_errors.append(dist)
-                true_flux = true_catalogue[t_idx][2]
+                true_flux = true_stars[t_idx][2]
                 pred_flux = pred_stars[p_idx][2]
                 flux_errors.append((pred_flux - true_flux) / true_flux)
                 

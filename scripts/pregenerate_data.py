@@ -11,8 +11,9 @@ def generate_and_save_sample(args):
     """Worker function to generate a single sample and save it."""
     idx, output_dir, dataset_params = args
     provider = GaussianPretrainingProvider(**dataset_params)
-    image, target, _ = provider.generate_chunk()
-    torch.save((image, target), os.path.join(output_dir, f"sample_{idx:05d}.pt"))
+    sparse_data = provider.generate_chunk()
+    # Save the sparse dictionary directly
+    torch.save(sparse_data, os.path.join(output_dir, f"sample_{idx:05d}.pt"))
 
 def pregenerate_dataset(num_samples, output_dir, dataset_params, num_workers=4, force_regenerate=False):
     """Parallel pre-generation of the dataset."""
@@ -54,7 +55,8 @@ def main():
         "min_stars": data_cfg["min_stars"],
         "max_stars": data_cfg["max_stars"],
         "image_size": data_cfg["image_size"],
-        "max_capacity_per_cell": data_cfg["max_capacity_per_cell"]
+        "max_capacity_per_cell": data_cfg["max_capacity_per_cell"],
+        "shape_size": data_cfg.get("shape_size", 7)
     }
     
     num_cpus = os.cpu_count() or 4

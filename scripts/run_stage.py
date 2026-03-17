@@ -33,6 +33,7 @@ def load_stage_model(stage_idx, device):
 def run_train(stage_idx, config, device):
     print(f"--- 🚀 Curriculum Stage {stage_idx}: Training ---")
     stage_cfg = get_stage_config(config, stage_idx)
+    data_cfg = config["data_params"]
     
     # Data Setup
     data_dir = stage_cfg["data_dir"]
@@ -43,15 +44,19 @@ def run_train(stage_idx, config, device):
         print(f"❌ Error: Data not found in {train_dir}. Run 'gen' for stage {stage_idx} first.")
         return
 
-    train_dataset = PregeneratedDataset(train_dir)
-    val_dataset = PregeneratedDataset(val_dir)
+    # Use K and shape_size from config
+    K = data_cfg["max_capacity_per_cell"]
+    S = data_cfg["shape_size"]
+    
+    train_dataset = PregeneratedDataset(train_dir, K=K, shape_size=S)
+    val_dataset = PregeneratedDataset(val_dir, K=K, shape_size=S)
     
     batch_size = stage_cfg["batch_size"]
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     # Model Setup
-    model = DenseGridModel().to(device)
+    model = DenseGridModel(K=K, shape_size=S).to(device)
     
     # Custom Trainer Setup
     stage_prefix = f"stage{stage_idx}"

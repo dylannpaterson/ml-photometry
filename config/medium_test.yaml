@@ -1,0 +1,21 @@
+run_config:
+  resume_from_checkpoint: false
+  force_regenerate_data: true
+
+curriculum:
+  stage0:
+    name: "Medium Test Stage"
+    data_dir: "data/medium_test"
+    epochs: 5
+    batch_size: 4
+    learning_rate: 0.0005
+    resume_from_last_stage: false
+
+data_params:
+  num_train_samples: 100
+  num_val_samples: 20
+  min_stars: 20
+  max_stars: 100
+  image_size: 256
+  max_capacity_per_cell: 3
+  shape_size: 7

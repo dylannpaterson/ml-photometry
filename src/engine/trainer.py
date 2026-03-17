@@ -66,14 +66,14 @@ class Trainer:
                 self.optimizer.zero_grad()
                 preds = self.model(images)
                 
-                loss, p_loss, r_loss = compute_grid_loss(preds, targets)
+                loss, p_loss, r_loss, s_loss = compute_grid_loss(preds, targets)
                 loss.backward()
                 self.optimizer.step()
                 
                 epoch_loss += loss.item()
                 
                 if i % 100 == 0:
-                    print(f"Epoch [{epoch+1}/{self.epochs}], Step [{i}/{len(self.train_loader)}], Loss: {loss.item():.4f}")
+                    print(f"Epoch [{epoch+1}/{self.epochs}], Step [{i}/{len(self.train_loader)}], Loss: {loss.item():.4f} (P:{p_loss.item():.4f}, R:{r_loss.item():.4f}, S:{s_loss.item():.4f})")
 
             avg_loss = epoch_loss / len(self.train_loader)
             duration = time.time() - start_time
@@ -100,6 +100,6 @@ class Trainer:
                 images = images.to(self.device)
                 targets = targets.to(self.device)
                 preds = self.model(images)
-                loss, _, _ = compute_grid_loss(preds, targets)
+                loss, _, _, _ = compute_grid_loss(preds, targets)
                 val_loss += loss.item()
         return val_loss / len(self.val_loader)
