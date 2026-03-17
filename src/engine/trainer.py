@@ -16,14 +16,15 @@ def find_latest_checkpoint(checkpoint_dir="checkpoints", prefix="stage0"):
     latest_epoch = 0
     latest_file = None
     
-    files = os.listdir(checkpoint_dir)
-    for f in files:
-        match = pattern.match(f)
-        if match:
-            epoch = int(match.group(1))
-            if epoch > latest_epoch:
-                latest_epoch = epoch
-                latest_file = os.path.join(checkpoint_dir, f)
+    if os.path.exists(checkpoint_dir):
+        files = os.listdir(checkpoint_dir)
+        for f in files:
+            match = pattern.match(f)
+            if match:
+                epoch = int(match.group(1))
+                if epoch > latest_epoch:
+                    latest_epoch = epoch
+                    latest_file = os.path.join(checkpoint_dir, f)
                 
     return latest_file, latest_epoch
 
@@ -66,14 +67,14 @@ class Trainer:
                 self.optimizer.zero_grad()
                 preds = self.model(images)
                 
-                loss, p_loss, r_loss, s_loss = compute_grid_loss(preds, targets)
+                loss, p_loss, r_loss, s_loss, b_loss = compute_grid_loss(preds, targets)
                 loss.backward()
                 self.optimizer.step()
                 
                 epoch_loss += loss.item()
                 
                 if i % 100 == 0:
-                    print(f"Epoch [{epoch+1}/{self.epochs}], Step [{i}/{len(self.train_loader)}], Loss: {loss.item():.4f} (P:{p_loss.item():.4f}, R:{r_loss.item():.4f}, S:{s_loss.item():.4f})")
+                    print(f"Epoch [{epoch+1}/{self.epochs}], Step [{i}/{len(self.train_loader)}], Loss: {loss.item():.4f} (P:{p_loss.item():.4f}, R:{r_loss.item():.4f}, S:{s_loss.item():.4f}, B:{b_loss.item():.4f})")
 
             avg_loss = epoch_loss / len(self.train_loader)
             duration = time.time() - start_time
@@ -100,6 +101,6 @@ class Trainer:
                 images = images.to(self.device)
                 targets = targets.to(self.device)
                 preds = self.model(images)
-                loss, _, _, _ = compute_grid_loss(preds, targets)
+                loss, _, _, _, _ = compute_grid_loss(preds, targets)
                 val_loss += loss.item()
         return val_loss / len(self.val_loader)

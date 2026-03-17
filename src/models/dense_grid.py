@@ -2,63 +2,77 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
+import numpy as np
 
 class DenseGridModel(nn.Module):
-    def __init__(self, K=3, shape_size=7):
+    def __init__(self, K=3, shape_size=9):
         super(DenseGridModel, self).__init__()
         self.K = K
         self.S2 = shape_size * shape_size
-        self.num_output_channels = self.K * (5 + self.S2)  # p, dx, dy, m, c + 49 pixels
+        self.num_output_channels = self.K * (5 + self.S2) + 1
 
-        # Backbone: Using a ResNet-34
         resnet = models.resnet34(weights=None)
         self.backbone = nn.Sequential(
             nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False),
             resnet.bn1,
             resnet.relu,
-            resnet.layer1, # Output stride 2: [B, 64, 128, 128]
+            resnet.layer1, 
         )
         
-        # Grid Prediction Head
-        # Added a 3x3 layer to give it more "thinking space" for the complex PSF shape
         self.head = nn.Sequential(
             nn.Conv2d(64, 256, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(256, self.num_output_channels, kernel_size=1)
         )
+        
+        # Initialize background bias to ~10.0
+        # The last channel is the background channel
+        with torch.no_grad():
+            self.head[-1].bias[-1].fill_(10.0)
 
     def forward(self, x):
         features = self.backbone(x)
         out = self.head(features)
         
         B, C, H, W = out.shape
-        out = out.view(B, self.K, 5 + self.S2, H, W)
-        out = out.permute(0, 3, 4, 1, 2) # [B, 128, 128, K, 54]
+        star_out = out[:, :-1, :, :]
+        bg_out = out[:, -1:, :, :]
         
-        # 1. Base Activations
-        p = torch.sigmoid(out[..., 0:1])
-        dx = torch.sigmoid(out[..., 1:2]) * 2.0
-        dy = torch.sigmoid(out[..., 2:3]) * 2.0
-        m = out[..., 3:4]
-        c = torch.sigmoid(out[..., 4:5])
+        star_out = star_out.view(B, self.K, 5 + self.S2, H, W)
+        star_out = star_out.permute(0, 3, 4, 1, 2)
         
-        # 2. Shape Activation (Softmax over 49 pixels)
-        # We apply softmax along the channel dimension of the 49 pixels
-        shape_logits = out[..., 5:]
+        p = torch.sigmoid(star_out[..., 0:1])
+        dx = torch.sigmoid(star_out[..., 1:2]) * 2.0
+        dy = torch.sigmoid(star_out[..., 2:3]) * 2.0
+        m = star_out[..., 3:4]
+        c = torch.sigmoid(star_out[..., 4:5])
+        
+        shape_logits = star_out[..., 5:]
         shape = F.softmax(shape_logits, dim=-1)
         
-        return torch.cat([p, dx, dy, m, c, shape], dim=-1)
+        bg = F.relu(bg_out.permute(0, 2, 3, 1))
+        
+        return {
+            "stars": torch.cat([p, dx, dy, m, c, shape], dim=-1),
+            "background": bg
+        }
 
-def compute_grid_loss(pred, target, lambda_prob=1.0, lambda_reg=1.0, lambda_shape=1.0, alpha=0.25, gamma=2.0):
+def compute_grid_loss(preds, targets, lambda_prob=1.0, lambda_reg=1.0, lambda_shape=1.0, lambda_bg=0.01, alpha=0.25, gamma=2.0):
     """
-    Implements Masked Loss with Shape Estimation.
-    pred, target: [B, 128, 128, 3, 54]
+    Implements Masked Loss with Shape Estimation and Background Fit.
+    lambda_bg is set to 0.01 to balance against star parameters.
     """
-    obj_mask = target[..., 0] == 1.0
+    star_preds = preds["stars"]
+    bg_preds = preds["background"]
+    
+    bg_targets = targets[..., 0, -1:]
+    star_targets = targets[..., :-1]
+    
+    obj_mask = star_targets[..., 0] == 1.0
     
     # 1. Focal Loss for Probability (p)
-    p_pred = torch.clamp(pred[..., 0], 1e-7, 1.0 - 1e-7)
-    p_target = target[..., 0]
+    p_pred = torch.clamp(star_preds[..., 0], 1e-7, 1.0 - 1e-7)
+    p_target = star_targets[..., 0]
     
     bce_loss = F.binary_cross_entropy(p_pred, p_target, reduction='none')
     p_t = p_pred * p_target + (1 - p_pred) * (1 - p_target)
@@ -67,19 +81,24 @@ def compute_grid_loss(pred, target, lambda_prob=1.0, lambda_reg=1.0, lambda_shap
     prob_loss = (alpha_t * focal_weight * bce_loss).mean()
     
     # 2. Regression Loss (Masked MSE)
-    # dx, dy, m, c
     if obj_mask.sum() > 0:
-        reg_pred = pred[..., 1:5][obj_mask]
-        reg_target = target[..., 1:5][obj_mask]
+        reg_pred = star_preds[..., 1:5][obj_mask]
+        reg_target = star_targets[..., 1:5][obj_mask]
         reg_loss = F.mse_loss(reg_pred, reg_target, reduction='mean')
         
-        # 3. Shape Loss (Masked MSE)
-        shape_pred = pred[..., 5:][obj_mask]
-        shape_target = target[..., 5:][obj_mask]
+        shape_pred = star_preds[..., 5:][obj_mask]
+        shape_target = star_targets[..., 5:][obj_mask]
         shape_loss = F.mse_loss(shape_pred, shape_target, reduction='mean')
     else:
-        reg_loss = torch.tensor(0.0, device=pred.device)
-        shape_loss = torch.tensor(0.0, device=pred.device)
+        reg_loss = torch.tensor(0.0, device=star_preds.device)
+        shape_loss = torch.tensor(0.0, device=star_preds.device)
         
-    total_loss = lambda_prob * prob_loss + lambda_reg * reg_loss + lambda_shape * shape_loss
-    return total_loss, prob_loss, reg_loss, shape_loss
+    # 3. Background Loss (Global MSE)
+    bg_loss = F.mse_loss(bg_preds, bg_targets, reduction='mean')
+        
+    total_loss = (lambda_prob * prob_loss + 
+                  lambda_reg * reg_loss + 
+                  lambda_shape * shape_loss + 
+                  lambda_bg * bg_loss)
+                  
+    return total_loss, prob_loss, reg_loss, shape_loss, bg_loss

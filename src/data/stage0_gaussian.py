@@ -65,16 +65,35 @@ class GaussianPretrainingProvider(Dataset):
         psf /= (psf.sum() + 1e-9)
         return psf.astype(np.float32).flatten()
 
+    def _generate_polynomial_background(self):
+        """Generates a smoothly varying 2D polynomial background surface."""
+        x = np.linspace(-1, 1, self.img_size)
+        y = np.linspace(-1, 1, self.img_size)
+        xx, yy = np.meshgrid(x, y)
+        
+        # 2nd order coefficients: tilt, bowl, ridge
+        # Baseline bg around 10.0, variation of +/- 5.0
+        c = np.random.uniform(8.0, 12.0) # Offset
+        coeffs = np.random.uniform(-2.0, 2.0, 5) # x, y, x2, y2, xy
+        
+        bg = (coeffs[0]*xx + coeffs[1]*yy + 
+              coeffs[2]*xx**2 + coeffs[3]*yy**2 + 
+              coeffs[4]*xx*yy + c)
+        
+        # Ensure it stays positive
+        return np.maximum(0.1, bg).astype(np.float32)
+
     def generate_chunk(self):
-        """Generates a sparse 256x256 image chunk and target data."""
-        image = np.random.normal(loc=10.0, scale=2.0, size=(self.img_size, self.img_size))
+        """Generates a sparse chunk with a polynomial background."""
+        # 1. Generate Background Surface
+        gt_background = self._generate_polynomial_background()
         
-        # Base grid: [128, 128, K, 5] (p, dx, dy, m, c)
+        # 2. Add Poisson-like Noise (Normal approximation)
+        image = np.random.normal(loc=gt_background, scale=2.0)
+        
+        # 3. Base grid and containers
         base_grid = np.zeros((self.grid_size, self.grid_size, self.K, 5), dtype=np.float32)
-        
-        # Pre-calculate the stationary PSF shape once
         psf_shape = self._generate_psf_shape()
-        
         shapes = []
         indices = []
 
@@ -86,12 +105,8 @@ class GaussianPretrainingProvider(Dataset):
             true_y = np.random.uniform(0, self.img_size)
             flux = fluxes[i]
 
-            # SNR / Completeness
-            ix, iy = int(true_x), int(true_y)
-            y_start, y_end = max(0, iy-1), min(self.img_size, iy+2)
-            x_start, x_end = max(0, ix-1), min(self.img_size, ix+2)
-            local_bg = np.sum(image[y_start:y_end, x_start:x_end])
-
+            # Use local background from surface for SNR
+            local_bg = gt_background[int(true_y), int(true_x)]
             snr = flux / np.sqrt(flux + local_bg + self.read_noise**2)
             completeness = float(np.clip((snr - 3.0) / 7.0, 0.0, 1.0))
 
@@ -101,53 +116,23 @@ class GaussianPretrainingProvider(Dataset):
             cell_x, cell_y = int(true_x // self.cell_size), int(true_y // self.cell_size)
             cell_x = min(cell_x, self.grid_size - 1)
             cell_y = min(cell_y, self.grid_size - 1)
-            
             dx, dy = true_x % self.cell_size, true_y % self.cell_size
 
             for slot in range(self.K):
                 if base_grid[cell_y, cell_x, slot, 0] == 0.0:
-                    # m is now log10(flux)
                     base_grid[cell_y, cell_x, slot] = [1.0, dx, dy, np.log10(flux + 1e-9), completeness]
-                    
-                    # Store sparse shape and its mapping
                     shapes.append(psf_shape)
                     indices.append([cell_y, cell_x, slot])
                     break
 
-        # Package as sparse dictionary for efficient storage
+        # Downsample ground truth background to grid size [128, 128] for target
+        # We take the average of each 2x2 cell
+        bg_grid = gt_background.reshape(self.grid_size, 2, self.grid_size, 2).mean(axis=(1, 3))
+
         sparse_target = {
             "image": torch.tensor(image, dtype=torch.float32).unsqueeze(0),
             "base_grid": torch.tensor(base_grid, dtype=torch.float32),
-            "shapes": torch.tensor(np.array(shapes), dtype=torch.float32) if shapes else torch.tensor([]),
-            "indices": torch.tensor(np.array(indices), dtype=torch.long) if indices else torch.tensor([])
-        }
-
-        return sparse_target
-
-    def visualize_chunk(self, image_tensor, true_catalogue, output_path="visualization_bulge.png"):
-        from matplotlib.colors import LogNorm
-        img = image_tensor.squeeze().numpy()
-        img_min = img.min()
-        if img_min <= 0: img = img - img_min + 1e-3
-
-        fig, ax = plt.subplots(figsize=(10, 10))
-        im = ax.imshow(img, cmap='inferno', origin='lower', norm=LogNorm())
-        fig.colorbar(im, ax=ax, label='Flux')
-
-        sample_size = min(200, len(true_catalogue))
-        indices = np.random.choice(len(true_catalogue), sample_size, replace=False)
-        for idx in indices:
-            x, y, flux, comp = true_catalogue[idx]
-            ax.plot(x, y, 'g+', markersize=5, alpha=comp)
-
-        ax.set_title(f"Synthetic Chunk (256x256): {len(true_catalogue)} stars")
-        plt.savefig(output_path)
-        print(f"Visualization saved to {output_path}")
-
-        # Package as sparse dictionary for efficient storage
-        sparse_target = {
-            "image": torch.tensor(image, dtype=torch.float32).unsqueeze(0),
-            "base_grid": torch.tensor(base_grid, dtype=torch.float32),
+            "background_map": torch.tensor(bg_grid, dtype=torch.float32), # [128, 128]
             "shapes": torch.tensor(np.array(shapes), dtype=torch.float32) if shapes else torch.tensor([]),
             "indices": torch.tensor(np.array(indices), dtype=torch.long) if indices else torch.tensor([])
         }

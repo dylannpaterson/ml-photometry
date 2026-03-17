@@ -135,6 +135,7 @@ def run_infer(stage_idx, config, device, checkpoint=None):
         # generate_chunk now returns a sparse dict
         sparse_sample = provider.generate_chunk()
         image_tensor = sparse_sample["image"]
+        gt_bg_map = sparse_sample["background_map"].numpy()
         
         # Extract true stars from the target base_grid for visualization
         true_stars = []
@@ -152,7 +153,7 @@ def run_infer(stage_idx, config, device, checkpoint=None):
                         # m in target is log10(flux), convert to linear for visualize
                         true_stars.append((tgx, tgy, 10**tm, tc))
         
-        predicted_stars, predicted_shapes = engine.predict(image_tensor)
+        predicted_stars, predicted_shapes, bg_map = engine.predict(image_tensor)
         
         # DEBUG: Print normalization stats
         matches, _, _ = match_stars(true_stars, predicted_stars)
@@ -173,7 +174,7 @@ def run_infer(stage_idx, config, device, checkpoint=None):
         else:
             print("\n--- Normalization Diagnostic: No matches found ---")
             
-        engine.visualize(image_tensor, true_stars, predicted_stars, predicted_shapes, threshold=0.5)
+        engine.visualize(image_tensor, true_stars, predicted_stars, predicted_shapes, bg_map, gt_bg_map, threshold=0.5)
     else:
         print(f"⚠️ Specialized inference for stage {stage_idx} not yet implemented.")
 

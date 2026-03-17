@@ -47,42 +47,38 @@ class Evaluator:
         self.model.eval()
         
         all_tp, all_fp, all_fn = 0, 0, 0
-        pos_errors, flux_errors = [], []
+        pos_errors, ratios, comp_errors = [], [], []
 
         # Analysis vs Flux
-        flux_bins = [0, 50, 100, 200, 500]
+        flux_bins = [0, 50, 100, 200, 500, 1000, 10000]
         flux_tp = [0] * (len(flux_bins) - 1)
         flux_total = [0] * (len(flux_bins) - 1)
 
         print(f"Evaluating model on {num_chunks} chunks...")
 
         for _ in range(num_chunks):
-            # generate_chunk now returns a sparse dict
             sparse_sample = self.dataset.generate_chunk()
             image_tensor = sparse_sample["image"]
-            # We need to manually extract the true catalogue for evaluation
-            # Since generate_chunk doesn't return it anymore in the sparse version
-            # I will assume for debug/eval we might need a dense version or just use the base_grid
             
             with torch.no_grad():
-                input_tensor = image_tensor.unsqueeze(0).to(self.device)
-                prediction = self.model(input_tensor).squeeze(0).cpu().numpy()
+                input_tensor = image_tensor.to(self.device)
+                if input_tensor.dim() == 3:
+                    input_tensor = input_tensor.unsqueeze(0)
+                
+                prediction_dict = self.model(input_tensor)
+                prediction = prediction_dict["stars"].squeeze(0).cpu().numpy()
                 
             pred_stars = []
             cell_size, grid_size = self.dataset.cell_size, self.dataset.grid_size
-            
             for y in range(grid_size):
                 for x in range(grid_size):
                     for k in range(self.K):
-                        slot = prediction[y, x, k]
-                        # Only take first 5: p, dx, dy, m, c
-                        p, dx, dy, m, c = slot[:5]
+                        p, dx, dy, log_m, c = prediction[y, x, k, :5]
                         if p > threshold:
                             gx = (x * cell_size) + dx
                             gy = (y * cell_size) + dy
-                            pred_stars.append((gx, gy, m, c, p))
+                            pred_stars.append((gx, gy, 10**log_m, c, p))
             
-            # Extract true stars from the target base_grid
             true_stars = []
             target_grid = sparse_sample["base_grid"].numpy()
             for y in range(grid_size):
@@ -93,7 +89,7 @@ class Evaluator:
                         if tp == 1.0:
                             tgx = (x * cell_size) + tdx
                             tgy = (y * cell_size) + tdy
-                            true_stars.append((tgx, tgy, tm, tc))
+                            true_stars.append((tgx, tgy, 10**tm, tc))
                             
             matches, unmatched_true, unmatched_pred = match_stars(true_stars, pred_stars)
             
@@ -103,7 +99,6 @@ class Evaluator:
 
             matched_true_indices = [m[0] for m in matches]
             for i, star in enumerate(true_stars):
-                # true_stars format is (x, y, m, c)
                 f = star[2]
                 for b in range(len(flux_bins)-1):
                     if flux_bins[b] <= f < flux_bins[b+1]:
@@ -114,33 +109,51 @@ class Evaluator:
 
             for t_idx, p_idx, dist in matches:
                 pos_errors.append(dist)
-                true_flux = true_stars[t_idx][2]
-                pred_flux = pred_stars[p_idx][2]
-                flux_errors.append((pred_flux - true_flux) / true_flux)
+                t_flux = true_stars[t_idx][2]
+                p_flux = pred_stars[p_idx][2]
+                t_comp = true_stars[t_idx][3]
+                p_comp = pred_stars[p_idx][3]
+                
+                ratios.append(p_flux / t_flux)
+                comp_errors.append(abs(p_comp - t_comp))
                 
         precision = all_tp / (all_tp + all_fp) if (all_tp + all_fp) > 0 else 0
         recall = all_tp / (all_tp + all_fn) if (all_tp + all_fn) > 0 else 0
-        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
         
-        results = {
+        mean_ratio = np.mean(ratios) if ratios else 0
+        std_ratio = np.std(ratios) if ratios else 0
+        comp_mae = np.mean(comp_errors) if comp_errors else 1.0
+        pos_rmse = np.sqrt(np.mean(np.array(pos_errors)**2)) if pos_errors else 1.0
+        
+        print("\n" + "="*45)
+        print(" STAGE 0 ACCEPTANCE CRITERIA CHECK")
+        print("="*45)
+        
+        def check(val, target, label, higher_is_better=True):
+            status = "✅" if (val >= target if higher_is_better else val <= target) else "❌"
+            print(f"{status} {label:22}: {val:8.4f} (Target: {target:8.4f})")
+            return val >= target if higher_is_better else val <= target
+
+        results_ok = [
+            check(recall, 0.95, "Recall (All Sources)"),
+            check(precision, 0.98, "Precision"),
+            check(pos_rmse, 0.15, "Positional RMSE", higher_is_better=False),
+            check(1.0 - abs(1.0 - mean_ratio), 0.95, "Flux Ratio Accuracy"),
+            check(std_ratio, 0.10, "Flux Scatter (StdDev)", higher_is_better=False),
+            check(comp_mae, 0.10, "Completeness MAE", higher_is_better=False)
+        ]
+        
+        if all(results_ok):
+            print("\n🎉 MODEL IS READY FOR STAGE 1 (REAL PSF)!")
+        else:
+            print("\n⚠️ MODEL NEEDS MORE TRAINING OR CALIBRATION.")
+        print("="*45)
+            
+        return {
             "precision": precision,
             "recall": recall,
-            "f1": f1,
-            "pos_rmse": np.sqrt(np.mean(np.array(pos_errors)**2)) if pos_errors else 0,
-            "flux_mae": np.mean(np.abs(flux_errors)) if flux_errors else 0,
-            "recall_vs_flux": []
+            "mean_ratio": mean_ratio,
+            "std_ratio": std_ratio,
+            "comp_mae": comp_mae,
+            "pos_rmse": pos_rmse
         }
-        
-        print("\n--- Evaluation Results ---")
-        print(f"Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
-        if pos_errors:
-            print(f"Positional RMSE:  {results['pos_rmse']:.4f} pixels")
-            print(f"Flux Relative MAE: {results['flux_mae']*100:.2f}%")
-        
-        print("\n--- Recall vs Flux ---")
-        for b in range(len(flux_bins)-1):
-            r = flux_tp[b] / flux_total[b] if flux_total[b] > 0 else 0
-            results["recall_vs_flux"].append((flux_bins[b], flux_bins[b+1], r))
-            print(f"Flux {flux_bins[b]:3d}-{flux_bins[b+1]:3d}: {r:.4f} ({flux_tp[b]:5d}/{flux_total[b]:5d})")
-            
-        return results

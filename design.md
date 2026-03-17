@@ -41,15 +41,20 @@ The feature map is passed through a $3 \times 3$ convolutional layer followed by
 
 ## 4. The Loss Function
 *   **Total Loss:** $\mathcal{L}_{Total} = \lambda_1 \mathcal{L}_{Prob} + \lambda_2 \mathcal{L}_{Reg} + \lambda_3 \mathcal{L}_{Shape} + \lambda_4 \mathcal{L}_{BG}$
-*   **$\mathcal{L}_{BG}$:** Global MSE between predicted background map and ground truth background.
+*   **$\mathcal{L}_{Prob}$:** Focal Loss to handle the class imbalance.
+*   **$\mathcal{L}_{Reg}$:** Masked MSE for $dx, dy, m, c$.
+*   **$\mathcal{L}_{Shape}$:** Masked MSE for the 9x9 PSF.
+*   **$\mathcal{L}_{BG}$:** Global MSE for the background map. This term is heavily down-weighted ($\lambda_4 \approx 0.01$) to prevent the high-magnitude background signal from drowning out the sub-pixel star recovery gradients during initial training.
 
 ## 5. Success Metrics (Acceptance Criteria)
 | Metric | Target | Description |
 | :--- | :--- | :--- |
 | **Recall (SNR > 10)** | $> 95\%$ | Successful detection of clear sources. |
 | **Precision** | $> 98\%$ | Minimal false positives. |
+| **Positional RMSE** | $< 0.15$ px | Sub-pixel coordinate accuracy. |
 | **Flux Ratio (Mean)** | $1.00 \pm 0.05$ | Accuracy in magnitude recovery. |
 | **Flux Scatter (StdDev)**| $< 0.10$ | Precision in magnitude recovery. |
+| **Completeness MAE** | $< 0.10$ | Reliability of predicted recoverability score. |
 | **Shape Loss ($S$)** | $< 0.0001$ | PSF profile fidelity. |
 
 ## 6. Implementation Strategy: Sparse Storage
