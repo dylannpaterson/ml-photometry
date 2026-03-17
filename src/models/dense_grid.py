@@ -25,8 +25,6 @@ class DenseGridModel(nn.Module):
             nn.Conv2d(256, self.num_output_channels, kernel_size=1)
         )
         
-        # Initialize background bias to ~10.0
-        # The last channel is the background channel
         with torch.no_grad():
             self.head[-1].bias[-1].fill_(10.0)
 
@@ -57,10 +55,10 @@ class DenseGridModel(nn.Module):
             "background": bg
         }
 
-def compute_grid_loss(preds, targets, lambda_prob=1.0, lambda_reg=1.0, lambda_shape=1.0, lambda_bg=0.01, alpha=0.25, gamma=2.0):
+def compute_grid_loss(preds, targets, lambda_prob=1.0, lambda_pos=5.0, lambda_flux=1.0, lambda_shape=1.0, lambda_bg=0.01, lambda_tv=0.1, alpha=0.25, gamma=2.0):
     """
-    Implements Masked Loss with Shape Estimation and Background Fit.
-    lambda_bg is set to 0.01 to balance against star parameters.
+    Enhanced Loss Function with TV Regularization for the background.
+    - lambda_tv=0.1: Penalizes sharp gradients in the background map to prevent star absorption.
     """
     star_preds = preds["stars"]
     bg_preds = preds["background"]
@@ -70,7 +68,7 @@ def compute_grid_loss(preds, targets, lambda_prob=1.0, lambda_reg=1.0, lambda_sh
     
     obj_mask = star_targets[..., 0] == 1.0
     
-    # 1. Focal Loss for Probability (p)
+    # 1. Probability Loss (p) with Faint Star Boosting
     p_pred = torch.clamp(star_preds[..., 0], 1e-7, 1.0 - 1e-7)
     p_target = star_targets[..., 0]
     
@@ -78,27 +76,50 @@ def compute_grid_loss(preds, targets, lambda_prob=1.0, lambda_reg=1.0, lambda_sh
     p_t = p_pred * p_target + (1 - p_pred) * (1 - p_target)
     focal_weight = (1 - p_t) ** gamma
     alpha_t = alpha * p_target + (1 - alpha) * (1 - p_target)
-    prob_loss = (alpha_t * focal_weight * bce_loss).mean()
     
-    # 2. Regression Loss (Masked MSE)
+    with torch.no_grad():
+        log_flux_target = star_targets[..., 3]
+        boost_weight = torch.where(obj_mask, 1.0 + (4.0 - log_flux_target) / 2.5, torch.tensor(1.0, device=p_pred.device))
+    
+    prob_loss = (alpha_t * focal_weight * bce_loss * boost_weight).mean()
+    
+    # 2. Regression Losses (Masked)
     if obj_mask.sum() > 0:
-        reg_pred = star_preds[..., 1:5][obj_mask]
-        reg_target = star_targets[..., 1:5][obj_mask]
-        reg_loss = F.mse_loss(reg_pred, reg_target, reduction='mean')
+        pos_pred = star_preds[..., 1:3][obj_mask]
+        pos_target = star_targets[..., 1:3][obj_mask]
+        pos_loss = F.mse_loss(pos_pred, pos_target, reduction='mean')
+        
+        flux_pred = star_preds[..., 3:4][obj_mask]
+        flux_target = star_targets[..., 3:4][obj_mask]
+        flux_loss = F.mse_loss(flux_pred, flux_target, reduction='mean')
+        
+        comp_pred = star_preds[..., 4:5][obj_mask]
+        comp_target = star_targets[..., 4:5][obj_mask]
+        comp_loss = F.mse_loss(comp_pred, comp_target, reduction='mean')
         
         shape_pred = star_preds[..., 5:][obj_mask]
         shape_target = star_targets[..., 5:][obj_mask]
         shape_loss = F.mse_loss(shape_pred, shape_target, reduction='mean')
     else:
-        reg_loss = torch.tensor(0.0, device=star_preds.device)
+        pos_loss = torch.tensor(0.0, device=star_preds.device)
+        flux_loss = torch.tensor(0.0, device=star_preds.device)
+        comp_loss = torch.tensor(0.0, device=star_preds.device)
         shape_loss = torch.tensor(0.0, device=star_preds.device)
         
     # 3. Background Loss (Global MSE)
     bg_loss = F.mse_loss(bg_preds, bg_targets, reduction='mean')
+    
+    # 4. TV Regularization (Smoothness)
+    # Penalize the difference between adjacent background pixels
+    tv_h = torch.abs(bg_preds[:, 1:, :, :] - bg_preds[:, :-1, :, :]).mean()
+    tv_w = torch.abs(bg_preds[:, :, 1:, :] - bg_preds[:, :, :-1, :]).mean()
+    tv_loss = tv_h + tv_w
         
     total_loss = (lambda_prob * prob_loss + 
-                  lambda_reg * reg_loss + 
+                  lambda_pos * pos_loss + 
+                  lambda_flux * (flux_loss + comp_loss) + 
                   lambda_shape * shape_loss + 
-                  lambda_bg * bg_loss)
+                  lambda_bg * bg_loss +
+                  lambda_tv * tv_loss)
                   
-    return total_loss, prob_loss, reg_loss, shape_loss, bg_loss
+    return total_loss, prob_loss, pos_loss, flux_loss, shape_loss, bg_loss, tv_loss

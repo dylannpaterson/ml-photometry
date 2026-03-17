@@ -40,11 +40,13 @@ The feature map is passed through a $3 \times 3$ convolutional layer followed by
     *   **b:** ReLU (ensures positive background levels).
 
 ## 4. The Loss Function
-*   **Total Loss:** $\mathcal{L}_{Total} = \lambda_1 \mathcal{L}_{Prob} + \lambda_2 \mathcal{L}_{Reg} + \lambda_3 \mathcal{L}_{Shape} + \lambda_4 \mathcal{L}_{BG}$
-*   **$\mathcal{L}_{Prob}$:** Focal Loss to handle the class imbalance.
-*   **$\mathcal{L}_{Reg}$:** Masked MSE for $dx, dy, m, c$.
+*   **Total Loss:** $\mathcal{L}_{Total} = \lambda_1 \mathcal{L}_{Prob} + \lambda_2 \mathcal{L}_{Pos} + \lambda_3 \mathcal{L}_{Flux} + \lambda_4 \mathcal{L}_{Shape} + \lambda_5 \mathcal{L}_{BG} + \lambda_6 \mathcal{L}_{TV}$
+*   **$\mathcal{L}_{Prob}$:** Focal Loss with inverse-flux importance weighting to boost the detection of faint sources.
+*   **$\mathcal{L}_{Pos}$:** Masked MSE for $dx, dy$ sub-pixel offsets, heavily weighted ($\lambda_2 \approx 5.0$) to force geometric precision.
+*   **$\mathcal{L}_{Flux}$:** Masked MSE for log-flux ($m$) and completeness ($c$).
 *   **$\mathcal{L}_{Shape}$:** Masked MSE for the 9x9 PSF.
-*   **$\mathcal{L}_{BG}$:** Global MSE for the background map. This term is heavily down-weighted ($\lambda_4 \approx 0.01$) to prevent the high-magnitude background signal from drowning out the sub-pixel star recovery gradients during initial training.
+*   **$\mathcal{L}_{BG}$:** Global MSE for the background map.
+*   **$\mathcal{L}_{TV}$:** Total Variation regularization on the predicted background map to enforce smoothness and prevent the model from "absorbing" star light into the background head.
 
 ## 5. Success Metrics (Acceptance Criteria)
 | Metric | Target | Description |
