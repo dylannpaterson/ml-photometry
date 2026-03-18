@@ -5,7 +5,7 @@ import torchvision.models as models
 import numpy as np
 
 class DenseGridModel(nn.Module):
-    def __init__(self, K=3, shape_size=9, cell_size=2):
+    def __init__(self, K=3, shape_size=9, cell_size=4):
         super(DenseGridModel, self).__init__()
         self.K = K
         self.S2 = shape_size * shape_size

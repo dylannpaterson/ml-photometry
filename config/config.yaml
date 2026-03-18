@@ -31,3 +31,4 @@ data_params:
   image_size: 256
   max_capacity_per_cell: 3
   shape_size: 9
+
