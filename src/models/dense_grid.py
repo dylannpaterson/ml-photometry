@@ -16,6 +16,7 @@ class DenseGridModel(nn.Module):
             nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False),
             resnet.bn1,
             resnet.relu,
+            resnet.maxpool,
             resnet.layer1, 
         )
         
