@@ -125,14 +125,14 @@ class GaussianPretrainingProvider(Dataset):
                     indices.append([cell_y, cell_x, slot])
                     break
 
-        # Downsample ground truth background to grid size [128, 128] for target
-        # We take the average of each 2x2 cell
-        bg_grid = gt_background.reshape(self.grid_size, 2, self.grid_size, 2).mean(axis=(1, 3))
+        # Downsample ground truth background to grid size for target
+        # We take the average of each cell
+        bg_grid = gt_background.reshape(self.grid_size, self.cell_size, self.grid_size, self.cell_size).mean(axis=(1, 3))
 
         sparse_target = {
             "image": torch.tensor(image, dtype=torch.float32).unsqueeze(0),
             "base_grid": torch.tensor(base_grid, dtype=torch.float32),
-            "background_map": torch.tensor(bg_grid, dtype=torch.float32), # [128, 128]
+            "background_map": torch.tensor(bg_grid, dtype=torch.float32), # [grid_size, grid_size]
             "shapes": torch.tensor(np.array(shapes), dtype=torch.float32) if shapes else torch.tensor([]),
             "indices": torch.tensor(np.array(indices), dtype=torch.long) if indices else torch.tensor([])
         }
