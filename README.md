@@ -1,4 +1,4 @@
-# Roman Point Source ML Pipeline (ml-photometry)
+# Castor: Roman Point Source ML Pipeline
 
 A specialized machine learning pipeline designed for fast, direct point-source detection, photometry, and completeness estimation on Level 2 slope images from the Nancy Grace Roman Space Telescope.
 

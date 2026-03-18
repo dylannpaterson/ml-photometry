@@ -1,4 +1,4 @@
-# Architecture Design: Roman Point Source ML Pipeline (Dense Grid Prediction)
+# Architecture Design: Castor (Roman Point Source ML Pipeline)
 
 ## 1. Objective
 To develop a machine learning pipeline capable of performing fast, direct point-source detection, photometry, and completeness estimation on Level 2 images from the Nancy Grace Roman Space Telescope. By framing the problem as a Dense Grid Prediction (inspired by YOLO/CenterNet), this architecture scales gracefully to handle extreme stellar densities while outputting a physical recoverability score for every source.

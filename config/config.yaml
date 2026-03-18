@@ -1,5 +1,5 @@
 run_config:
-  resume_from_checkpoint: false
+  resume_from_checkpoint: true
   force_regenerate_data: false
 
 curriculum:
