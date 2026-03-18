@@ -84,7 +84,7 @@ case "$1" in
         if [ -d "checkpoints" ] || [ -f "training.log" ]; then
             BACKUP_NAME="local_backup_${TIMESTAMP}.tar.gz"
             echo "📦 Backing up local results to $BACKUP_NAME..."
-            tar -czf "$BACKUP_NAME" checkpoints/ training.log 2>/dev/null
+            tar -czf "backups/$BACKUP_NAME" checkpoints/ training.log 2>/dev/null
         fi
 
         # 2. Check VM status

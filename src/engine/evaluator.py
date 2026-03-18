@@ -48,11 +48,12 @@ class Evaluator:
         
         all_tp, all_fp, all_fn = 0, 0, 0
         pos_errors, ratios, comp_errors = [], [], []
+        matched_completeness, missed_completeness = [], []
 
-        # Analysis vs Flux
-        flux_bins = [0, 50, 100, 200, 500, 1000, 10000]
-        flux_tp = [0] * (len(flux_bins) - 1)
-        flux_total = [0] * (len(flux_bins) - 1)
+        # Completeness Bins for Recall Analysis
+        comp_bins = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+        comp_total = [0] * (len(comp_bins) - 1)
+        comp_tp = [0] * (len(comp_bins) - 1)
 
         print(f"Evaluating model on {num_chunks} chunks...")
 
@@ -97,14 +98,21 @@ class Evaluator:
             all_fp += len(unmatched_pred)
             all_fn += len(unmatched_true)
 
+            # Analyze completeness of matched vs missed
             matched_true_indices = [m[0] for m in matches]
             for i, star in enumerate(true_stars):
-                f = star[2]
-                for b in range(len(flux_bins)-1):
-                    if flux_bins[b] <= f < flux_bins[b+1]:
-                        flux_total[b] += 1
+                comp = star[3]
+                if i in matched_true_indices:
+                    matched_completeness.append(comp)
+                else:
+                    missed_completeness.append(comp)
+
+                # Bin recall by completeness
+                for b in range(len(comp_bins)-1):
+                    if comp_bins[b] <= comp <= comp_bins[b+1]:
+                        comp_total[b] += 1
                         if i in matched_true_indices:
-                            flux_tp[b] += 1
+                            comp_tp[b] += 1
                         break
 
             for t_idx, p_idx, dist in matches:
@@ -125,6 +133,9 @@ class Evaluator:
         comp_mae = np.mean(comp_errors) if comp_errors else 1.0
         pos_rmse = np.sqrt(np.mean(np.array(pos_errors)**2)) if pos_errors else 1.0
         
+        avg_matched_comp = np.mean(matched_completeness) if matched_completeness else 0
+        avg_missed_comp = np.mean(missed_completeness) if missed_completeness else 0
+
         print("\n" + "="*45)
         print(" STAGE 0 ACCEPTANCE CRITERIA CHECK")
         print("="*45)
@@ -143,6 +154,16 @@ class Evaluator:
             check(comp_mae, 0.10, "Completeness MAE", higher_is_better=False)
         ]
         
+        print("-" * 45)
+        print(f"📊 Avg Completeness (Detected): {avg_matched_comp:8.4f}")
+        print(f"📊 Avg Completeness (Missed):   {avg_missed_comp:8.4f}")
+        print("-" * 45)
+        print("📈 Recall vs. Completeness (SNR Proxy):")
+        for b in range(len(comp_bins)-1):
+            bin_recall = comp_tp[b] / comp_total[b] if comp_total[b] > 0 else 0
+            label = f"{comp_bins[b]:.1f}-{comp_bins[b+1]:.1f}"
+            print(f"   Bin {label}: {bin_recall:8.4f} ({comp_tp[b]}/{comp_total[b]})")
+
         if all(results_ok):
             print("\n🎉 MODEL IS READY FOR STAGE 1 (REAL PSF)!")
         else:

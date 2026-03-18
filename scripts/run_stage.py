@@ -110,7 +110,8 @@ def run_eval(stage_idx, config, device, checkpoint=None):
 
     if stage_idx == 0:
         evaluator = Evaluator(model, device, config)
-        evaluator.run_evaluation()
+        # Increased to 500 chunks for better statistical stability
+        evaluator.run_evaluation(num_chunks=500)
     else:
         print(f"⚠️ Specialized evaluator for stage {stage_idx} not yet implemented.")
 

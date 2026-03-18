@@ -7,7 +7,7 @@ class GaussianPretrainingProvider(Dataset):
     def __init__(self, num_samples=1000, min_stars=100, max_stars=1500, image_size=256, max_capacity_per_cell=3, shape_size=7):
         """
         Generates realistic synthetic data for the Roman Bulge Time Domain Survey.
-        Edge-to-Edge prediction on 256x256 image with 128x128 grid.
+        Edge-to-Edge prediction on 256x256 image with 64x64 grid.
         """
         self.num_samples = num_samples
         self.min_stars = min_stars
@@ -17,8 +17,8 @@ class GaussianPretrainingProvider(Dataset):
         self.S = shape_size
         self.read_noise = 5.0
 
-        # Grid parameters: 2x2 cells for 256x256 image = 128x128 grid
-        self.cell_size = 2
+        # Grid parameters: 4x4 cells for 256x256 image = 64x64 grid
+        self.cell_size = 4
         self.grid_size = self.img_size // self.cell_size
 
     def __len__(self):
