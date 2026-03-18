@@ -7,7 +7,7 @@
 INSTANCE_NAME="bulge-survey-ml-worker"
 ZONES=("us-east4-c" "asia-east1-c" "asia-east1-a" "us-central1-c" "us-central1-a")
 REPO_URL="https://github.com/dylannpaterson/castor.git"
-BRANCH="add-psf"
+BRANCH="main"
 
 # Stage index (defaults to 0: Gaussian Pre-training)
 STAGE=${2:-0}
