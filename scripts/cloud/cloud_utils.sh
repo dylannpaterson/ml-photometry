@@ -79,7 +79,15 @@ case "$1" in
         echo "✅ Reset signal sent. Wait a minute for it to come back online."
         ;;
     results)
-        # Check if instance is already running
+        # 1. Backup local results if they exist
+        TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+        if [ -d "checkpoints" ] || [ -f "training.log" ]; then
+            BACKUP_NAME="local_backup_${TIMESTAMP}.tar.gz"
+            echo "📦 Backing up local results to $BACKUP_NAME..."
+            tar -czf "$BACKUP_NAME" checkpoints/ training.log 2>/dev/null
+        fi
+
+        # 2. Check VM status
         INITIAL_STATUS=$(gcloud compute instances describe "$INSTANCE_NAME" --zone="$ZONE" --format='get(status)')
         echo "Current VM status: $INITIAL_STATUS"
         
@@ -94,12 +102,13 @@ case "$1" in
             sleep 5
         done
 
-        echo "📦 Downloading results..."
-        # Create a timestamped bundle to avoid overwriting local ones if desired, 
-        # but sticking to the current logic of results_bundle.tar.gz for now.
-        gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" --command "cd ~/ml-photometry && tar -czf results_bundle.tar.gz checkpoints/ training.log"
-        gcloud compute scp "$INSTANCE_NAME":~/ml-photometry/results_bundle.tar.gz ./results_bundle.tar.gz --zone="$ZONE"
-        tar -xzf results_bundle.tar.gz && rm results_bundle.tar.gz
+        echo "📦 Downloading results from cloud..."
+        # Remote bundling
+        gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" --command "cd ~/ml-photometry && tar -czf remote_results.tar.gz checkpoints/ training.log"
+        
+        # Download and extract
+        gcloud compute scp "$INSTANCE_NAME":~/ml-photometry/remote_results.tar.gz ./remote_results.tar.gz --zone="$ZONE"
+        tar -xzf remote_results.tar.gz && rm remote_results.tar.gz
         
         if [ "$INITIAL_STATUS" != "RUNNING" ]; then
             echo "✅ Results updated. Stopping VM (as it was started by this script)..."
