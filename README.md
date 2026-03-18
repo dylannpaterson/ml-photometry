@@ -1,6 +1,13 @@
 # Castor: Roman Point Source ML Pipeline
 
-A specialized machine learning pipeline designed for fast, direct point-source detection, photometry, and completeness estimation on Level 2 slope images from the Nancy Grace Roman Space Telescope.
+**Castor** is the research and training engine for a specialized machine learning pipeline designed for fast, direct point-source detection, photometry, and completeness estimation on Level 2 images from the Nancy Grace Roman Space Telescope.
+
+## The Castor & Pollux Ecosystem
+
+This project is part of a dual-pipeline architecture:
+
+*   **Castor (This Repository):** The **Training & Research** suite. It focuses on curriculum learning, PSF shape modeling, and refining the Dense Grid Prediction network on $256 \times 256$ image chunks.
+*   **Pollux (Sister Project):** The **Production Photometry Pipeline**. Pollux utilizes the models trained by Castor to perform automated, wide-field photometry on full-sized ($4088 \times 4088$) Roman L2 images by implementing intelligent tiling, hardware-accelerated inference, and global catalog stitching.
 
 ## Overview
 
