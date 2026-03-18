@@ -33,8 +33,10 @@ def load_stage_model(stage_idx, device, config, checkpoint_path=None):
     data_cfg = config["data_params"]
     K = data_cfg["max_capacity_per_cell"]
     S = data_cfg["shape_size"]
+    # For stage 0, cell_size is 4 (256/64). For future stages, we'll needs this in config.
+    cell_size = 4 if stage_idx == 0 else 2
     
-    model = DenseGridModel(K=K, shape_size=S).to(device)
+    model = DenseGridModel(K=K, shape_size=S, cell_size=cell_size).to(device)
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     return model
 
@@ -68,6 +70,7 @@ def run_train(stage_idx, config, device):
     # Use K and shape_size from config
     K = data_cfg["max_capacity_per_cell"]
     S = data_cfg["shape_size"]
+    cell_size = 4 if stage_idx == 0 else 2
     
     train_dataset = PregeneratedDataset(train_dir, K=K, shape_size=S)
     val_dataset = PregeneratedDataset(val_dir, K=K, shape_size=S)
@@ -78,7 +81,7 @@ def run_train(stage_idx, config, device):
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
     # Model Setup
-    model = DenseGridModel(K=K, shape_size=S).to(device)
+    model = DenseGridModel(K=K, shape_size=S, cell_size=cell_size).to(device)
     
     # Custom Trainer Setup
     trainer = Trainer(

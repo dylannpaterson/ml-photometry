@@ -5,10 +5,11 @@ import torchvision.models as models
 import numpy as np
 
 class DenseGridModel(nn.Module):
-    def __init__(self, K=3, shape_size=9):
+    def __init__(self, K=3, shape_size=9, cell_size=2):
         super(DenseGridModel, self).__init__()
         self.K = K
         self.S2 = shape_size * shape_size
+        self.cell_size = float(cell_size)
         self.num_output_channels = self.K * (5 + self.S2) + 1
 
         resnet = models.resnet34(weights=None)
@@ -41,8 +42,8 @@ class DenseGridModel(nn.Module):
         star_out = star_out.permute(0, 3, 4, 1, 2)
         
         p = torch.sigmoid(star_out[..., 0:1])
-        dx = torch.sigmoid(star_out[..., 1:2]) * 2.0
-        dy = torch.sigmoid(star_out[..., 2:3]) * 2.0
+        dx = torch.sigmoid(star_out[..., 1:2]) * self.cell_size
+        dy = torch.sigmoid(star_out[..., 2:3]) * self.cell_size
         m = star_out[..., 3:4]
         c = torch.sigmoid(star_out[..., 4:5])
         
@@ -56,7 +57,7 @@ class DenseGridModel(nn.Module):
             "background": bg
         }
 
-def compute_grid_loss(preds, targets, lambda_prob=1.0, lambda_pos=10.0, lambda_flux=1.0, lambda_shape=1.0, lambda_bg=0.01, alpha=0.75, gamma=2.0):
+def compute_grid_loss(preds, targets, lambda_prob=5.0, lambda_pos=20.0, lambda_flux=1.0, lambda_shape=1.0, lambda_bg=0.01, alpha=0.75, gamma=2.0):
     """
     Standard Generative Loss without TV regularization (optimized for speed).
     Maintains positional weighting and faint-star boost.
