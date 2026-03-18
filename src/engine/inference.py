@@ -3,6 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 import os
+from scipy.ndimage import zoom
 
 class InferenceEngine:
     def __init__(self, model, device, config):
@@ -13,45 +14,123 @@ class InferenceEngine:
     def predict(self, image_tensor, threshold=0.5):
         """Runs inference on a single 2D image tensor [1, H, W]."""
         self.model.eval()
-        
         with torch.no_grad():
             input_tensor = image_tensor.unsqueeze(0).to(self.device)
-            # Output: [1, H/2, W/2, K, 5]
-            prediction = self.model(input_tensor).squeeze(0).cpu().numpy()
+            prediction_dict = self.model(input_tensor)
+            prediction = prediction_dict["stars"].squeeze(0).cpu().numpy()
+            bg_map = prediction_dict["background"].squeeze(0).cpu().numpy()
             
-        predicted_stars = []
-        cell_size = 2 # Fixed by current architecture
+        predicted_stars, predicted_shapes = [], []
+        cell_size = 2
         grid_h, grid_w, K, _ = prediction.shape
-        
         for y in range(grid_h):
             for x in range(grid_w):
                 for k in range(K):
-                    p, dx, dy, m, c = prediction[y, x, k]
+                    p, dx, dy, log_m, c = prediction[y, x, k, :5]
                     if p > threshold:
-                        global_x = (x * cell_size) + dx
-                        global_y = (y * cell_size) + dy
-                        predicted_stars.append((global_x, global_y, m, c, p))
-                        
-        return predicted_stars
+                        predicted_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, 10**log_m, c, p))
+                        shape_vector = prediction[y, x, k, 5:]
+                        S = int(np.sqrt(len(shape_vector)))
+                        predicted_shapes.append(shape_vector.reshape(S, S))
+        return predicted_stars, predicted_shapes, bg_map
 
-    def visualize(self, image_tensor, true_catalogue, predicted_stars, threshold, output_path="inference_comparison.png"):
+    def visualize(self, image_tensor, true_catalogue, predicted_stars, predicted_shapes, bg_map, gt_bg_map, threshold, output_path="inference_comparison.png"):
+        from src.engine.evaluator import match_stars
         img = image_tensor.squeeze().numpy()
-        img_min = img.min()
-        if img_min <= 0: img = img - img_min + 1e-3
+        H, W = img.shape
 
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 10))
-        
-        ax1.imshow(img, cmap='inferno', origin='lower', norm=LogNorm())
-        ax1.set_title(f"Ground Truth ({len(true_catalogue)} stars)")
-        for star in true_catalogue:
-            x, y = star[0], star[1]
-            ax1.plot(x, y, 'g+', markersize=10, alpha=0.6)
-        
-        ax2.imshow(img, cmap='inferno', origin='lower', norm=LogNorm())
-        ax2.set_title(f"Model Predictions ({len(predicted_stars)} stars, p > {threshold})")
-        for x, y, m, c, p in predicted_stars:
-            ax2.plot(x, y, 'r+', markersize=10, alpha=min(1.0, p))
+        # 1. Component Preparation
+        full_bg = zoom(bg_map.squeeze(), 2, order=1)
+        full_gt_bg = zoom(gt_bg_map.squeeze(), 2, order=1)
+        reconstruction = np.zeros_like(img)
+        for (x, y, flux, c, p), shape in zip(predicted_stars, predicted_shapes):
+            ix, iy, S = int(round(x)), int(round(y)), shape.shape[0]
+            half = S // 2
+            y0, y1 = max(0, iy - half), min(H, iy + half + 1)
+            x0, x1 = max(0, ix - half), min(W, ix + half + 1)
+            sy0, sy1, sx0, sx1 = half - (iy - y0), half + (y1 - iy), half - (ix - x0), half + (x1 - ix)
+            reconstruction[y0:y1, x0:x1] += flux * shape[sy0:sy1, sx0:sx1]
 
-        plt.suptitle("Dense Grid Model Inference: Roman Point Source Pipeline", fontsize=16)
-        plt.savefig(output_path)
-        print(f"Comparison saved to {output_path}")
+        full_reconstruction = reconstruction + full_bg
+        residual = img - full_reconstruction
+
+        # 2. Statistics for Plots
+        matches, _, _ = match_stars(true_catalogue, predicted_stars)
+        true_mags, pred_mags, true_comps, pred_comps = [], [], [], []
+        for t_idx, p_idx, _ in matches:
+            true_mags.append(np.log10(true_catalogue[t_idx][2] + 1e-9))
+            pred_mags.append(np.log10(predicted_stars[p_idx][2] + 1e-9))
+            true_comps.append(true_catalogue[t_idx][3])
+            pred_comps.append(predicted_stars[p_idx][3])
+
+        # 3. Figure Layout
+        fig = plt.figure(figsize=(30, 24))
+        gs = fig.add_gridspec(5, 4)
+        
+        # Row 1-2: Primary Comparisons
+        norm = LogNorm(vmin=10, vmax=max(img.max(), full_reconstruction.max()))
+        
+        ax1 = fig.add_subplot(gs[0:2, 0])
+        ax1.imshow(img, cmap='inferno', origin='lower', norm=norm)
+        ax1.set_title("Original Input")
+        for s in true_catalogue: ax1.plot(s[0], s[1], 'g+', markersize=8, alpha=0.4)
+        
+        ax2 = fig.add_subplot(gs[0:2, 1])
+        ax2.imshow(full_reconstruction, cmap='inferno', origin='lower', norm=norm)
+        ax2.set_title("Model Reconstruction")
+        
+        ax3 = fig.add_subplot(gs[0:2, 2])
+        rmax = np.percentile(np.abs(residual), 99)
+        im3 = ax3.imshow(residual, cmap='bwr', origin='lower', vmin=-rmax, vmax=rmax)
+        ax3.set_title("Residual")
+        plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
+
+        # Row 3: Metrics & Background
+        # Magnitude
+        ax4 = fig.add_subplot(gs[2, 0])
+        if true_mags:
+            ax4.scatter(true_mags, pred_mags, alpha=0.5, color='blue')
+            ax4.plot([min(true_mags), max(true_mags)], [min(true_mags), max(true_mags)], 'r--')
+            ax4.set_title("Magnitude Recovery"); ax4.set_aspect('equal')
+        
+        # Completeness
+        ax5 = fig.add_subplot(gs[2, 1])
+        if true_comps:
+            ax5.scatter(true_comps, pred_comps, alpha=0.5, color='green')
+            ax5.plot([0, 1], [0, 1], 'r--')
+            ax5.set_title("Completeness Reliability"); ax5.set_aspect('equal')
+
+        # Background Side-by-Side (Shared Colorbar)
+        bg_vmin = min(full_bg.min(), full_gt_bg.min())
+        bg_vmax = max(full_bg.max(), full_gt_bg.max())
+        
+        ax6 = fig.add_subplot(gs[2, 2])
+        ax6.imshow(full_bg, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax)
+        ax6.set_title("Predicted Background")
+        
+        ax7 = fig.add_subplot(gs[2, 3])
+        im7 = ax7.imshow(full_gt_bg, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax)
+        ax7.set_title("Truth Background")
+        plt.colorbar(im7, ax=ax7, fraction=0.046, pad=0.04)
+
+        # Row 4-5: PSF Comparisons
+        if predicted_stars:
+            indices = np.argsort([s[4] for s in predicted_stars])[::-1]
+            psf_gs = gs[3:5, :].subgridspec(2, 8)
+            def get_ideal_psf(size=9):
+                half = size // 2
+                xx, yy = np.meshgrid(np.arange(-half, half + 1), np.arange(-half, half + 1))
+                psf = np.exp(-(xx**2 + yy**2) / (2 * 1.5**2))
+                return psf / (psf.sum() + 1e-9)
+            ideal_psf = get_ideal_psf(size=predicted_shapes[0].shape[0])
+            for i in range(min(8, len(indices))):
+                idx = indices[i]
+                ax_pred = fig.add_subplot(psf_gs[0, i])
+                ax_pred.imshow(predicted_shapes[idx], cmap='viridis', origin='lower')
+                ax_pred.set_title(f"p={predicted_stars[idx][4]:.2f}\nc={predicted_stars[idx][3]:.2f}"); ax_pred.axis('off')
+                ax_true = fig.add_subplot(psf_gs[1, i])
+                ax_true.imshow(ideal_psf, cmap='viridis', origin='lower'); ax_true.axis('off')
+
+        plt.suptitle("Generative Diagnostic: Star & Background Recovery", fontsize=24)
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.savefig(output_path); print(f"Comparison saved to {output_path}")

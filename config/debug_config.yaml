@@ -1,0 +1,21 @@
+run_config:
+  resume_from_checkpoint: false
+  force_regenerate_data: true
+
+curriculum:
+  stage0:
+    name: "Debug Stage"
+    data_dir: "data/debug"
+    epochs: 2
+    batch_size: 2
+    learning_rate: 0.001
+    resume_from_last_stage: false
+
+data_params:
+  num_train_samples: 10
+  num_val_samples: 4
+  min_stars: 10
+  max_stars: 50
+  image_size: 256
+  max_capacity_per_cell: 3
+  shape_size: 7

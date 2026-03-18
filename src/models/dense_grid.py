@@ -2,83 +2,117 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
+import numpy as np
 
 class DenseGridModel(nn.Module):
-    def __init__(self, K=5):
+    def __init__(self, K=3, shape_size=9):
         super(DenseGridModel, self).__init__()
         self.K = K
-        self.num_output_channels = self.K * 5  # p, dx, dy, m, c
+        self.S2 = shape_size * shape_size
+        self.num_output_channels = self.K * (5 + self.S2) + 1
 
-        # Backbone: Using a ResNet-34
-        # Input 256x256 -> Stride 2 -> 128x128.
         resnet = models.resnet34(weights=None)
         self.backbone = nn.Sequential(
             nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False),
             resnet.bn1,
             resnet.relu,
-            # resnet.maxpool, # Removing maxpool to stay at stride 2
-            resnet.layer1, # Output stride 2: [B, 64, 128, 128] for 256x256 input
+            resnet.layer1, 
         )
         
-        # Grid Prediction Head
         self.head = nn.Sequential(
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.Conv2d(64, 256, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, self.num_output_channels, kernel_size=1)
+            nn.Conv2d(256, self.num_output_channels, kernel_size=1)
         )
+        
+        with torch.no_grad():
+            self.head[-1].bias[-1].fill_(10.0)
 
     def forward(self, x):
-        # 1. Feature Extraction (Backbone)
-        # Input: [B, 1, 256, 256] -> Output: [B, 64, 128, 128]
         features = self.backbone(x)
-        
-        # 2. Grid Prediction
-        # Output: [B, K*5, 128, 128]
         out = self.head(features)
         
-        # 3. Reshape to [B, 128, 128, K, 5]
         B, C, H, W = out.shape
-        out = out.view(B, self.K, 5, H, W)
-        out = out.permute(0, 3, 4, 1, 2) # [B, 128, 128, K, 5]
+        star_out = out[:, :-1, :, :]
+        bg_out = out[:, -1:, :, :]
         
-        # 4. Apply Activations
-        p = torch.sigmoid(out[..., 0:1])
-        dx = torch.sigmoid(out[..., 1:2]) * 2.0 # Cell size is 2.0
-        dy = torch.sigmoid(out[..., 2:3]) * 2.0 # Cell size is 2.0
-        m = out[..., 3:4]
-        c = torch.sigmoid(out[..., 4:5])
+        star_out = star_out.view(B, self.K, 5 + self.S2, H, W)
+        star_out = star_out.permute(0, 3, 4, 1, 2)
         
-        return torch.cat([p, dx, dy, m, c], dim=-1)
+        p = torch.sigmoid(star_out[..., 0:1])
+        dx = torch.sigmoid(star_out[..., 1:2]) * 2.0
+        dy = torch.sigmoid(star_out[..., 2:3]) * 2.0
+        m = star_out[..., 3:4]
+        c = torch.sigmoid(star_out[..., 4:5])
+        
+        shape_logits = star_out[..., 5:]
+        shape = F.softmax(shape_logits, dim=-1)
+        
+        bg = F.relu(bg_out.permute(0, 2, 3, 1))
+        
+        return {
+            "stars": torch.cat([p, dx, dy, m, c, shape], dim=-1),
+            "background": bg
+        }
 
-def compute_grid_loss(pred, target, lambda_prob=1.0, lambda_reg=1.0, alpha=0.25, gamma=2.0):
+def compute_grid_loss(preds, targets, lambda_prob=1.0, lambda_pos=5.0, lambda_flux=1.0, lambda_shape=1.0, lambda_bg=0.01, alpha=0.25, gamma=2.0):
     """
-    Implements Step 4.B: The Masked Loss with Focal Loss for Probability.
-    pred, target: [B, 128, 128, 5, 5]
+    Standard Generative Loss without TV regularization (optimized for speed).
+    Maintains positional weighting and faint-star boost.
     """
-    # Masks
-    obj_mask = target[..., 0] == 1.0
+    star_preds = preds["stars"]
+    bg_preds = preds["background"]
     
-    # 1. Focal Loss for Probability (p)
-    p_pred = pred[..., 0]
-    p_target = target[..., 0]
+    bg_targets = targets[..., 0, -1:]
+    star_targets = targets[..., :-1]
     
-    # Clip for stability
-    p_pred = torch.clamp(p_pred, 1e-7, 1.0 - 1e-7)
+    obj_mask = star_targets[..., 0] == 1.0
+    
+    # 1. Probability Loss (p) with Faint Star Boosting
+    p_pred = torch.clamp(star_preds[..., 0], 1e-7, 1.0 - 1e-7)
+    p_target = star_targets[..., 0]
     
     bce_loss = F.binary_cross_entropy(p_pred, p_target, reduction='none')
     p_t = p_pred * p_target + (1 - p_pred) * (1 - p_target)
     focal_weight = (1 - p_t) ** gamma
     alpha_t = alpha * p_target + (1 - alpha) * (1 - p_target)
     
-    prob_loss = (alpha_t * focal_weight * bce_loss).mean()
+    with torch.no_grad():
+        log_flux_target = star_targets[..., 3]
+        boost_weight = torch.where(obj_mask, 1.0 + (4.0 - log_flux_target) / 2.5, torch.tensor(1.0, device=p_pred.device))
     
-    # 2. Regression Loss (Masked MSE)
+    prob_loss = (alpha_t * focal_weight * bce_loss * boost_weight).mean()
+    
+    # 2. Regression Losses (Masked)
     if obj_mask.sum() > 0:
-        reg_pred = pred[..., 1:][obj_mask]
-        reg_target = target[..., 1:][obj_mask]
-        reg_loss = F.mse_loss(reg_pred, reg_target, reduction='mean')
-    else:
-        reg_loss = torch.tensor(0.0, device=pred.device)
+        pos_pred = star_preds[..., 1:3][obj_mask]
+        pos_target = star_targets[..., 1:3][obj_mask]
+        pos_loss = F.mse_loss(pos_pred, pos_target, reduction='mean')
         
-    total_loss = lambda_prob * prob_loss + lambda_reg * reg_loss
-    return total_loss, prob_loss, reg_loss
+        flux_pred = star_preds[..., 3:4][obj_mask]
+        flux_target = star_targets[..., 3:4][obj_mask]
+        flux_loss = F.mse_loss(flux_pred, flux_target, reduction='mean')
+        
+        comp_pred = star_preds[..., 4:5][obj_mask]
+        comp_target = star_targets[..., 4:5][obj_mask]
+        comp_loss = F.mse_loss(comp_pred, comp_target, reduction='mean')
+        
+        shape_pred = star_preds[..., 5:][obj_mask]
+        shape_target = star_targets[..., 5:][obj_mask]
+        shape_loss = F.mse_loss(shape_pred, shape_target, reduction='mean')
+    else:
+        pos_loss = torch.tensor(0.0, device=star_preds.device)
+        flux_loss = torch.tensor(0.0, device=star_preds.device)
+        comp_loss = torch.tensor(0.0, device=star_preds.device)
+        shape_loss = torch.tensor(0.0, device=star_preds.device)
+        
+    # 3. Background Loss (Global MSE)
+    bg_loss = F.mse_loss(bg_preds, bg_targets, reduction='mean')
+        
+    total_loss = (lambda_prob * prob_loss + 
+                  lambda_pos * pos_loss + 
+                  lambda_flux * (flux_loss + comp_loss) + 
+                  lambda_shape * shape_loss + 
+                  lambda_bg * bg_loss)
+                  
+    return total_loss, prob_loss, pos_loss, flux_loss, shape_loss, bg_loss

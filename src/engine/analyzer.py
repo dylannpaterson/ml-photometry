@@ -20,33 +20,53 @@ class ThresholdAnalyzer:
         all_true_catalogues = []
         all_raw_predictions = []
         
-        for _ in range(num_chunks):
-            image_tensor, _, true_catalogue = self.dataset.generate_chunk()
-            with torch.no_grad():
-                input_tensor = image_tensor.unsqueeze(0).to(self.device)
-                prediction = self.model(input_tensor).squeeze(0).cpu().numpy()
-            
-            all_true_catalogues.append(true_catalogue)
-            all_raw_predictions.append(prediction)
+        cell_size = self.dataset.cell_size
+        grid_size = self.dataset.grid_size
+        K = self.dataset.K
 
-        cell_size = 2 # Fixed by current architecture
-        grid_h, grid_w, K, _ = all_raw_predictions[0].shape
+        for _ in range(num_chunks):
+            sparse_target = self.dataset.generate_chunk()
+            image_tensor = sparse_target["image"]
+            target_grid = sparse_target["base_grid"].numpy()
+
+            with torch.no_grad():
+                input_tensor = image_tensor.to(self.device)
+                if input_tensor.dim() == 3:
+                    input_tensor = input_tensor.unsqueeze(0)
+                
+                prediction_dict = self.model(input_tensor)
+                prediction = prediction_dict["stars"].squeeze(0).cpu().numpy()
+            
+            # Extract true stars from grid
+            true_stars = []
+            for y in range(grid_size):
+                for x in range(grid_size):
+                    for k in range(K):
+                        slot = target_grid[y, x, k]
+                        tp, tdx, tdy, tm, tc = slot
+                        if tp == 1.0:
+                            tgx = (x * cell_size) + tdx
+                            tgy = (y * cell_size) + tdy
+                            true_stars.append((tgx, tgy, 10**tm, tc))
+
+            all_true_catalogues.append(true_stars)
+            all_raw_predictions.append(prediction)
 
         for thresh in thresholds:
             tp, fp, fn = 0, 0, 0
             
             for true_catalogue, prediction in zip(all_true_catalogues, all_raw_predictions):
                 pred_stars = []
-                for y in range(grid_h):
-                    for x in range(grid_w):
+                for y in range(grid_size):
+                    for x in range(grid_size):
                         for k in range(K):
-                            p, dx, dy, m, c = prediction[y, x, k]
+                            p, dx, dy, log_m, c = prediction[y, x, k, :5]
                             if p > thresh:
                                 gx = (x * cell_size) + dx
                                 gy = (y * cell_size) + dy
-                                pred_stars.append((gx, gy, m, c, p))
+                                pred_stars.append((gx, gy, 10**log_m, c, p))
                 
-                matches, _, unmatched_pred, unmatched_true = match_stars(true_catalogue, pred_stars)
+                matches, unmatched_true, unmatched_pred = match_stars(true_catalogue, pred_stars)
                 tp += len(matches)
                 fp += len(unmatched_pred)
                 fn += len(unmatched_true)
