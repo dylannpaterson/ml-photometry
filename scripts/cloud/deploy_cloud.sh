@@ -5,7 +5,7 @@
 
 # --- CONFIGURATION ---
 INSTANCE_NAME="bulge-survey-ml-worker"
-ZONES=("us-east4-c" "asia-east1-c" "asia-east1-a" "us-central1-c" "us-central1-a")
+ZONES=("asia-east1-b" "us-east4-c")
 REPO_URL="https://github.com/dylannpaterson/castor.git"
 BRANCH="main"
 
@@ -90,7 +90,7 @@ EOF
         cd ~/ml-photometry
         
         # Wipe old logs for a clean start
-        rm -f training.log pregen_cloud.log setup.log
+        rm -f training.log pregen.log setup.log
         
         chmod +x scripts/cloud/cloud_setup.sh
         ./scripts/cloud/cloud_setup.sh >> setup.log
@@ -99,11 +99,11 @@ EOF
         export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
         # 1. Pregenerate data for this specific stage (if needed)
-        echo "Checking data for Stage $STAGE (Logging to pregen_cloud.log)..."
+        echo "Checking data for Stage $STAGE (Logging to pregen.log)..."
         if [ "$STAGE" == "0" ]; then
-            python3 scripts/generate_mosaics.py --num 10 >> pregen_cloud.log 2>&1
+            python3 scripts/generate_mosaics.py --num 10 >> pregen.log 2>&1
         else
-            python3 scripts/pregenerate_data.py $STAGE >> pregen_cloud.log 2>&1
+            python3 scripts/pregenerate_data.py $STAGE >> pregen.log 2>&1
         fi
 
         # 2. Launch Training for this specific stage

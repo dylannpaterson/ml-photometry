@@ -23,4 +23,5 @@ venv.bak/
 .vscode
 
 /data
-*.tar.gz*.asdf
+*.tar.gz
+*.asdf

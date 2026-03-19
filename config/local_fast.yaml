@@ -1,0 +1,37 @@
+run_config:
+  resume_from_checkpoint: false
+  force_regenerate_data: true
+
+curriculum:
+  stage0:
+    name: "Local Fast Stage 0"
+    data_dir: "data/local_fast"
+    epochs: 20
+    batch_size: 64
+    learning_rate: 0.0001
+    num_workers: 4
+    resume_from_last_stage: false
+    # Parameters moved inside the stage
+    cell_size: 4
+    mosaic_params:
+      num_mosaics: 1
+      mosaic_size: 4088
+
+  stage1:
+    name: "Ideal PSF Fine-tuning"
+    data_dir: "data/stage1_romanisim"
+    epochs: 50
+    batch_size: 32
+    learning_rate: 0.00001
+    num_workers: 4
+    resume_from_last_stage: true
+    cell_size: 2 # Different cell size for high-res fine tuning
+
+data_params:
+  num_train_samples: 1000
+  num_val_samples: 500
+  min_stars: 500
+  max_stars: 1500
+  image_size: 256
+  max_capacity_per_cell: 3
+  shape_size: 9

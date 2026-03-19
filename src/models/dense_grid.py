@@ -28,7 +28,7 @@ class DenseGridModel(nn.Module):
         )
         
         with torch.no_grad():
-            self.head[-1].bias[-1].fill_(10.0)
+            self.head[-1].bias[-1].fill_(100.0)
 
     def forward(self, x):
         features = self.backbone(x)
@@ -57,7 +57,7 @@ class DenseGridModel(nn.Module):
             "background": bg
         }
 
-def compute_grid_loss(preds, targets, lambda_prob=5.0, lambda_pos=50.0, lambda_flux=1.0, lambda_shape=1.0, lambda_bg=0.01, alpha=0.75, gamma=2.0):
+def compute_grid_loss(preds, targets, lambda_prob=5.0, lambda_pos=50.0, lambda_flux=1.0, lambda_shape=1.0, lambda_bg=1.0, alpha=0.75, gamma=2.0):
     """
     Standard Generative Loss without TV regularization (optimized for speed).
     Maintains positional weighting and faint-star boost.

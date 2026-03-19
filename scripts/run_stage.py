@@ -31,10 +31,13 @@ def load_stage_model(stage_idx, device, config, checkpoint_path=None):
         return None
     
     data_cfg = config["data_params"]
+    stage_key = f"stage{stage_idx}"
+    stage_cfg = config["curriculum"].get(stage_key, {})
+    
     K = data_cfg["max_capacity_per_cell"]
     S = data_cfg["shape_size"]
-    # For stage 0, cell_size is 4 (256/64). For future stages, we'll needs this in config.
-    cell_size = 4 if stage_idx == 0 else 2
+    # Get cell_size from stage config, default to 4
+    cell_size = stage_cfg.get("cell_size", 4)
     
     model = DenseGridModel(K=K, shape_size=S, cell_size=cell_size).to(device)
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
@@ -42,13 +45,15 @@ def load_stage_model(stage_idx, device, config, checkpoint_path=None):
 
 def run_train(stage_idx, config, device):
     print(f"--- 🚀 Curriculum Stage {stage_idx}: Training ---")
-    stage_cfg = get_stage_config(config, stage_idx)
+    stage_key = f"stage{stage_idx}"
+    stage_cfg = config["curriculum"].get(stage_key, {})
     data_cfg = config["data_params"]
     stage_prefix = f"stage{stage_idx}"
     
     # 1. Cleanup old checkpoints if not resuming
     resume_from_last = stage_cfg.get("resume_from_last_stage", False)
     resume_from_ckpt = config["run_config"].get("resume_from_checkpoint", False)
+    force_gen = config["run_config"].get("force_regenerate_data", False)
     
     if not resume_from_last and not resume_from_ckpt:
         checkpoint_dir = "checkpoints"
@@ -57,20 +62,25 @@ def run_train(stage_idx, config, device):
             for f in os.listdir(checkpoint_dir):
                 if f.startswith(stage_prefix) and f.endswith(".pth"):
                     os.remove(os.path.join(checkpoint_dir, f))
-    # Data Setup
-    data_cfg = config["data_params"]
-    stage_prefix = f"stage{stage_idx}"
 
-    # Use K and shape_size from config
+    # Data Setup
     K = data_cfg["max_capacity_per_cell"]
     S = data_cfg["shape_size"]
-    # Stage 0 is 64x64 grid -> cell_size 4
-    cell_size = 4 if stage_idx == 0 else 2
+    cell_size = stage_cfg.get("cell_size", 4)
 
     if stage_idx == 0:
+        mosaic_dir = os.path.join(stage_cfg["data_dir"], "mosaics")
+        if force_gen or not os.path.exists(mosaic_dir) or not os.listdir(mosaic_dir):
+            print("🛠️ Generating Mosaics for Stage 0...")
+            cfg_path = config.get("config_path", "config/config.yaml")
+            # Extract num_mosaics from config if available
+            mos_cfg = stage_cfg.get("mosaic_params", {"num_mosaics": 5})
+            num_mos = mos_cfg.get("num_mosaics", 5)
+            # Use the correct config file path
+            os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/generate_mosaics.py --num {num_mos} --stage {stage_idx} --config {cfg_path}")
+
         from src.data.stage0_gaussian import GaussianMosaicDataset
         print("🛠️ Using Mosaic Sampling for high-speed training...")
-        mosaic_dir = os.path.join(stage_cfg["data_dir"], "mosaics")
         train_dataset = GaussianMosaicDataset(
             mosaic_dir,
             num_samples=data_cfg["num_train_samples"],
@@ -232,6 +242,7 @@ def main():
     
     args = parser.parse_args()
     config = load_config(args.config)
+    config["config_path"] = args.config # Store for sub-scripts
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")

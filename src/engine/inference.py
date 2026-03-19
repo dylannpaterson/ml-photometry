@@ -4,12 +4,15 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 import os
 from scipy.ndimage import zoom
+from astropy.io import fits
 
 class InferenceEngine:
     def __init__(self, model, device, config):
         self.model = model
         self.device = device
         self.config = config
+        # Dynamically determine cell_size based on image_size and grid_size
+        self.img_size = config["data_params"]["image_size"]
 
     def predict(self, image_tensor, threshold=0.5):
         """Runs inference on a single 2D image tensor [1, H, W]."""
@@ -21,8 +24,9 @@ class InferenceEngine:
             bg_map = prediction_dict["background"].squeeze(0).cpu().numpy()
             
         predicted_stars, predicted_shapes = [], []
-        cell_size = 2
         grid_h, grid_w, K, _ = prediction.shape
+        cell_size = self.img_size // grid_h
+        
         for y in range(grid_h):
             for x in range(grid_w):
                 for k in range(K):
@@ -38,10 +42,14 @@ class InferenceEngine:
         from src.engine.evaluator import match_stars
         img = image_tensor.squeeze().numpy()
         H, W = img.shape
+        
+        # Calculate zoom factor for background upsampling
+        bg_h, bg_w = bg_map.shape[:2]
+        zoom_h, zoom_w = H / bg_h, W / bg_w
 
         # 1. Component Preparation
-        full_bg = zoom(bg_map.squeeze(), 2, order=1)
-        full_gt_bg = zoom(gt_bg_map.squeeze(), 2, order=1)
+        full_bg = zoom(bg_map.squeeze(), (zoom_h, zoom_w), order=1)
+        full_gt_bg = zoom(gt_bg_map.squeeze(), (zoom_h, zoom_w), order=1)
         reconstruction = np.zeros_like(img)
         for (x, y, flux, c, p), shape in zip(predicted_stars, predicted_shapes):
             ix, iy, S = int(round(x)), int(round(y)), shape.shape[0]
@@ -53,6 +61,19 @@ class InferenceEngine:
 
         full_reconstruction = reconstruction + full_bg
         residual = img - full_reconstruction
+
+        # --- FITS OUTPUT ---
+        hdul = fits.HDUList([
+            fits.PrimaryHDU(),
+            fits.ImageHDU(img, name="INPUT"),
+            fits.ImageHDU(full_reconstruction, name="MODEL"),
+            fits.ImageHDU(residual, name="RESIDUAL"),
+            fits.ImageHDU(full_bg, name="BG_PRED"),
+            fits.ImageHDU(full_gt_bg, name="BG_TRUE")
+        ])
+        fits_path = output_path.replace(".png", ".fits")
+        hdul.writeto(fits_path, overwrite=True)
+        print(f"FITS data saved to {fits_path}")
 
         # 2. Statistics for Plots
         matches, _, _ = match_stars(true_catalogue, predicted_stars)
@@ -68,7 +89,9 @@ class InferenceEngine:
         gs = fig.add_gridspec(5, 4)
         
         # Row 1-2: Primary Comparisons
-        norm = LogNorm(vmin=10, vmax=max(img.max(), full_reconstruction.max()))
+        # Use background-relative vmin to make stars visible
+        bg_level = np.percentile(img, 10)
+        norm = LogNorm(vmin=max(1.0, bg_level), vmax=max(img.max(), full_reconstruction.max()))
         
         ax1 = fig.add_subplot(gs[0:2, 0])
         ax1.imshow(img, cmap='inferno', origin='lower', norm=norm)

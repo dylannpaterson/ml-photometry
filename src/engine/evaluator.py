@@ -3,7 +3,7 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 from src.data.stage0_gaussian import GaussianPretrainingProvider
 
-def match_stars(true_stars, pred_stars, dist_threshold=2.0):
+def match_stars(true_stars, pred_stars, dist_threshold=1.0):
     if not true_stars or not pred_stars:
         return [], list(range(len(true_stars))), list(range(len(pred_stars)))
 

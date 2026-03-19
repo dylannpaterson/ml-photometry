@@ -79,62 +79,110 @@ class GaussianPretrainingProvider(Dataset):
         return psf.astype(np.float32).flatten()
 
     def generate_chunk(self):
-        """Generates a sparse chunk with a realistic Bulge background (Vectorized)."""
-        # 1. Generate Realistic Background Surface
+        """Generates a realistic Roman-like chunk with guaranteed truth density and separate tail."""
+        # 1. Smooth Background Surface
         x_lin = np.linspace(-1, 1, self.img_size)
         y_lin = np.linspace(-1, 1, self.img_size)
         xx_bg, yy_bg = np.meshgrid(x_lin, y_lin)
         
         c = np.random.uniform(80.0, 120.0)
         coeffs = np.random.uniform(-10.0, 10.0, 5)
-        base_bg = np.maximum(10.0, (coeffs[0]*xx_bg + coeffs[1]*yy_bg + 
-                                    coeffs[2]*xx_bg**2 + coeffs[3]*yy_bg**2 + 
-                                    coeffs[4]*xx_bg*yy_bg + c))
+        smooth_bg = np.maximum(10.0, (coeffs[0]*xx_bg + coeffs[1]*yy_bg + 
+                                      coeffs[2]*xx_bg**2 + coeffs[3]*yy_bg**2 + 
+                                      coeffs[4]*xx_bg*yy_bg + c))
         
-        unresolved_noise = np.random.gamma(shape=2.0, scale=5.0, size=base_bg.shape)
-        gt_background = (base_bg + unresolved_noise).astype(np.float32)
-        
-        # 2. Base image with Poisson-like noise
-        noise_std = np.sqrt(gt_background + self.read_noise**2)
-        image = np.random.normal(loc=gt_background, scale=noise_std).astype(np.float32)
-        
-        # 3. Add detectable stars (Vectorized)
-        num_stars = np.random.randint(self.min_stars, self.max_stars)
-        fluxes = self._sample_luminosity_function(num_stars)
-        x_centers = np.random.uniform(0, self.img_size, num_stars)
-        y_centers = np.random.uniform(0, self.img_size, num_stars)
-        
+        noise_floor = np.sqrt(smooth_bg + self.read_noise**2)
         sigma = 1.5
-        patch_size = int(round(5 * sigma))
-        for i in range(num_stars):
-            ix, iy = int(round(x_centers[i])), int(round(y_centers[i]))
-            x0, x1 = max(0, ix - patch_size), min(self.img_size, ix + patch_size + 1)
-            y0, y1 = max(0, iy - patch_size), min(self.img_size, iy + patch_size + 1)
-            x = np.arange(x0, x1)
-            y = np.arange(y0, y1)[:, np.newaxis]
-            patch = (fluxes[i] / (2 * np.pi * sigma**2)) * np.exp(-((x - x_centers[i])**2 + (y - y_centers[i])**2) / (2 * sigma**2))
-            image[y0:y1, x0:x1] += patch
+        u_patch = 3
+        star_patch = int(round(5 * sigma))
+        
+        # 2. Generate the "Morass" (Tail Population)
+        # Separate population of stars that are physically below 3.5-sigma
+        unresolved_img = np.zeros_like(smooth_bg)
+        num_tail = self.max_stars * 5
+        # Sample fluxes that will mostly result in SNR < 3.5
+        tail_fluxes = np.random.gamma(shape=1.0, scale=10.0, size=num_tail)
+        tail_x = np.random.uniform(0, self.img_size, num_tail)
+        tail_y = np.random.uniform(0, self.img_size, num_tail)
+        
+        for i in range(num_tail):
+            ix, iy = int(round(tail_x[i])), int(round(tail_y[i]))
+            x0, x1 = max(0, ix - u_patch), min(self.img_size, ix + u_patch + 1)
+            y0, y1 = max(0, iy - u_patch), min(self.img_size, iy + u_patch + 1)
+            xx = np.arange(x0, x1)
+            yy = np.arange(y0, y1)[:, np.newaxis]
+            patch = (tail_fluxes[i] / (2 * np.pi * sigma**2)) * np.exp(-((xx - tail_x[i])**2 + (yy - tail_y[i])**2) / (2 * sigma**2))
+            unresolved_img[y0:y1, x0:x1] += patch
 
-        # 4. Grid Assignment
+        # 3. Generate Truth Population (Guaranteed Detectable Stars)
+        num_stars = np.random.randint(self.min_stars, self.max_stars)
+        # Sample from Main LF, but we will filter to ensure density
+        fluxes = self._sample_luminosity_function(num_stars * 2) 
+        x_centers = np.random.uniform(0, self.img_size, num_stars * 2)
+        y_centers = np.random.uniform(0, self.img_size, num_stars * 2)
+        
         base_grid = np.zeros((self.grid_size, self.grid_size, self.K, 5), dtype=np.float32)
-        psf_shape = self._generate_psf_shape(sigma)
-        shapes = []
-        indices = []
-
-        for i in range(num_stars):
+        star_signal = np.zeros_like(smooth_bg)
+        psf_shape = self._generate_psf_shape(sigma=1.5)
+        shapes, indices = [], []
+        
+        truth_count = 0
+        for i in range(len(fluxes)):
+            if truth_count >= num_stars: break
+            
             px, py = int(np.clip(x_centers[i], 0, self.img_size-1)), int(np.clip(y_centers[i], 0, self.img_size-1))
-            local_bg = gt_background[py, px]
-            snr = fluxes[i] / np.sqrt(fluxes[i] + local_bg + self.read_noise**2)
-            completeness = float(np.clip((snr - 3.0) / 7.0, 0.0, 1.0))
-            cell_x, cell_y = int(x_centers[i] // self.cell_size), int(y_centers[i] // self.cell_size)
-            cell_x, cell_y = min(cell_x, self.grid_size - 1), min(cell_y, self.grid_size - 1)
-            for slot in range(self.K):
-                if base_grid[cell_y, cell_x, slot, 0] == 0.0:
-                    base_grid[cell_y, cell_x, slot] = [1.0, x_centers[i] % self.cell_size, y_centers[i] % self.cell_size, np.log10(fluxes[i] + 1e-9), completeness]
-                    shapes.append(psf_shape)
-                    indices.append([cell_y, cell_x, slot])
-                    break
+            local_noise = noise_floor[py, px]
+            snr = fluxes[i] / (local_noise * 4.0)
+            
+            if snr >= 3.5:
+                cell_x, cell_y = int(x_centers[i] // self.cell_size), int(y_centers[i] // self.cell_size)
+                cell_x, cell_y = min(cell_x, self.grid_size - 1), min(cell_y, self.grid_size - 1)
+                
+                slot_found = False
+                for slot in range(self.K):
+                    if base_grid[cell_y, cell_x, slot, 0] == 0.0:
+                        completeness = float(np.clip((snr - 3.5) / 4.5, 0.0, 1.0))
+                        base_grid[cell_y, cell_x, slot] = [1.0, x_centers[i] % self.cell_size, y_centers[i] % self.cell_size, np.log10(fluxes[i] + 1e-9), completeness]
+                        shapes.append(psf_shape)
+                        indices.append([cell_y, cell_x, slot])
+                        slot_found = True
+                        break
+                
+                if slot_found:
+                    ix, iy = px, py
+                    x0, x1 = max(0, ix - star_patch), min(self.img_size, ix + star_patch + 1)
+                    y0, y1 = max(0, iy - star_patch), min(self.img_size, iy + star_patch + 1)
+                    xx = np.arange(x0, x1)
+                    yy = np.arange(y0, y1)[:, np.newaxis]
+                    patch = (fluxes[i] / (2 * np.pi * sigma**2)) * np.exp(-((xx - x_centers[i])**2 + (yy - y_centers[i])**2) / (2 * sigma**2))
+                    star_signal[y0:y1, x0:x1] += patch
+                    truth_count += 1
+            else:
+                # Faint star from main population also goes to confusion
+                ix, iy = px, py
+                x0, x1 = max(0, ix - u_patch), min(self.img_size, ix + u_patch + 1)
+                y0, y1 = max(0, iy - u_patch), min(self.img_size, iy + u_patch + 1)
+                xx = np.arange(x0, x1)
+                yy = np.arange(y0, y1)[:, np.newaxis]
+                patch = (fluxes[i] / (2 * np.pi * sigma**2)) * np.exp(-((xx - x_centers[i])**2 + (yy - y_centers[i])**2) / (2 * sigma**2))
+                unresolved_img[y0:y1, x0:x1] += patch
 
+        # 4. Final Image Assembly
+        gt_background = (smooth_bg + unresolved_img).astype(np.float32)
+        total_photon_flux = gt_background + star_signal
+        noise_std = np.sqrt(total_photon_flux + self.read_noise**2)
+        image = np.random.normal(loc=total_photon_flux, scale=noise_std).astype(np.float32)
+
+        # 5. Grid Assembly
+        bg_grid = gt_background.reshape(self.grid_size, self.cell_size, self.grid_size, self.cell_size).mean(axis=(1, 3))
+
+        # 4. Final Image Assembly
+        gt_background = (smooth_bg + unresolved_img).astype(np.float32)
+        total_photon_flux = gt_background + star_signal
+        noise_std = np.sqrt(total_photon_flux + self.read_noise**2)
+        image = np.random.normal(loc=total_photon_flux, scale=noise_std).astype(np.float32)
+
+        # 5. Grid Assembly
         bg_grid = gt_background.reshape(self.grid_size, self.cell_size, self.grid_size, self.cell_size).mean(axis=(1, 3))
 
         return {
@@ -164,7 +212,7 @@ class GaussianPretrainingProvider(Dataset):
 
 class GaussianMosaicDataset(Dataset):
     def __init__(self, data_dir, num_samples=25000, image_size=256, cell_size=4):
-        """Uses memory-mapping for images and RAM for sparse data to maximize speed/RAM balance."""
+        """Uses dual memory-mapping (Image + Dense Target) for absolute maximum speed."""
         self.data_dir = data_dir
         self.num_samples = num_samples
         self.img_size = image_size
@@ -172,20 +220,20 @@ class GaussianMosaicDataset(Dataset):
         self.grid_size = image_size // cell_size
         
         self.image_files = sorted([f for f in os.listdir(data_dir) if f.endswith("_img.npy")])
-        self.sparse_files = sorted([f for f in os.listdir(data_dir) if f.endswith("_sparse.pt")])
+        self.target_files = sorted([f for f in os.listdir(data_dir) if f.endswith("_target.npy")])
         
         if not self.image_files:
             raise FileNotFoundError(f"No mosaics found in {data_dir}. Run scripts/generate_mosaics.py first.")
             
-        print(f"🔗 Loading {len(self.sparse_files)} SCA Mosaics (Hybrid RAM/mmap)...")
+        print(f"🔗 Memory-mapping {len(self.image_files)} SCA Mosaics (Dual-mmap)...")
         self.mosaics = []
-        for img_f, spr_f in zip(self.image_files, self.sparse_files):
+        for img_f, tgt_f in zip(self.image_files, self.target_files):
             # Memory-map the large image
             img_mmap = np.load(os.path.join(data_dir, img_f), mmap_mode='r')
-            # Load sparse data into RAM (it's small)
-            sparse_data = torch.load(os.path.join(data_dir, spr_f), map_location='cpu')
-            self.mosaics.append((img_mmap, sparse_data))
-        print(f"✅ Ready to sample {num_samples} chunks.")
+            # Memory-map the large dense target grid
+            tgt_mmap = np.load(os.path.join(data_dir, tgt_f), mmap_mode='r')
+            self.mosaics.append((img_mmap, tgt_mmap))
+        print(f"✅ Ready to sample {num_samples} chunks (zero-overhead).")
 
     def __len__(self):
         return self.num_samples
@@ -193,42 +241,19 @@ class GaussianMosaicDataset(Dataset):
     def __getitem__(self, idx):
         # 1. Pick a random mosaic
         mosaic_idx = np.random.randint(0, len(self.mosaics))
-        full_img, spr = self.mosaics[mosaic_idx]
+        full_img, full_tgt = self.mosaics[mosaic_idx]
         
         # 2. Pick a random crop
-        # SCA is 4088x4088, grid is 1022x1022
-        full_grid_size = spr["background_map"].shape[0]
-        max_y_grid = full_grid_size - self.grid_size
-        max_x_grid = full_grid_size - self.grid_size
+        # SCA is 4088x4088, grid is 1022x1022 (for cell_size=4)
+        full_grid_size = full_tgt.shape[0]
+        max_grid = full_grid_size - self.grid_size
         
-        gy, gx = np.random.randint(0, max_y_grid), np.random.randint(0, max_x_grid)
+        gy = np.random.randint(0, max_grid)
+        gx = np.random.randint(0, max_grid)
         py, px = gy * self.cell_size, gx * self.cell_size
         
-        # 3. Slice Image (from mmap)
+        # 3. Direct Slices (No logic, just memory access)
         image = torch.from_numpy(full_img[py:py+self.img_size, px:px+self.img_size].copy()).unsqueeze(0).float()
-        
-        # 4. Redensify Target Crop (Fast, since it's only 64x64)
-        K = spr["base_grid"].shape[2]
-        S2 = spr["shapes"].shape[1]
-        target = torch.zeros((self.grid_size, self.grid_size, K, 5 + S2 + 1), dtype=torch.float32)
-        
-        # Slice the sparse components
-        target[..., :5] = spr["base_grid"][gy:gy+self.grid_size, gx:gx+self.grid_size]
-        target[..., -1] = spr["background_map"][gy:gy+self.grid_size, gx:gx+self.grid_size].unsqueeze(-1)
-        
-        # Fill shapes for this crop
-        indices = spr["indices"] # [N, 3]
-        # Filter indices that fall within our crop
-        mask = (indices[:, 0] >= gy) & (indices[:, 0] < gy + self.grid_size) & \
-               (indices[:, 1] >= gx) & (indices[:, 1] < gx + self.grid_size)
-        
-        if mask.any():
-            crop_indices = indices[mask]
-            crop_shapes = spr["shapes"][mask]
-            # Adjust indices relative to crop
-            ry = crop_indices[:, 0] - gy
-            rx = crop_indices[:, 1] - gx
-            rk = crop_indices[:, 2]
-            target[ry, rx, rk, 5:5+S2] = crop_shapes
+        target = torch.from_numpy(full_tgt[gy:gy+self.grid_size, gx:gx+self.grid_size].copy())
             
         return image, target
