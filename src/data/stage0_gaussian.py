@@ -79,22 +79,30 @@ class GaussianPretrainingProvider(Dataset):
         return psf.astype(np.float32).flatten()
 
     def generate_chunk(self):
-        """Generates a sparse chunk with a polynomial background (Vectorized)."""
-        # 1. Generate Background Surface
+        """Generates a sparse chunk with a realistic Bulge background (Vectorized)."""
+        # 1. Generate Realistic Background Surface
+        # Galactic Bulge has high background from unresolved stars and zodiacal light
         x_lin = np.linspace(-1, 1, self.img_size)
         y_lin = np.linspace(-1, 1, self.img_size)
         xx_bg, yy_bg = np.meshgrid(x_lin, y_lin)
         
-        c = np.random.uniform(8.0, 12.0)
-        coeffs = np.random.uniform(-2.0, 2.0, 5)
-        gt_background = np.maximum(0.1, (coeffs[0]*xx_bg + coeffs[1]*yy_bg + 
-                                        coeffs[2]*xx_bg**2 + coeffs[3]*yy_bg**2 + 
-                                        coeffs[4]*xx_bg*yy_bg + c)).astype(np.float32)
+        # Mean background level approx 100.0 e- (typical for Bulge F146)
+        c = np.random.uniform(80.0, 120.0)
+        coeffs = np.random.uniform(-10.0, 10.0, 5)
+        base_bg = np.maximum(10.0, (coeffs[0]*xx_bg + coeffs[1]*yy_bg + 
+                                    coeffs[2]*xx_bg**2 + coeffs[3]*yy_bg**2 + 
+                                    coeffs[4]*xx_bg*yy_bg + c))
         
-        # 2. Base image with noise
-        image = np.random.normal(loc=gt_background, scale=2.0).astype(np.float32)
+        # Add high-frequency "unresolved star" noise (correlated noise)
+        unresolved_noise = np.random.gamma(shape=2.0, scale=5.0, size=base_bg.shape)
+        gt_background = (base_bg + unresolved_noise).astype(np.float32)
         
-        # 3. Add stars (Vectorized)
+        # 2. Base image with Poisson-like noise
+        # Variance = Mean + ReadNoise^2
+        noise_std = np.sqrt(gt_background + self.read_noise**2)
+        image = np.random.normal(loc=gt_background, scale=noise_std).astype(np.float32)
+        
+        # 3. Add detectable stars (Vectorized)
         num_stars = np.random.randint(self.min_stars, self.max_stars)
         fluxes = self._sample_luminosity_function(num_stars)
         x_centers = np.random.uniform(0, self.img_size, num_stars)
