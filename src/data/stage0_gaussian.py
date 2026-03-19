@@ -81,24 +81,20 @@ class GaussianPretrainingProvider(Dataset):
     def generate_chunk(self):
         """Generates a sparse chunk with a realistic Bulge background (Vectorized)."""
         # 1. Generate Realistic Background Surface
-        # Galactic Bulge has high background from unresolved stars and zodiacal light
         x_lin = np.linspace(-1, 1, self.img_size)
         y_lin = np.linspace(-1, 1, self.img_size)
         xx_bg, yy_bg = np.meshgrid(x_lin, y_lin)
         
-        # Mean background level approx 100.0 e- (typical for Bulge F146)
         c = np.random.uniform(80.0, 120.0)
         coeffs = np.random.uniform(-10.0, 10.0, 5)
         base_bg = np.maximum(10.0, (coeffs[0]*xx_bg + coeffs[1]*yy_bg + 
                                     coeffs[2]*xx_bg**2 + coeffs[3]*yy_bg**2 + 
                                     coeffs[4]*xx_bg*yy_bg + c))
         
-        # Add high-frequency "unresolved star" noise (correlated noise)
         unresolved_noise = np.random.gamma(shape=2.0, scale=5.0, size=base_bg.shape)
         gt_background = (base_bg + unresolved_noise).astype(np.float32)
         
         # 2. Base image with Poisson-like noise
-        # Variance = Mean + ReadNoise^2
         noise_std = np.sqrt(gt_background + self.read_noise**2)
         image = np.random.normal(loc=gt_background, scale=noise_std).astype(np.float32)
         
@@ -168,43 +164,47 @@ class GaussianPretrainingProvider(Dataset):
 
 class GaussianMosaicDataset(Dataset):
     def __init__(self, data_dir, num_samples=25000, image_size=256, cell_size=4):
-        """Loads large mosaics into memory and samples random chunks."""
+        """Uses memory-mapping to sample random chunks from large mosaics without OOM."""
         self.data_dir = data_dir
         self.num_samples = num_samples
         self.img_size = image_size
         self.cell_size = cell_size
         self.grid_size = image_size // cell_size
         
-        self.image_files = sorted([f for f in os.listdir(data_dir) if f.endswith("_img.pt")])
-        self.target_files = sorted([f for f in os.listdir(data_dir) if f.endswith("_tgt.pt")])
+        self.image_files = sorted([f for f in os.listdir(data_dir) if f.endswith("_img.npy")])
+        self.target_files = sorted([f for f in os.listdir(data_dir) if f.endswith("_tgt.npy")])
         
         if not self.image_files:
-            raise FileNotFoundError(f"No mosaic files found in {data_dir}. Run scripts/generate_mosaics.py first.")
+            raise FileNotFoundError(f"No .npy mosaic files found in {data_dir}. Run scripts/generate_mosaics.py first.")
             
-        print(f"📦 Loading {len(self.image_files)} SCA Mosaics into RAM...")
+        print(f"🔗 Memory-mapping {len(self.image_files)} SCA Mosaics...")
         self.mosaics = []
         for img_f, tgt_f in zip(self.image_files, self.target_files):
-            img = torch.load(os.path.join(data_dir, img_f), map_location='cpu')
-            tgt = torch.load(os.path.join(data_dir, tgt_f), map_location='cpu')
+            img = np.load(os.path.join(data_dir, img_f), mmap_mode='r')
+            tgt = np.load(os.path.join(data_dir, tgt_f), mmap_mode='r')
             self.mosaics.append((img, tgt))
-        print(f"✅ Ready to sample {num_samples} chunks.")
+        print(f"✅ Ready to sample {num_samples} chunks (Virtual Memory mode).")
 
     def __len__(self):
         return self.num_samples
 
     def __getitem__(self, idx):
+        # Pick a random mosaic
         mosaic_idx = np.random.randint(0, len(self.mosaics))
         full_img, full_tgt = self.mosaics[mosaic_idx]
         
+        # Calculate bounds
         max_y_grid = full_tgt.shape[0] - self.grid_size
         max_x_grid = full_tgt.shape[1] - self.grid_size
         
         gy = np.random.randint(0, max_y_grid)
         gx = np.random.randint(0, max_x_grid)
         
+        # Pixel coordinates
         py, px = gy * self.cell_size, gx * self.cell_size
         
-        img_chunk = full_img[py : py + self.img_size, px : px + self.img_size].unsqueeze(0).float()
-        tgt_chunk = full_tgt[gy : gy + self.grid_size, gx : gx + self.grid_size].float()
+        # Slice from mmap (instantly loads from disk cache)
+        img_chunk = torch.from_numpy(full_img[py : py + self.img_size, px : px + self.img_size].copy()).unsqueeze(0).float()
+        tgt_chunk = torch.from_numpy(full_tgt[gy : gy + self.grid_size, gx : gx + self.grid_size].copy()).float()
         
         return img_chunk, tgt_chunk
