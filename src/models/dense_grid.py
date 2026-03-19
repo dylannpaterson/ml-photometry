@@ -4,6 +4,32 @@ import torch.nn.functional as F
 import torchvision.models as models
 import numpy as np
 
+class CoordConv(nn.Module):
+    """Adds normalized (x, y) coordinate channels to the input."""
+    def __init__(self, in_channels, out_channels, kernel_size=1, padding=0):
+        super(CoordConv, self).__init__()
+        self.conv = nn.Conv2d(in_channels + 2, out_channels, kernel_size=kernel_size, padding=padding)
+
+    def forward(self, x):
+        batch_size, _, h, w = x.size()
+        xx = torch.arange(w).view(1, 1, 1, w).expand(batch_size, 1, h, w).float() / (w - 1)
+        yy = torch.arange(h).view(1, 1, h, 1).expand(batch_size, 1, h, w).float() / (h - 1)
+        xx = xx.to(x.device) * 2 - 1
+        yy = yy.to(x.device) * 2 - 1
+        x = torch.cat([x, xx, yy], dim=1)
+        return self.conv(x)
+
+class FPNBlock(nn.Module):
+    def __init__(self, high_res_in, low_res_in, out_channels):
+        super(FPNBlock, self).__init__()
+        self.lateral = nn.Conv2d(high_res_in, out_channels, kernel_size=1)
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.smooth = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+
+    def forward(self, high_res, low_res):
+        # low_res comes from deeper in the network, needs upsampling
+        return self.smooth(self.lateral(high_res) + self.up(low_res))
+
 class DenseGridModel(nn.Module):
     def __init__(self, K=3, shape_size=9, cell_size=4):
         super(DenseGridModel, self).__init__()
@@ -12,27 +38,51 @@ class DenseGridModel(nn.Module):
         self.cell_size = float(cell_size)
         self.num_output_channels = self.K * (5 + self.S2) + 1
 
+        # 1. Backbone: Full ResNet-34
         resnet = models.resnet34(weights=None)
-        self.backbone = nn.Sequential(
+        self.initial = nn.Sequential(
             nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False),
             resnet.bn1,
             resnet.relu,
-            resnet.maxpool,
-            resnet.layer1, 
+            resnet.maxpool, # Stride 4, Output 64x64
         )
-        
+        self.layer1 = resnet.layer1 # 64x64, 64ch
+        self.layer2 = resnet.layer2 # 32x32, 128ch
+        self.layer3 = resnet.layer3 # 16x16, 256ch
+        self.layer4 = resnet.layer4 # 8x8, 512ch
+
+        # 2. FPN Neck: Merge deep context back to the 64x64 prediction grid
+        # We want to end up at 64x64 resolution (Stride 4)
+        self.top_layer = nn.Conv2d(512, 128, kernel_size=1) # 8x8
+        self.fpn3 = FPNBlock(256, 128, 128) # 16x16
+        self.fpn2 = FPNBlock(128, 128, 128) # 32x32
+        self.fpn1 = FPNBlock(64, 128, 128)  # 64x64
+
+        # 3. Prediction Head with CoordConv for spatial awareness
         self.head = nn.Sequential(
-            nn.Conv2d(64, 256, kernel_size=3, padding=1),
+            CoordConv(128, 256, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(256, self.num_output_channels, kernel_size=1)
         )
         
         with torch.no_grad():
-            self.head[-1].bias[-1].fill_(100.0)
+            self.head[-1].bias[-1].fill_(100.0) # Initial BG guess
 
     def forward(self, x):
-        features = self.backbone(x)
-        out = self.head(features)
+        # Bottom-up
+        c0 = self.initial(x)
+        c1 = self.layer1(c0)
+        c2 = self.layer2(c1)
+        c3 = self.layer3(c2)
+        c4 = self.layer4(c3)
+
+        # Top-down (FPN)
+        p4 = self.top_layer(c4)
+        p3 = self.fpn3(c3, p4)
+        p2 = self.fpn2(c2, p3)
+        p1 = self.fpn1(c1, p2) # Final 64x64 features
+
+        out = self.head(p1)
         
         B, C, H, W = out.shape
         star_out = out[:, :-1, :, :]
