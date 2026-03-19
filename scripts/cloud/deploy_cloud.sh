@@ -89,6 +89,9 @@ EOF
     gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" << EOF
         cd ~/ml-photometry
         
+        # Wipe old logs for a clean start
+        rm -f training.log pregen_cloud.log setup.log
+        
         chmod +x scripts/cloud/cloud_setup.sh
         ./scripts/cloud/cloud_setup.sh >> setup.log
         
