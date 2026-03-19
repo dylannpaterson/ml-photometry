@@ -100,7 +100,11 @@ EOF
 
         # 1. Pregenerate data for this specific stage (if needed)
         echo "Checking data for Stage $STAGE (Logging to pregen_cloud.log)..."
-        python3 scripts/pregenerate_data.py $STAGE >> pregen_cloud.log 2>&1
+        if [ "$STAGE" == "0" ]; then
+            python3 scripts/generate_mosaics.py --num 10 >> pregen_cloud.log 2>&1
+        else
+            python3 scripts/pregenerate_data.py $STAGE >> pregen_cloud.log 2>&1
+        fi
 
         # 2. Launch Training for this specific stage
         echo "Launching Training for Stage $STAGE..."
