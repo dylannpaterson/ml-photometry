@@ -4,7 +4,7 @@
 # Usage: cloud [status | logs | tail | gpu | kill | ssh | reboot | results]
 
 INSTANCE_NAME="bulge-survey-ml-worker"
-ZONES=("us-east4-c" "asia-east1-c" "asia-east1-a" "us-central1-c" "us-central1-a")
+ZONES=("asia-east1-b" "us-east4-c")
 
 get_current_zone() {
     for zone in "${ZONES[@]}"; do
@@ -51,6 +51,9 @@ case "$1" in
         ;;
     logs)
         gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" --command "tail -n 50 ~/ml-photometry/training.log" --quiet
+        ;;
+    pregen-logs)
+        gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" --command "tail -n 50 ~/ml-photometry/pregen.log" --quiet
         ;;
     tail)
         gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" --command "tail -f ~/ml-photometry/training.log" --quiet
