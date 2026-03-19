@@ -7,7 +7,7 @@ curriculum:
   stage0:
     name: "Gaussian Pre-training"
     data_dir: "data/stage0_gaussian"
-    epochs: 50
+    epochs: 100
     batch_size: 32
     learning_rate: 0.0001
     num_workers: 4
@@ -24,7 +24,7 @@ curriculum:
     resume_from_last_stage: true
 
 data_params:
-  num_train_samples: 5000
+  num_train_samples: 25000
   num_val_samples: 1000
   min_stars: 500
   max_stars: 1500

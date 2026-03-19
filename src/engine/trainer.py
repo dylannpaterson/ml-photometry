@@ -26,6 +26,7 @@ class Trainer:
         self.config, self.device, self.checkpoint_prefix = config, device, checkpoint_prefix
         self.epochs, self.lr = epochs, lr
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=5, verbose=True)
         self.start_epoch = 0
 
     def resume(self, checkpoint_path=None):
@@ -47,8 +48,17 @@ class Trainer:
                 loss.backward(); self.optimizer.step(); epoch_loss += loss.item()
                 if i % 100 == 0:
                     print(f"Epoch [{epoch+1}/{self.epochs}], Step [{i}/{len(self.train_loader)}], Loss: {loss.item():.4f} (P:{p_loss.item():.4f}, Pos:{po_loss.item():.4f}, F:{f_loss.item():.4f}, S:{s_loss.item():.4f}, B:{b_loss.item():.4f})")
-            print(f"==> Epoch {epoch+1} Complete | Avg Loss: {epoch_loss/len(self.train_loader):.4f} | Time: {time.time()-start_time:.1f}s")
+            
+            avg_epoch_loss = epoch_loss/len(self.train_loader)
+            print(f"==> Epoch {epoch+1} Complete | Avg Loss: {avg_epoch_loss:.4f} | Time: {time.time()-start_time:.1f}s")
             val_loss = self.validate(); print(f"Validation Loss: {val_loss:.4f}")
+            
+            # Step the scheduler
+            self.scheduler.step(val_loss)
+            curr_lr = self.optimizer.param_groups[0]['lr']
+            if curr_lr < self.lr:
+                print(f"📉 Learning rate adjusted to: {curr_lr:.6f}")
+
             os.makedirs("checkpoints", exist_ok=True)
             torch.save(self.model.state_dict(), os.path.join("checkpoints", f"{self.checkpoint_prefix}_epoch_{epoch+1}.pth"))
         torch.save(self.model.state_dict(), os.path.join("checkpoints", f"{self.checkpoint_prefix}_final.pth"))
