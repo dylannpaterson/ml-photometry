@@ -31,14 +31,27 @@ class GaussianPretrainingProvider(Dataset):
         sparse_sample = self.generate_chunk()
         image = sparse_sample["image"]
         
-        # Redensify exactly like PregeneratedDataset
+        # Redensify exactly like PregeneratedDataset (including shapes)
         base_grid = sparse_sample["base_grid"]
         bg_map = sparse_sample["background_map"]
+        shapes = sparse_sample["shapes"]
+        indices = sparse_sample["indices"]
         
-        # Target shape: [H, W, K, 6]
+        # Target shape: [H, W, K, 5 + S^2 + 1] -> 87 channels for S=9, K=3
+        S2 = self.S * self.S
         grid_size = self.grid_size
-        target = torch.zeros((grid_size, grid_size, self.K, 6), dtype=torch.float32)
-        target[..., :-1] = base_grid
+        target = torch.zeros((grid_size, grid_size, self.K, 5 + S2 + 1), dtype=torch.float32)
+        
+        # Fill base metadata (p, dx, dy, m, c)
+        target[..., :5] = base_grid
+        
+        # Fill shapes at correct indices
+        if len(indices) > 0:
+            for i in range(len(indices)):
+                y, x, k = indices[i]
+                target[y, x, k, 5:5+S2] = shapes[i]
+        
+        # Fill background in last channel
         target[..., -1] = bg_map.unsqueeze(-1)
         
         return image, target
