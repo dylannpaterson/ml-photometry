@@ -98,14 +98,6 @@ EOF
         export PYTHONPATH=\$PYTHONPATH:.
         export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-        # 1. Pregenerate data for this specific stage (if needed)
-        echo "Checking data for Stage $STAGE (Logging to pregen.log)..."
-        if [ "$STAGE" == "0" ]; then
-            python3 scripts/generate_mosaics.py --num 10 >> pregen.log 2>&1
-        else
-            python3 scripts/pregenerate_data.py $STAGE >> pregen.log 2>&1
-        fi
-
         # 2. Launch Training for this specific stage
         echo "Launching Training for Stage $STAGE..."
         pkill -9 -f 'scripts.run_stage' || true
