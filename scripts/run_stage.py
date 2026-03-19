@@ -80,21 +80,19 @@ def run_train(stage_idx, config, device):
             os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/generate_mosaics.py --num {num_mos} --stage {stage_idx} --config {cfg_path}")
 
         from src.data.stage0_gaussian import GaussianMosaicDataset
-        print("🛠️ Using Mosaic Sampling for high-speed training...")
+        print("🛠️ Using Mosaic Sampling for high-speed training & validation...")
         train_dataset = GaussianMosaicDataset(
             mosaic_dir,
             num_samples=data_cfg["num_train_samples"],
             image_size=data_cfg["image_size"],
             cell_size=cell_size
         )
-        val_dataset = GaussianPretrainingProvider(
+        # Use the same mosaics for validation but with a fixed sample count
+        val_dataset = GaussianMosaicDataset(
+            mosaic_dir,
             num_samples=data_cfg["num_val_samples"],
-            min_stars=data_cfg["min_stars"],
-            max_stars=data_cfg["max_stars"],
             image_size=data_cfg["image_size"],
-            max_capacity_per_cell=K,
-            shape_size=S,
-            use_fixed_seed=True # Validate on fixed set
+            cell_size=cell_size
         )
     else:
         data_dir = stage_cfg["data_dir"]
