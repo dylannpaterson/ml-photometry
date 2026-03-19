@@ -8,7 +8,7 @@ from src.models.dense_grid import DenseGridModel
 from src.data.dataset import PregeneratedDataset
 from src.engine.trainer import Trainer
 from src.engine.evaluator import Evaluator
-from src.engine.inference import InferenceEngine
+# Removed top-level InferenceEngine import
 from src.engine.analyzer import ThresholdAnalyzer
 from src.data.stage0_gaussian import GaussianPretrainingProvider
 from torch.utils.data import DataLoader
@@ -154,6 +154,7 @@ def run_eval(stage_idx, config, device, checkpoint=None):
 
 def run_infer(stage_idx, config, device, checkpoint=None):
     from src.engine.evaluator import match_stars
+    from src.engine.inference import InferenceEngine
     print(f"--- 🛰️ Curriculum Stage {stage_idx}: Inference ---")
     model = load_stage_model(stage_idx, device, config, checkpoint)
     if not model: return

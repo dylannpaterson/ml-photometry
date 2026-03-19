@@ -13,7 +13,7 @@ sudo apt-get update && sudo apt-get install -y htop nvtop screen
 echo "Installing Python dependencies..."
 # scipy is required for Hungarian matching in evaluate.py
 pip install --upgrade pip
-pip install scipy matplotlib numpy torch torchvision
+pip install scipy matplotlib numpy torch torchvision astropy
 
 # 3. Verify GPU Availability (Crucial for Cloud runs)
 echo "Checking for NVIDIA GPU..."
