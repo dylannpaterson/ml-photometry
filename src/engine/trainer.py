@@ -26,7 +26,7 @@ class Trainer:
         self.config, self.device, self.checkpoint_prefix = config, device, checkpoint_prefix
         self.epochs, self.lr = epochs, lr
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=5)
         self.start_epoch = 0
 
     def resume(self, checkpoint_path=None):
