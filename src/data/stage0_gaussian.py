@@ -28,8 +28,20 @@ class GaussianPretrainingProvider(Dataset):
     def __getitem__(self, idx):
         if self.use_fixed_seed:
             np.random.seed(idx)
-        image_tensor, target_tensor, _ = self.generate_chunk()
-        return image_tensor, target_tensor
+        sparse_sample = self.generate_chunk()
+        image = sparse_sample["image"]
+        
+        # Redensify exactly like PregeneratedDataset
+        base_grid = sparse_sample["base_grid"]
+        bg_map = sparse_sample["background_map"]
+        
+        # Target shape: [H, W, K, 6]
+        grid_size = self.grid_size
+        target = torch.zeros((grid_size, grid_size, self.K, 6), dtype=torch.float32)
+        target[..., :-1] = base_grid
+        target[..., -1] = bg_map.unsqueeze(-1)
+        
+        return image, target
 
     def _add_star_to_image(self, image, x_center, y_center, flux, sigma=1.5):
         """Adds a normalized 2D Gaussian profile to the image."""
