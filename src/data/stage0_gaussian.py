@@ -2,6 +2,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 import matplotlib.pyplot as plt
+import os
 
 class GaussianPretrainingProvider(Dataset):
     def __init__(self, num_samples=1000, min_stars=100, max_stars=1500, image_size=256, max_capacity_per_cell=3, shape_size=7, use_fixed_seed=False):
@@ -99,37 +100,30 @@ class GaussianPretrainingProvider(Dataset):
         x_centers = np.random.uniform(0, self.img_size, num_stars)
         y_centers = np.random.uniform(0, self.img_size, num_stars)
         
-        # Only render stars onto the image using a local patch to save CPU
         sigma = 1.5
         patch_size = int(round(5 * sigma))
         for i in range(num_stars):
             ix, iy = int(round(x_centers[i])), int(round(y_centers[i]))
             x0, x1 = max(0, ix - patch_size), min(self.img_size, ix + patch_size + 1)
             y0, y1 = max(0, iy - patch_size), min(self.img_size, iy + patch_size + 1)
-            
-            # Local coordinates for the patch
             x = np.arange(x0, x1)
             y = np.arange(y0, y1)[:, np.newaxis]
-            
             patch = (fluxes[i] / (2 * np.pi * sigma**2)) * np.exp(-((x - x_centers[i])**2 + (y - y_centers[i])**2) / (2 * sigma**2))
             image[y0:y1, x0:x1] += patch
 
-        # 4. Grid Assignment (CPU efficient)
+        # 4. Grid Assignment
         base_grid = np.zeros((self.grid_size, self.grid_size, self.K, 5), dtype=np.float32)
         psf_shape = self._generate_psf_shape(sigma)
         shapes = []
         indices = []
 
-        # Use local background from surface for SNR and completeness
         for i in range(num_stars):
             px, py = int(np.clip(x_centers[i], 0, self.img_size-1)), int(np.clip(y_centers[i], 0, self.img_size-1))
             local_bg = gt_background[py, px]
             snr = fluxes[i] / np.sqrt(fluxes[i] + local_bg + self.read_noise**2)
             completeness = float(np.clip((snr - 3.0) / 7.0, 0.0, 1.0))
-            
             cell_x, cell_y = int(x_centers[i] // self.cell_size), int(y_centers[i] // self.cell_size)
             cell_x, cell_y = min(cell_x, self.grid_size - 1), min(cell_y, self.grid_size - 1)
-            
             for slot in range(self.K):
                 if base_grid[cell_y, cell_x, slot, 0] == 0.0:
                     base_grid[cell_y, cell_x, slot] = [1.0, x_centers[i] % self.cell_size, y_centers[i] % self.cell_size, np.log10(fluxes[i] + 1e-9), completeness]
@@ -137,7 +131,6 @@ class GaussianPretrainingProvider(Dataset):
                     indices.append([cell_y, cell_x, slot])
                     break
 
-        # Downsample ground truth background
         bg_grid = gt_background.reshape(self.grid_size, self.cell_size, self.grid_size, self.cell_size).mean(axis=(1, 3))
 
         return {
@@ -153,37 +146,57 @@ class GaussianPretrainingProvider(Dataset):
         img = image_tensor.squeeze().numpy()
         img_min = img.min()
         if img_min <= 0: img = img - img_min + 1e-3
-
         fig, ax = plt.subplots(figsize=(10, 10))
         im = ax.imshow(img, cmap='inferno', origin='lower', norm=LogNorm())
         fig.colorbar(im, ax=ax, label='Flux')
-
         sample_size = min(200, len(true_catalogue))
         indices = np.random.choice(len(true_catalogue), sample_size, replace=False)
         for idx in indices:
             x, y, flux, comp = true_catalogue[idx]
             ax.plot(x, y, 'g+', markersize=5, alpha=comp)
-
         ax.set_title(f"Synthetic Chunk (256x256): {len(true_catalogue)} stars")
         plt.savefig(output_path)
         print(f"Visualization saved to {output_path}")
 
-    def visualize_chunk(self, image_tensor, true_catalogue, output_path="visualization_bulge.png"):
-        from matplotlib.colors import LogNorm
-        img = image_tensor.squeeze().numpy()
-        img_min = img.min()
-        if img_min <= 0: img = img - img_min + 1e-3
+class GaussianMosaicDataset(Dataset):
+    def __init__(self, data_dir, num_samples=25000, image_size=256, cell_size=4):
+        """Loads large mosaics into memory and samples random chunks."""
+        self.data_dir = data_dir
+        self.num_samples = num_samples
+        self.img_size = image_size
+        self.cell_size = cell_size
+        self.grid_size = image_size // cell_size
+        
+        self.image_files = sorted([f for f in os.listdir(data_dir) if f.endswith("_img.pt")])
+        self.target_files = sorted([f for f in os.listdir(data_dir) if f.endswith("_tgt.pt")])
+        
+        if not self.image_files:
+            raise FileNotFoundError(f"No mosaic files found in {data_dir}. Run scripts/generate_mosaics.py first.")
+            
+        print(f"📦 Loading {len(self.image_files)} SCA Mosaics into RAM...")
+        self.mosaics = []
+        for img_f, tgt_f in zip(self.image_files, self.target_files):
+            img = torch.load(os.path.join(data_dir, img_f), map_location='cpu')
+            tgt = torch.load(os.path.join(data_dir, tgt_f), map_location='cpu')
+            self.mosaics.append((img, tgt))
+        print(f"✅ Ready to sample {num_samples} chunks.")
 
-        fig, ax = plt.subplots(figsize=(10, 10))
-        im = ax.imshow(img, cmap='inferno', origin='lower', norm=LogNorm())
-        fig.colorbar(im, ax=ax, label='Flux')
+    def __len__(self):
+        return self.num_samples
 
-        sample_size = min(200, len(true_catalogue))
-        indices = np.random.choice(len(true_catalogue), sample_size, replace=False)
-        for idx in indices:
-            x, y, flux, comp = true_catalogue[idx]
-            ax.plot(x, y, 'g+', markersize=5, alpha=comp)
-
-        ax.set_title(f"Synthetic Chunk (256x256): {len(true_catalogue)} stars")
-        plt.savefig(output_path)
-        print(f"Visualization saved to {output_path}")
+    def __getitem__(self, idx):
+        mosaic_idx = np.random.randint(0, len(self.mosaics))
+        full_img, full_tgt = self.mosaics[mosaic_idx]
+        
+        max_y_grid = full_tgt.shape[0] - self.grid_size
+        max_x_grid = full_tgt.shape[1] - self.grid_size
+        
+        gy = np.random.randint(0, max_y_grid)
+        gx = np.random.randint(0, max_x_grid)
+        
+        py, px = gy * self.cell_size, gx * self.cell_size
+        
+        img_chunk = full_img[py : py + self.img_size, px : px + self.img_size].unsqueeze(0).float()
+        tgt_chunk = full_tgt[gy : gy + self.grid_size, gx : gx + self.grid_size].float()
+        
+        return img_chunk, tgt_chunk

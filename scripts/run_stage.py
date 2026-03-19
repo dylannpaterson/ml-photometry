@@ -68,15 +68,14 @@ def run_train(stage_idx, config, device):
     cell_size = 4 if stage_idx == 0 else 2
 
     if stage_idx == 0:
-        print("🛠️ Using on-the-fly Gaussian data generation (No Disk IO)...")
-        train_dataset = GaussianPretrainingProvider(
+        from src.data.stage0_gaussian import GaussianMosaicDataset
+        print("🛠️ Using Mosaic Sampling for high-speed training...")
+        mosaic_dir = os.path.join(stage_cfg["data_dir"], "mosaics")
+        train_dataset = GaussianMosaicDataset(
+            mosaic_dir,
             num_samples=data_cfg["num_train_samples"],
-            min_stars=data_cfg["min_stars"],
-            max_stars=data_cfg["max_stars"],
             image_size=data_cfg["image_size"],
-            max_capacity_per_cell=K,
-            shape_size=S,
-            use_fixed_seed=False # Train on infinite variations
+            cell_size=cell_size
         )
         val_dataset = GaussianPretrainingProvider(
             num_samples=data_cfg["num_val_samples"],
