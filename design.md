@@ -26,17 +26,23 @@ To develop a machine learning pipeline capable of performing fast, direct point-
 ## 3. Neural Network Architecture
 
 ### Stage 1: The Backbone
-*   **Recommendation:** ResNet-34.
-*   **Output:** $128 \times 128 \times 64$ feature map.
+*   **Backbone:** Full ResNet-34 (all 4 stages).
+*   **Input:** $256 \times 256 \times 1$.
+*   **Multi-scale Features:** Extracts features at $1/4, 1/8, 1/16, 1/32$ resolutions.
 
-### Stage 2: The Grid Prediction Head
-The feature map is passed through a $3 \times 3$ convolutional layer followed by a $1 \times 1$ projection layer.
-*   **Output Layer:** $K \times 86 + 1$ channels (259 channels total for $K=3$).
+### Stage 2: The FPN Neck
+A **Feature Pyramid Network (FPN)** merges deep semantic context from the lower resolutions back into the high-resolution prediction grid.
+*   **Top-down path:** Upsamples deep features and merges them with lateral high-res connections.
+*   **Final Feature Map:** $64 \times 64 \times 128$ tensor (Stride 4 relative to input).
+
+### Stage 3: The Prediction Head
+*   **Spatial Awareness:** Uses **CoordConv** (normalized x,y coordinate channels) to help the model learn geometric dependencies within the grid cells.
+*   **Output Layer:** $K \times (5 + S^2) + 1$ channels (259 channels total for $K=3, S=9$).
 *   **Activations:**
     *   **p, c:** Sigmoid.
-    *   **dx, dy:** Sigmoid $\times 2.0$.
+    *   **dx, dy:** Sigmoid $\times \text{cell\_size}$.
     *   **m:** Linear.
-    *   **S:** Softmax over the 81 values per slot.
+    *   **S:** Softmax over the $S^2$ values per slot.
     *   **b:** ReLU (ensures positive background levels).
 
 ## 4. The Loss Function
@@ -63,3 +69,26 @@ The feature map is passed through a $3 \times 3$ convolutional layer followed by
 To maintain a < 100 GB disk footprint:
 *   **Storage:** Samples save the image, the 5-channel star grid, the 1-channel background map, and a compressed list of 81-pixel shapes.
 *   **JIT Re-densification:** The `Dataset` class re-inflates these into the full $128 \times 128 \times 259$ tensor during training.
+
+## 7. Training Curriculum
+The pipeline uses a multi-stage curriculum to build a robust foundation model for space-based point source recovery.
+
+### Stage 0: Gaussian Pre-training (The "Simple Physics" Phase)
+*   **Objective:** Teach the model the grid-based prediction format using simple 2D Gaussian PSFs.
+*   **Data:** Vectorized synthetic images with physically accurate Roman background levels and noise.
+*   **Goal:** Reach basic competency in detection and flux recovery on smooth, well-defined sources.
+
+### Stage 1: Multi-Telescope Foundation Training (The "Universal Photometrist" Phase)
+*   **Objective:** Build instrument-agnostic features by training on diverse space-based instruments.
+*   **Data:** High-fidelity simulations using **GalSim** for:
+    1. **Roman** (Wide-field, 0.11"/px)
+    2. **Hubble (WFC3/IR)** (Diffraction-limited, 0.13"/px)
+    3. **JWST (NIRCam)** (Hexagonal diffraction, 0.031"/px)
+    4. **Euclid (VIS)** (Unique stable PSF, 0.1"/px)
+    5. **Gaia-like** (Extremely sparse, super-resolution)
+*   **Goal:** Learn to decouple the intrinsic stellar signal from the varied instrumental PSF and noise profiles.
+
+### Stage 2: Roman-specific High-Fidelity Fine-tuning (The "Mission" Phase)
+*   **Objective:** Master the specific artifacts and complex PSF of the Roman Space Telescope.
+*   **Data:** Real mission-simulated data from **Romanisim** including geometric distortion, inter-pixel capacitance (IPC), and time-varying PSFs.
+*   **Goal:** Exceed Mission Acceptance Criteria for the Galactic Bulge Time Domain Survey.

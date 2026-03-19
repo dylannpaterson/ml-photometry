@@ -3,6 +3,7 @@ run_config:
   force_regenerate_data: true
 
 curriculum:
+  # Stage 0: Gaussian Pre-training (The Base Model)
   stage0:
     name: "Roman Bulge Stage 0 (Full)"
     data_dir: "data/bulge_stage0_full"
@@ -15,6 +16,26 @@ curriculum:
     mosaic_params:
       num_mosaics: 5
       mosaic_size: 4088
+
+  # Stage 1: Multi-Telescope Foundation Training (GalSim)
+  stage1:
+    name: "Multi-Telescope Foundation"
+    data_dir: "data/stage1_multitel"
+    epochs: 50
+    batch_size: 64
+    learning_rate: 0.0001
+    num_workers: 4
+    resume_from_last_stage: true
+
+  # Stage 2: Roman-specific High-Fidelity Fine-tuning (Romanisim)
+  stage2:
+    name: "Roman High-Fidelity Fine-tuning"
+    data_dir: "data/stage2_romanisim"
+    epochs: 50
+    batch_size: 32
+    learning_rate: 0.00001
+    num_workers: 4
+    resume_from_last_stage: true
 
 data_params:
   num_train_samples: 50000

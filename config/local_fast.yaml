@@ -3,6 +3,7 @@ run_config:
   force_regenerate_data: true
 
 curriculum:
+  # Stage 0: Gaussian Pre-training
   stage0:
     name: "Local Fast Stage 0"
     data_dir: "data/local_fast"
@@ -11,21 +12,30 @@ curriculum:
     learning_rate: 0.0001
     num_workers: 4
     resume_from_last_stage: false
-    # Parameters moved inside the stage
     cell_size: 4
     mosaic_params:
       num_mosaics: 1
       mosaic_size: 4088
 
+  # Stage 1: Multi-Telescope Foundation
   stage1:
-    name: "Ideal PSF Fine-tuning"
-    data_dir: "data/stage1_romanisim"
-    epochs: 50
+    name: "Local Fast Stage 1"
+    data_dir: "data/local_fast_stage1"
+    epochs: 10
     batch_size: 32
+    learning_rate: 0.0001
+    num_workers: 4
+    resume_from_last_stage: true
+
+  # Stage 2: Roman Fine-tuning
+  stage2:
+    name: "Local Fast Stage 2"
+    data_dir: "data/local_fast_stage2"
+    epochs: 10
+    batch_size: 16
     learning_rate: 0.00001
     num_workers: 4
     resume_from_last_stage: true
-    cell_size: 2 # Different cell size for high-res fine tuning
 
 data_params:
   num_train_samples: 1000

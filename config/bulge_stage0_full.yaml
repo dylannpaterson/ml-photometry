@@ -1,0 +1,26 @@
+run_config:
+  resume_from_checkpoint: false
+  force_regenerate_data: true
+
+curriculum:
+  stage0:
+    name: "Roman Bulge Stage 0 (Full)"
+    data_dir: "data/bulge_stage0_full"
+    epochs: 50
+    batch_size: 128
+    learning_rate: 0.0001
+    num_workers: 4
+    resume_from_last_stage: false
+    cell_size: 4
+    mosaic_params:
+      num_mosaics: 5
+      mosaic_size: 4088
+
+data_params:
+  num_train_samples: 50000
+  num_val_samples: 2000
+  min_stars: 500
+  max_stars: 1500
+  image_size: 256
+  max_capacity_per_cell: 3
+  shape_size: 9
