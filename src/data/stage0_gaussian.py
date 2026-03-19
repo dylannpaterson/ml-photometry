@@ -164,7 +164,7 @@ class GaussianPretrainingProvider(Dataset):
 
 class GaussianMosaicDataset(Dataset):
     def __init__(self, data_dir, num_samples=25000, image_size=256, cell_size=4):
-        """Uses memory-mapping to sample random chunks from large mosaics without OOM."""
+        """Uses memory-mapping for images and RAM for sparse data to maximize speed/RAM balance."""
         self.data_dir = data_dir
         self.num_samples = num_samples
         self.img_size = image_size
@@ -172,39 +172,63 @@ class GaussianMosaicDataset(Dataset):
         self.grid_size = image_size // cell_size
         
         self.image_files = sorted([f for f in os.listdir(data_dir) if f.endswith("_img.npy")])
-        self.target_files = sorted([f for f in os.listdir(data_dir) if f.endswith("_tgt.npy")])
+        self.sparse_files = sorted([f for f in os.listdir(data_dir) if f.endswith("_sparse.pt")])
         
         if not self.image_files:
-            raise FileNotFoundError(f"No .npy mosaic files found in {data_dir}. Run scripts/generate_mosaics.py first.")
+            raise FileNotFoundError(f"No mosaics found in {data_dir}. Run scripts/generate_mosaics.py first.")
             
-        print(f"🔗 Memory-mapping {len(self.image_files)} SCA Mosaics...")
+        print(f"🔗 Loading {len(self.sparse_files)} SCA Mosaics (Hybrid RAM/mmap)...")
         self.mosaics = []
-        for img_f, tgt_f in zip(self.image_files, self.target_files):
-            img = np.load(os.path.join(data_dir, img_f), mmap_mode='r')
-            tgt = np.load(os.path.join(data_dir, tgt_f), mmap_mode='r')
-            self.mosaics.append((img, tgt))
-        print(f"✅ Ready to sample {num_samples} chunks (Virtual Memory mode).")
+        for img_f, spr_f in zip(self.image_files, self.sparse_files):
+            # Memory-map the large image
+            img_mmap = np.load(os.path.join(data_dir, img_f), mmap_mode='r')
+            # Load sparse data into RAM (it's small)
+            sparse_data = torch.load(os.path.join(data_dir, spr_f), map_location='cpu')
+            self.mosaics.append((img_mmap, sparse_data))
+        print(f"✅ Ready to sample {num_samples} chunks.")
 
     def __len__(self):
         return self.num_samples
 
     def __getitem__(self, idx):
-        # Pick a random mosaic
+        # 1. Pick a random mosaic
         mosaic_idx = np.random.randint(0, len(self.mosaics))
-        full_img, full_tgt = self.mosaics[mosaic_idx]
+        full_img, spr = self.mosaics[mosaic_idx]
         
-        # Calculate bounds
-        max_y_grid = full_tgt.shape[0] - self.grid_size
-        max_x_grid = full_tgt.shape[1] - self.grid_size
+        # 2. Pick a random crop
+        # SCA is 4088x4088, grid is 1022x1022
+        full_grid_size = spr["background_map"].shape[0]
+        max_y_grid = full_grid_size - self.grid_size
+        max_x_grid = full_grid_size - self.grid_size
         
-        gy = np.random.randint(0, max_y_grid)
-        gx = np.random.randint(0, max_x_grid)
-        
-        # Pixel coordinates
+        gy, gx = np.random.randint(0, max_y_grid), np.random.randint(0, max_x_grid)
         py, px = gy * self.cell_size, gx * self.cell_size
         
-        # Slice from mmap (instantly loads from disk cache)
-        img_chunk = torch.from_numpy(full_img[py : py + self.img_size, px : px + self.img_size].copy()).unsqueeze(0).float()
-        tgt_chunk = torch.from_numpy(full_tgt[gy : gy + self.grid_size, gx : gx + self.grid_size].copy()).float()
+        # 3. Slice Image (from mmap)
+        image = torch.from_numpy(full_img[py:py+self.img_size, px:px+self.img_size].copy()).unsqueeze(0).float()
         
-        return img_chunk, tgt_chunk
+        # 4. Redensify Target Crop (Fast, since it's only 64x64)
+        K = spr["base_grid"].shape[2]
+        S2 = spr["shapes"].shape[1]
+        target = torch.zeros((self.grid_size, self.grid_size, K, 5 + S2 + 1), dtype=torch.float32)
+        
+        # Slice the sparse components
+        target[..., :5] = spr["base_grid"][gy:gy+self.grid_size, gx:gx+self.grid_size]
+        target[..., -1] = spr["background_map"][gy:gy+self.grid_size, gx:gx+self.grid_size].unsqueeze(-1)
+        
+        # Fill shapes for this crop
+        indices = spr["indices"] # [N, 3]
+        # Filter indices that fall within our crop
+        mask = (indices[:, 0] >= gy) & (indices[:, 0] < gy + self.grid_size) & \
+               (indices[:, 1] >= gx) & (indices[:, 1] < gx + self.grid_size)
+        
+        if mask.any():
+            crop_indices = indices[mask]
+            crop_shapes = spr["shapes"][mask]
+            # Adjust indices relative to crop
+            ry = crop_indices[:, 0] - gy
+            rx = crop_indices[:, 1] - gx
+            rk = crop_indices[:, 2]
+            target[ry, rx, rk, 5:5+S2] = crop_shapes
+            
+        return image, target
