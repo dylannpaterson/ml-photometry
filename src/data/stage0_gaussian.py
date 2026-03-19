@@ -4,7 +4,7 @@ from torch.utils.data import Dataset
 import matplotlib.pyplot as plt
 
 class GaussianPretrainingProvider(Dataset):
-    def __init__(self, num_samples=1000, min_stars=100, max_stars=1500, image_size=256, max_capacity_per_cell=3, shape_size=7):
+    def __init__(self, num_samples=1000, min_stars=100, max_stars=1500, image_size=256, max_capacity_per_cell=3, shape_size=7, use_fixed_seed=False):
         """
         Generates realistic synthetic data for the Roman Bulge Time Domain Survey.
         Edge-to-Edge prediction on 256x256 image with 64x64 grid.
@@ -16,6 +16,7 @@ class GaussianPretrainingProvider(Dataset):
         self.K = max_capacity_per_cell
         self.S = shape_size
         self.read_noise = 5.0
+        self.use_fixed_seed = use_fixed_seed
 
         # Grid parameters: 4x4 cells for 256x256 image = 64x64 grid
         self.cell_size = 4
@@ -25,6 +26,8 @@ class GaussianPretrainingProvider(Dataset):
         return self.num_samples
 
     def __getitem__(self, idx):
+        if self.use_fixed_seed:
+            np.random.seed(idx)
         image_tensor, target_tensor, _ = self.generate_chunk()
         return image_tensor, target_tensor
 

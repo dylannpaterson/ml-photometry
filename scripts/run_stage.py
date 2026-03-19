@@ -57,23 +57,48 @@ def run_train(stage_idx, config, device):
             for f in os.listdir(checkpoint_dir):
                 if f.startswith(stage_prefix) and f.endswith(".pth"):
                     os.remove(os.path.join(checkpoint_dir, f))
-    
     # Data Setup
-    data_dir = stage_cfg["data_dir"]
-    train_dir = os.path.join(data_dir, "train")
-    val_dir = os.path.join(data_dir, "val")
-    
-    if not os.path.exists(train_dir) or not os.listdir(train_dir):
-        print(f"❌ Error: Data not found in {train_dir}. Run 'gen' for stage {stage_idx} first.")
-        return
+    data_cfg = config["data_params"]
+    stage_prefix = f"stage{stage_idx}"
 
     # Use K and shape_size from config
     K = data_cfg["max_capacity_per_cell"]
     S = data_cfg["shape_size"]
+    # Stage 0 is 64x64 grid -> cell_size 4
     cell_size = 4 if stage_idx == 0 else 2
-    
-    train_dataset = PregeneratedDataset(train_dir, K=K, shape_size=S)
-    val_dataset = PregeneratedDataset(val_dir, K=K, shape_size=S)
+
+    if stage_idx == 0:
+        print("🛠️ Using on-the-fly Gaussian data generation (No Disk IO)...")
+        train_dataset = GaussianPretrainingProvider(
+            num_samples=data_cfg["num_train_samples"],
+            min_stars=data_cfg["min_stars"],
+            max_stars=data_cfg["max_stars"],
+            image_size=data_cfg["image_size"],
+            max_capacity_per_cell=K,
+            shape_size=S,
+            use_fixed_seed=False # Train on infinite variations
+        )
+        val_dataset = GaussianPretrainingProvider(
+            num_samples=data_cfg["num_val_samples"],
+            min_stars=data_cfg["min_stars"],
+            max_stars=data_cfg["max_stars"],
+            image_size=data_cfg["image_size"],
+            max_capacity_per_cell=K,
+            shape_size=S,
+            use_fixed_seed=True # Validate on fixed set
+        )
+    else:
+        data_dir = stage_cfg["data_dir"]
+        train_dir = os.path.join(data_dir, "train")
+        val_dir = os.path.join(data_dir, "val")
+
+        if not os.path.exists(train_dir) or not os.listdir(train_dir):
+            print(f"❌ Error: Data not found in {train_dir}. Run 'gen' for stage {stage_idx} first.")
+            return
+
+        train_dataset = PregeneratedDataset(train_dir, K=K, shape_size=S)
+        val_dataset = PregeneratedDataset(val_dir, K=K, shape_size=S)
+
     
     batch_size = stage_cfg["batch_size"]
     num_workers = stage_cfg.get("num_workers", 0)
