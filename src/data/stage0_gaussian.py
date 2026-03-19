@@ -91,17 +91,17 @@ class GaussianPretrainingProvider(Dataset):
                                       coeffs[2]*xx_bg**2 + coeffs[3]*yy_bg**2 + 
                                       coeffs[4]*xx_bg*yy_bg + c))
         
-        noise_floor = np.sqrt(smooth_bg + self.read_noise**2)
         sigma = 1.5
         u_patch = 3
         star_patch = int(round(5 * sigma))
         
-        # 2. Generate the "Morass" (Tail Population)
-        # Separate population of stars that are physically below 3.5-sigma
+        # 2. Generate the "Morass" (Tail Population - Physically Unresolved)
         unresolved_img = np.zeros_like(smooth_bg)
-        num_tail = self.max_stars * 5
-        # Sample fluxes that will mostly result in SNR < 3.5
-        tail_fluxes = np.random.gamma(shape=1.0, scale=10.0, size=num_tail)
+        num_tail = self.max_stars * 10
+        # Sample tail from power law (alpha=2.0) between 1 and 10 photons
+        u_tail = np.random.uniform(0, 1, num_tail)
+        f_min_t, f_max_t = 1.0, 10.0
+        tail_fluxes = ((f_max_t**(1-2.0) - f_min_t**(1-2.0)) * u_tail + f_min_t**(1-2.0))**(1/(1-2.0))
         tail_x = np.random.uniform(0, self.img_size, num_tail)
         tail_y = np.random.uniform(0, self.img_size, num_tail)
         
@@ -114,12 +114,14 @@ class GaussianPretrainingProvider(Dataset):
             patch = (tail_fluxes[i] / (2 * np.pi * sigma**2)) * np.exp(-((xx - tail_x[i])**2 + (yy - tail_y[i])**2) / (2 * sigma**2))
             unresolved_img[y0:y1, x0:x1] += patch
 
-        # 3. Generate Truth Population (Guaranteed Detectable Stars)
-        num_stars = np.random.randint(self.min_stars, self.max_stars)
-        # Sample from Main LF, but we will filter to ensure density
-        fluxes = self._sample_luminosity_function(num_stars * 2) 
-        x_centers = np.random.uniform(0, self.img_size, num_stars * 2)
-        y_centers = np.random.uniform(0, self.img_size, num_stars * 2)
+        # 3. Clean Noise Floor for Detectability (BG + Morass + ReadNoise)
+        noise_floor = np.sqrt(smooth_bg + unresolved_img + self.read_noise**2)
+
+        # 4. Generate Truth Population (Discrete Stars)
+        num_potential = np.random.randint(self.min_stars, self.max_stars)
+        fluxes = self._sample_luminosity_function(num_potential * 2) 
+        x_centers = np.random.uniform(0, self.img_size, num_potential * 2)
+        y_centers = np.random.uniform(0, self.img_size, num_potential * 2)
         
         base_grid = np.zeros((self.grid_size, self.grid_size, self.K, 5), dtype=np.float32)
         star_signal = np.zeros_like(smooth_bg)
@@ -128,19 +130,21 @@ class GaussianPretrainingProvider(Dataset):
         
         truth_count = 0
         for i in range(len(fluxes)):
-            if truth_count >= num_stars: break
+            if truth_count >= num_potential: break
             
             px, py = int(np.clip(x_centers[i], 0, self.img_size-1)), int(np.clip(y_centers[i], 0, self.img_size-1))
             local_noise = noise_floor[py, px]
             snr = fluxes[i] / (local_noise * 4.0)
             
-            if snr >= 3.5:
+            # Threshold: SNR > 2.0 is visible truth
+            if snr >= 2.0:
                 cell_x, cell_y = int(x_centers[i] // self.cell_size), int(y_centers[i] // self.cell_size)
                 cell_x, cell_y = min(cell_x, self.grid_size - 1), min(cell_y, self.grid_size - 1)
                 
                 slot_found = False
                 for slot in range(self.K):
                     if base_grid[cell_y, cell_x, slot, 0] == 0.0:
+                        # Completeness: 50% at 5-sigma, 100% at 8-sigma
                         completeness = float(np.clip((snr - 3.5) / 4.5, 0.0, 1.0))
                         base_grid[cell_y, cell_x, slot] = [1.0, x_centers[i] % self.cell_size, y_centers[i] % self.cell_size, np.log10(fluxes[i] + 1e-9), completeness]
                         shapes.append(psf_shape)
@@ -158,7 +162,7 @@ class GaussianPretrainingProvider(Dataset):
                     star_signal[y0:y1, x0:x1] += patch
                     truth_count += 1
             else:
-                # Faint star from main population also goes to confusion
+                # Sub-threshold: Convolve into unresolved_img
                 ix, iy = px, py
                 x0, x1 = max(0, ix - u_patch), min(self.img_size, ix + u_patch + 1)
                 y0, y1 = max(0, iy - u_patch), min(self.img_size, iy + u_patch + 1)
@@ -167,22 +171,13 @@ class GaussianPretrainingProvider(Dataset):
                 patch = (fluxes[i] / (2 * np.pi * sigma**2)) * np.exp(-((xx - x_centers[i])**2 + (yy - y_centers[i])**2) / (2 * sigma**2))
                 unresolved_img[y0:y1, x0:x1] += patch
 
-        # 4. Final Image Assembly
+        # 5. Final Image Assembly
         gt_background = (smooth_bg + unresolved_img).astype(np.float32)
         total_photon_flux = gt_background + star_signal
         noise_std = np.sqrt(total_photon_flux + self.read_noise**2)
         image = np.random.normal(loc=total_photon_flux, scale=noise_std).astype(np.float32)
 
-        # 5. Grid Assembly
-        bg_grid = gt_background.reshape(self.grid_size, self.cell_size, self.grid_size, self.cell_size).mean(axis=(1, 3))
-
-        # 4. Final Image Assembly
-        gt_background = (smooth_bg + unresolved_img).astype(np.float32)
-        total_photon_flux = gt_background + star_signal
-        noise_std = np.sqrt(total_photon_flux + self.read_noise**2)
-        image = np.random.normal(loc=total_photon_flux, scale=noise_std).astype(np.float32)
-
-        # 5. Grid Assembly
+        # 6. Grid Assembly
         bg_grid = gt_background.reshape(self.grid_size, self.cell_size, self.grid_size, self.cell_size).mean(axis=(1, 3))
 
         return {
