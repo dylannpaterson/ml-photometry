@@ -128,41 +128,24 @@ class GaussianPretrainingProvider(Dataset):
         psf_shape = self._generate_psf_shape(sigma=1.5)
         shapes, indices = [], []
         
-        truth_count = 0
+        # 1. Group potential truth stars by cell
+        cell_assignments = {} # (cy, cx) -> list of [flux, tx, ty, snr, tcomp]
+
         for i in range(len(fluxes)):
-            if truth_count >= num_potential: break
-            
             px, py = int(np.clip(x_centers[i], 0, self.img_size-1)), int(np.clip(y_centers[i], 0, self.img_size-1))
             local_noise = noise_floor[py, px]
             snr = fluxes[i] / (local_noise * 4.0)
             
-            # Threshold: SNR > 2.0 is visible truth
             if snr >= 2.0:
-                cell_x, cell_y = int(x_centers[i] // self.cell_size), int(y_centers[i] // self.cell_size)
-                cell_x, cell_y = min(cell_x, self.grid_size - 1), min(cell_y, self.grid_size - 1)
+                cx, cy = int(x_centers[i] // self.cell_size), int(y_centers[i] // self.cell_size)
+                cx, cy = min(cx, self.grid_size - 1), min(cy, self.grid_size - 1)
                 
-                slot_found = False
-                for slot in range(self.K):
-                    if base_grid[cell_y, cell_x, slot, 0] == 0.0:
-                        # Completeness: 50% at 5-sigma, 100% at 8-sigma
-                        completeness = float(np.clip((snr - 3.5) / 4.5, 0.0, 1.0))
-                        base_grid[cell_y, cell_x, slot] = [1.0, x_centers[i] % self.cell_size, y_centers[i] % self.cell_size, np.log10(fluxes[i] + 1e-9), completeness]
-                        shapes.append(psf_shape)
-                        indices.append([cell_y, cell_x, slot])
-                        slot_found = True
-                        break
+                if (cy, cx) not in cell_assignments: cell_assignments[(cy, cx)] = []
                 
-                if slot_found:
-                    ix, iy = px, py
-                    x0, x1 = max(0, ix - star_patch), min(self.img_size, ix + star_patch + 1)
-                    y0, y1 = max(0, iy - star_patch), min(self.img_size, iy + star_patch + 1)
-                    xx = np.arange(x0, x1)
-                    yy = np.arange(y0, y1)[:, np.newaxis]
-                    patch = (fluxes[i] / (2 * np.pi * sigma**2)) * np.exp(-((xx - x_centers[i])**2 + (yy - y_centers[i])**2) / (2 * sigma**2))
-                    star_signal[y0:y1, x0:x1] += patch
-                    truth_count += 1
+                completeness = float(np.clip((snr - 3.5) / 4.5, 0.0, 1.0))
+                cell_assignments[(cy, cx)].append([fluxes[i], x_centers[i], y_centers[i], snr, completeness])
             else:
-                # Sub-threshold: Convolve into unresolved_img
+                # Sub-threshold stars go to background
                 ix, iy = px, py
                 x0, x1 = max(0, ix - u_patch), min(self.img_size, ix + u_patch + 1)
                 y0, y1 = max(0, iy - u_patch), min(self.img_size, iy + u_patch + 1)
@@ -170,6 +153,39 @@ class GaussianPretrainingProvider(Dataset):
                 yy = np.arange(y0, y1)[:, np.newaxis]
                 patch = (fluxes[i] / (2 * np.pi * sigma**2)) * np.exp(-((xx - x_centers[i])**2 + (yy - y_centers[i])**2) / (2 * sigma**2))
                 unresolved_img[y0:y1, x0:x1] += patch
+
+        # 2. Canonical Sorting: Process each cell and assign to slots by flux
+        for (cy, cx), cell_stars in cell_assignments.items():
+            # Sort stars in this cell by flux (brightest first)
+            sorted_stars = sorted(cell_stars, key=lambda x: x[0], reverse=True)
+            
+            for slot in range(min(self.K, len(sorted_stars))):
+                flux, tx, ty, snr, tcomp = sorted_stars[slot]
+                
+                base_grid[cy, cx, slot] = [1.0, tx % self.cell_size, ty % self.cell_size, np.log10(flux + 1e-9), tcomp]
+                shapes.append(psf_shape)
+                indices.append([cy, cx, slot])
+                
+                # Add to star signal for Poisson noise calculation
+                ix, iy = int(np.clip(tx, 0, self.img_size-1)), int(np.clip(ty, 0, self.img_size-1))
+                x0, x1 = max(0, ix - star_patch), min(self.img_size, ix + star_patch + 1)
+                y0, y1 = max(0, iy - star_patch), min(self.img_size, iy + star_patch + 1)
+                xx = np.arange(x0, x1)
+                yy = np.arange(y0, y1)[:, np.newaxis]
+                patch = (flux / (2 * np.pi * sigma**2)) * np.exp(-((xx - tx)**2 + (yy - ty)**2) / (2 * sigma**2))
+                star_signal[y0:y1, x0:x1] += patch
+            
+            # Overflow stars (beyond K) become background confusion
+            if len(sorted_stars) > self.K:
+                for i in range(self.K, len(sorted_stars)):
+                    flux, tx, ty, _, _ = sorted_stars[i]
+                    ix, iy = int(np.clip(tx, 0, self.img_size-1)), int(np.clip(ty, 0, self.img_size-1))
+                    x0, x1 = max(0, ix - u_patch), min(self.img_size, ix + u_patch + 1)
+                    y0, y1 = max(0, iy - u_patch), min(self.img_size, iy + u_patch + 1)
+                    xx = np.arange(x0, x1)
+                    yy = np.arange(y0, y1)[:, np.newaxis]
+                    patch = (flux / (2 * np.pi * sigma**2)) * np.exp(-((xx - tx)**2 + (yy - ty)**2) / (2 * sigma**2))
+                    unresolved_img[y0:y1, x0:x1] += patch
 
         # 5. Final Image Assembly
         gt_background = (smooth_bg + unresolved_img).astype(np.float32)
