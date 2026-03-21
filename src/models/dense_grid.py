@@ -93,7 +93,8 @@ class DenseGridModel(nn.Module):
         p = torch.sigmoid(star_out[..., 0:1])
         dx = torch.sigmoid(star_out[..., 1:2]) * self.cell_size
         dy = torch.sigmoid(star_out[..., 2:3]) * self.cell_size
-        m = star_out[..., 3:4]
+        # FLUX FIX: Use exp activation to map to wide physical fluxes stably
+        m = torch.exp(star_out[..., 3:4])
         c = torch.sigmoid(star_out[..., 4:5])
         
         shape_logits = star_out[..., 5:]
@@ -140,8 +141,13 @@ def compute_grid_loss(preds, targets, lambda_prob=5.0, lambda_pos=50.0, lambda_f
     alpha_t = focal_alpha * p_target + (1 - focal_alpha) * (1 - p_target)
     
     with torch.no_grad():
-        log_flux_target = star_targets[..., 3]
-        boost_weight = torch.where(obj_mask, 1.0 + (4.0 - log_flux_target) / 2.5, torch.tensor(1.0, device=p_pred.device))
+        # IMPORTANT: Flux target in dataset is now arcsinh(flux / scale)
+        # We boost based on the true flux magnitude
+        # We need to invert arcsinh here to get linear flux for boosting
+        # Actually we can just use the target m directly since it's monotonic
+        m_target = star_targets[..., 3]
+        boost_weight = torch.where(obj_mask, 1.0 + (4.0 - m_target) / 4.0, torch.tensor(1.0, device=p_pred.device))
+        boost_weight = torch.clamp(boost_weight, 1.0, 5.0)
     
     prob_loss = (alpha_t * focal_weight * bce_loss * boost_weight).mean()
     

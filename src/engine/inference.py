@@ -52,11 +52,10 @@ class InferenceEngine:
         for y in range(grid_h):
             for x in range(grid_w):
                 for k in range(K):
-                    p, dx, dy, m_network, c = prediction[y, x, k, :5]
+                    p, dx, dy, m_linear, c = prediction[y, x, k, :5]
                     if p > threshold:
-                        # CENTRALIZED: Network Space -> Physical Space (Flux)
-                        linear_flux = self.transform.network_to_flux(m_network)
-                        predicted_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, linear_flux, c, p))
+                        # FLUX FIX: m is now exp-activated, so it is already linear flux
+                        predicted_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, float(m_linear), c, p))
                         shape_vector = prediction[y, x, k, 5:]
                         S = int(np.sqrt(len(shape_vector)))
                         predicted_shapes.append(shape_vector.reshape(S, S))
@@ -68,7 +67,6 @@ class InferenceEngine:
         H, W = img_stretched.shape
         
         # 1. Component Preparation (Network Space: Stretched)
-        # bg_map is predicted in stretched space
         full_residual_bg_stretched = upsample_background(bg_map.squeeze(), (H, W))
         full_gt_residual_bg_stretched = upsample_background(gt_bg_map.squeeze(), (H, W))
         
@@ -82,18 +80,14 @@ class InferenceEngine:
             reconstruction_stars_linear[y0:y1, x0:x1] += flux * shape[sy0:sy1, sx0:sx1]
 
         # 2. Linear Reconstruction (Residual Space)
-        # CENTRALIZED: Network Space -> Physical Space (BG Residual)
         full_residual_bg_linear = self.transform.network_to_bg(full_residual_bg_stretched)
         full_reconstruction_linear = reconstruction_stars_linear + full_residual_bg_linear
         
         # 3. Map back to Stretched Space for units-matching comparison
-        # CENTRALIZED: Physical Space (Residual) -> Network Space
-        # We can use target_bg_to_network since it takes linear residual
         full_reconstruction_stretched = self.transform.target_bg_to_network(full_reconstruction_linear)
         residual_stretched = img_stretched - full_reconstruction_stretched
 
         # 4. Absolute Space Conversion (Raw Physical Photons)
-        # CENTRALIZED: Network Space -> Physical Space (Absolute)
         img_linear_abs = self.transform.network_to_image(img_stretched, chunk_median)
         full_reconstruction_linear_abs = full_reconstruction_linear + chunk_median
         full_bg_abs = full_residual_bg_linear + chunk_median
