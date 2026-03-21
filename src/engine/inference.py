@@ -63,6 +63,8 @@ class InferenceEngine:
 
     def visualize(self, image_tensor, true_catalogue, predicted_stars, predicted_shapes, bg_map, gt_bg_map, threshold, chunk_median=0.0, output_path="inference_comparison.png"):
         from src.engine.evaluator import match_stars
+        from mpl_toolkits.axes_grid1 import make_axes_locatable
+        
         img_stretched = image_tensor.squeeze().numpy()
         H, W = img_stretched.shape
         
@@ -117,54 +119,77 @@ class InferenceEngine:
 
         # 6. Figure Layout
         fig = plt.figure(figsize=(30, 24))
-        gs = fig.add_gridspec(5, 4)
+        gs = fig.add_gridspec(5, 4, hspace=0.3, wspace=0.3)
         
+        def add_colorbar(im, ax):
+            divider = make_axes_locatable(ax)
+            cax = divider.append_axes("right", size="5%", pad=0.05)
+            fig.colorbar(im, cax=cax)
+
         # Row 1-2: Stretched Comparisons (Network Space)
         vmin, vmax = np.percentile(img_stretched, [1, 99.9])
         
         ax1 = fig.add_subplot(gs[0:2, 0])
-        ax1.imshow(img_stretched, cmap='inferno', origin='lower', vmin=vmin, vmax=vmax)
+        ax1.imshow(img_stretched, cmap='inferno', origin='lower', vmin=vmin, vmax=vmax, aspect='equal')
         ax1.set_title("Input (Stretched)")
         for s in true_catalogue: ax1.plot(s[0], s[1], 'g+', markersize=8, alpha=0.4)
         
-        ax2 = fig.add_subplot(gs[0:2, 1])
-        ax2.imshow(full_reconstruction_stretched, cmap='inferno', origin='lower', vmin=vmin, vmax=vmax)
+        ax2 = fig.add_subplot(gs[0:2, 1], sharex=ax1, sharey=ax1)
+        im2 = ax2.imshow(full_reconstruction_stretched, cmap='inferno', origin='lower', vmin=vmin, vmax=vmax, aspect='equal')
         ax2.set_title("Model (Stretched)")
+        add_colorbar(im2, ax2)
         
-        ax3 = fig.add_subplot(gs[0:2, 2])
+        ax3 = fig.add_subplot(gs[0:2, 2], sharex=ax1, sharey=ax1)
         rmax = max(0.1, np.percentile(np.abs(residual_stretched), 99))
-        im3 = ax3.imshow(residual_stretched, cmap='bwr', origin='lower', vmin=-rmax, vmax=rmax)
+        im3 = ax3.imshow(residual_stretched, cmap='bwr', origin='lower', vmin=-rmax, vmax=rmax, aspect='equal')
         ax3.set_title("Residual (Stretched)")
-        plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
+        add_colorbar(im3, ax3)
 
         # Row 3: Absolute Linear Comparisons (Physical Space)
-        ax4 = fig.add_subplot(gs[2, 0])
+        ax4 = fig.add_subplot(gs[2, 0], sharex=ax1, sharey=ax1)
         l_vmin, l_vmax = np.percentile(img_linear_abs, [10, 99.9])
-        ax4.imshow(img_linear_abs, cmap='inferno', origin='lower', norm=LogNorm(vmin=max(1.0, l_vmin), vmax=l_vmax))
+        ax4.imshow(img_linear_abs, cmap='inferno', origin='lower', norm=LogNorm(vmin=max(1.0, l_vmin), vmax=l_vmax), aspect='equal')
         ax4.set_title("Input (Absolute Linear)")
         
-        ax5 = fig.add_subplot(gs[2, 1])
-        ax5.imshow(full_reconstruction_linear_abs, cmap='inferno', origin='lower', norm=LogNorm(vmin=max(1.0, l_vmin), vmax=l_vmax))
+        ax5 = fig.add_subplot(gs[2, 1], sharex=ax1, sharey=ax1)
+        im5 = ax5.imshow(full_reconstruction_linear_abs, cmap='inferno', origin='lower', norm=LogNorm(vmin=max(1.0, l_vmin), vmax=l_vmax), aspect='equal')
         ax5.set_title("Model (Absolute Linear)")
+        add_colorbar(im5, ax5)
 
         # Background Side-by-Side (Residuals in Stretched Space)
         bg_vmin = min(full_residual_bg_stretched.min(), full_gt_residual_bg_stretched.min())
         bg_vmax = max(full_residual_bg_stretched.max(), full_gt_residual_bg_stretched.max())
-        ax6 = fig.add_subplot(gs[2, 2])
-        ax6.imshow(full_residual_bg_stretched, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax)
+        ax6 = fig.add_subplot(gs[2, 2], sharex=ax1, sharey=ax1)
+        ax6.imshow(full_residual_bg_stretched, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax, aspect='equal')
         ax6.set_title("Pred Residual BG (Stretched)")
-        ax7 = fig.add_subplot(gs[2, 3])
-        im7 = ax7.imshow(full_gt_residual_bg_stretched, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax)
+        
+        ax7 = fig.add_subplot(gs[2, 3], sharex=ax1, sharey=ax1)
+        im7 = ax7.imshow(full_gt_residual_bg_stretched, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax, aspect='equal')
         ax7.set_title("Truth Residual BG (Stretched)")
-        plt.colorbar(im7, ax=ax7, fraction=0.046, pad=0.04)
+        add_colorbar(im7, ax7)
 
         # Row 4-5: PSF & Mag Plots
         if true_mags:
-            ax8 = fig.add_subplot(gs[3, 0])
-            ax8.scatter(true_mags, pred_mags, alpha=0.5)
-            ax8.plot([min(true_mags), max(true_mags)], [min(true_mags), max(true_mags)], 'r--')
-            ax8.set_title("Mag Recovery"); ax8.set_aspect('equal')
+            ax8 = fig.add_subplot(gs[3:, 0:2])
+            ax8.scatter(true_mags, pred_mags, alpha=0.5, s=10)
+            all_mags = true_mags + pred_mags
+            mmin, mmax = min(all_mags), max(all_mags)
+            ax8.plot([mmin, mmax], [mmin, mmax], 'r--', alpha=0.8)
+            ax8.set_xlabel("True log10(Flux)")
+            ax8.set_ylabel("Predicted log10(Flux)")
+            ax8.set_title("Magnitude Recovery Accuracy")
+            ax8.set_aspect('equal')
+            ax8.grid(True, alpha=0.3)
+
+        # 3x3 PSF Shape Grid
+        if predicted_shapes:
+            psf_gs = gs[3:, 2:].subgridspec(3, 3)
+            num_psfs = min(9, len(predicted_shapes))
+            for i in range(num_psfs):
+                ax_psf = fig.add_subplot(psf_gs[i // 3, i % 3])
+                ax_psf.imshow(predicted_shapes[i], cmap='viridis', origin='lower')
+                ax_psf.axis('off')
+                if i == 1: ax_psf.set_title("Sample Predicted 9x9 PSFs")
 
         plt.suptitle(f"Generative Diagnostic (Scale={self.stretch_scale}) | Predicted Stars: {len(predicted_stars)}", fontsize=24)
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         plt.savefig(output_path); print(f"Comparison saved to {output_path}")
