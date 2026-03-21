@@ -63,7 +63,11 @@ class GaussianPretrainingProvider(Dataset):
         flattened_stars = star_targets.view(grid_size, grid_size, -1)
         target = torch.cat([flattened_stars, bg_map.unsqueeze(-1)], dim=-1)
         
-        return image, target
+        return {
+            "image": image,
+            "target": target,
+            "chunk_median": sparse_sample["chunk_median"]
+        }
 
     def _sample_luminosity_function(self, n_stars, alpha=2.0, f_min=30, f_max=10000):
         """Samples fluxes from a power-law distribution."""
@@ -249,7 +253,8 @@ class GaussianPretrainingProvider(Dataset):
             "base_grid": torch.from_numpy(base_grid),
             "background_map": torch.from_numpy(bg_grid),
             "shapes": torch.from_numpy(np.array(shapes)) if shapes else torch.tensor([]),
-            "indices": torch.from_numpy(np.array(indices)) if indices else torch.tensor([])
+            "indices": torch.from_numpy(np.array(indices)) if indices else torch.tensor([]),
+            "chunk_median": float(chunk_median)
         }
 
     def visualize_chunk(self, image_tensor, true_catalogue, output_path="visualization_bulge.png"):
@@ -341,4 +346,8 @@ class GaussianMosaicDataset(Dataset):
             # Adjust the last channel (background) to be residual
             target[..., -1] -= chunk_median
             
-        return image_tensor, target
+        return {
+            "image": image_tensor,
+            "target": target,
+            "chunk_median": float(chunk_median)
+        }

@@ -11,8 +11,8 @@ class InferenceEngine:
         self.model = model
         self.device = device
         self.config = config
-        # Dynamically determine cell_size based on image_size and grid_size
         self.img_size = config["data_params"]["image_size"]
+        self.stretch_scale = config["data_params"].get("GLOBAL_STRETCH_SCALE", 10.0)
 
     def predict(self, image_tensor, threshold=0.5):
         """Runs inference on a single 2D image tensor [1, H, W]."""
@@ -38,38 +38,50 @@ class InferenceEngine:
                         predicted_shapes.append(shape_vector.reshape(S, S))
         return predicted_stars, predicted_shapes, bg_map
 
-    def visualize(self, image_tensor, true_catalogue, predicted_stars, predicted_shapes, bg_map, gt_bg_map, threshold, output_path="inference_comparison.png"):
+    def visualize(self, image_tensor, true_catalogue, predicted_stars, predicted_shapes, bg_map, gt_bg_map, threshold, chunk_median=0.0, output_path="inference_comparison.png"):
         from src.engine.evaluator import match_stars
-        img = image_tensor.squeeze().numpy()
+        img = image_tensor.squeeze().numpy() # This is Stretched Input: asinh((raw - median) / scale)
         H, W = img.shape
         
         # Calculate zoom factor for background upsampling
         bg_h, bg_w = bg_map.shape[:2]
         zoom_h, zoom_w = H / bg_h, W / bg_w
 
-        # 1. Component Preparation
-        full_bg = zoom(bg_map.squeeze(), (zoom_h, zoom_w), order=1)
-        full_gt_bg = zoom(gt_bg_map.squeeze(), (zoom_h, zoom_w), order=1)
-        reconstruction = np.zeros_like(img)
+        # 1. Component Preparation (Linear Space)
+        # Background is linear residual: (gt_bg - median)
+        full_residual_bg = zoom(bg_map.squeeze(), (zoom_h, zoom_w), order=1)
+        full_gt_residual_bg = zoom(gt_bg_map.squeeze(), (zoom_h, zoom_w), order=1)
+        
+        reconstruction_linear = np.zeros_like(img)
         for (x, y, flux, c, p), shape in zip(predicted_stars, predicted_shapes):
             ix, iy, S = int(round(x)), int(round(y)), shape.shape[0]
             half = S // 2
             y0, y1 = max(0, iy - half), min(H, iy + half + 1)
             x0, x1 = max(0, ix - half), min(W, ix + half + 1)
             sy0, sy1, sx0, sx1 = half - (iy - y0), half + (y1 - iy), half - (ix - x0), half + (x1 - ix)
-            reconstruction[y0:y1, x0:x1] += flux * shape[sy0:sy1, sx0:sx1]
+            reconstruction_linear[y0:y1, x0:x1] += flux * shape[sy0:sy1, sx0:sx1]
 
-        full_reconstruction = reconstruction + full_bg
-        residual = img - full_reconstruction
+        # 2. Map Reconstruction to Stretched Space for Valid Residuals
+        # Network sees: asinh((raw - median) / scale)
+        # We have: (reconstruction_linear + full_residual_bg) which is effectively (stars + bg - median)
+        full_reconstruction_linear = reconstruction_linear + full_residual_bg
+        full_reconstruction_stretched = np.arcsinh(full_reconstruction_linear / self.stretch_scale)
+        
+        # Residual in Stretched Space (what the loss function optimizes)
+        residual_stretched = img - full_reconstruction_stretched
+
+        # Absolute Backgrounds for FITS
+        full_bg_abs = full_residual_bg + chunk_median
+        full_gt_bg_abs = full_gt_residual_bg + chunk_median
 
         # --- FITS OUTPUT ---
         hdul = fits.HDUList([
             fits.PrimaryHDU(),
-            fits.ImageHDU(img, name="INPUT"),
-            fits.ImageHDU(full_reconstruction, name="MODEL"),
-            fits.ImageHDU(residual, name="RESIDUAL"),
-            fits.ImageHDU(full_bg, name="BG_PRED"),
-            fits.ImageHDU(full_gt_bg, name="BG_TRUE")
+            fits.ImageHDU(img, name="INPUT_STRETCHED"),
+            fits.ImageHDU(full_reconstruction_stretched, name="MODEL_STRETCHED"),
+            fits.ImageHDU(residual_stretched, name="RESIDUAL_STRETCHED"),
+            fits.ImageHDU(full_bg_abs, name="BG_PRED_ABS"),
+            fits.ImageHDU(full_gt_bg_abs, name="BG_TRUE_ABS")
         ])
         fits_path = output_path.replace(".png", ".fits")
         hdul.writeto(fits_path, overwrite=True)
@@ -88,23 +100,22 @@ class InferenceEngine:
         fig = plt.figure(figsize=(30, 24))
         gs = fig.add_gridspec(5, 4)
         
-        # Row 1-2: Primary Comparisons
-        # Arcsinh images are already stretched, use linear normalization with percentiles
+        # Row 1-2: Primary Comparisons (Stretched Space)
         vmin, vmax = np.percentile(img, [1, 99.9])
         
         ax1 = fig.add_subplot(gs[0:2, 0])
         ax1.imshow(img, cmap='inferno', origin='lower', vmin=vmin, vmax=vmax)
-        ax1.set_title("Original Input (Arcsinh)")
+        ax1.set_title("Original Input (Stretched)")
         for s in true_catalogue: ax1.plot(s[0], s[1], 'g+', markersize=8, alpha=0.4)
         
         ax2 = fig.add_subplot(gs[0:2, 1])
-        ax2.imshow(full_reconstruction, cmap='inferno', origin='lower', vmin=vmin, vmax=vmax)
-        ax2.set_title("Model Reconstruction")
+        ax2.imshow(full_reconstruction_stretched, cmap='inferno', origin='lower', vmin=vmin, vmax=vmax)
+        ax2.set_title("Model Reconstruction (Stretched)")
         
         ax3 = fig.add_subplot(gs[0:2, 2])
-        rmax = np.percentile(np.abs(residual), 99)
-        im3 = ax3.imshow(residual, cmap='bwr', origin='lower', vmin=-rmax, vmax=rmax)
-        ax3.set_title("Residual")
+        rmax = np.percentile(np.abs(residual_stretched), 99)
+        im3 = ax3.imshow(residual_stretched, cmap='bwr', origin='lower', vmin=-rmax, vmax=rmax)
+        ax3.set_title("Residual (Stretched)")
         plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
 
         # Row 3: Metrics & Background
@@ -122,17 +133,17 @@ class InferenceEngine:
             ax5.plot([0, 1], [0, 1], 'r--')
             ax5.set_title("Completeness Reliability"); ax5.set_aspect('equal')
 
-        # Background Side-by-Side (Shared Colorbar)
-        bg_vmin = min(full_bg.min(), full_gt_bg.min())
-        bg_vmax = max(full_bg.max(), full_gt_bg.max())
+        # Background Side-by-Side (Residuals)
+        bg_vmin = min(full_residual_bg.min(), full_gt_residual_bg.min())
+        bg_vmax = max(full_residual_bg.max(), full_gt_residual_bg.max())
         
         ax6 = fig.add_subplot(gs[2, 2])
-        ax6.imshow(full_bg, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax)
-        ax6.set_title("Predicted Background")
+        ax6.imshow(full_residual_bg, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax)
+        ax6.set_title("Predicted Residual BG")
         
         ax7 = fig.add_subplot(gs[2, 3])
-        im7 = ax7.imshow(full_gt_bg, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax)
-        ax7.set_title("Truth Background")
+        im7 = ax7.imshow(full_gt_residual_bg, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax)
+        ax7.set_title("Truth Residual BG")
         plt.colorbar(im7, ax=ax7, fraction=0.046, pad=0.04)
 
         # Row 4-5: PSF Comparisons
