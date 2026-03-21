@@ -107,11 +107,9 @@ class GaussianPretrainingProvider(Dataset):
             return 100 + 900 * relative_density
 
     def generate_chunk(self):
-        """Generates a realistic Roman-like chunk using AstroSpaceTransform."""
-        center_l = np.random.uniform(-5.0, 5.0)
-        center_b = np.random.uniform(-3.0, 3.0)
-        expected_stars = self._get_local_density(center_l, center_b)
-        num_stars = int(np.random.poisson(expected_stars))
+        """Generates a realistic Roman-like chunk using configured star density."""
+        # Simple uniform density between configured limits for pre-training
+        num_stars = int(np.random.randint(self.min_stars, self.max_stars + 1))
 
         zodiacal_level = np.random.uniform(20.0, 40.0)
         smooth_bg = np.full((self.img_size, self.img_size), zodiacal_level, dtype=np.float32)

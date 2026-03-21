@@ -204,6 +204,7 @@ def run_infer(stage_idx, config, device, checkpoint=None):
                         # NEW: Target already contains raw physical photons
                         true_stars.append((tgx, tgy, float(raw_flux), tc))
         
+        print(f"DEBUG: Found {len(true_stars)} true stars in the chunk.")
         predicted_stars, predicted_shapes, bg_map = engine.predict(image_tensor)
         
         # DEBUG: Print normalization stats
