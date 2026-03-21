@@ -65,8 +65,7 @@ class DenseGridModel(nn.Module):
             nn.Conv2d(256, self.num_output_channels, kernel_size=1)
         )
         
-        with torch.no_grad():
-            self.head[-1].bias[-1].fill_(100.0) # Initial BG guess
+        # Removed 100.0 bias init: background is now a zero-centered residual
 
     def forward(self, x):
         # Bottom-up
@@ -100,7 +99,8 @@ class DenseGridModel(nn.Module):
         shape_logits = star_out[..., 5:]
         shape = F.softmax(shape_logits, dim=-1)
         
-        bg = F.relu(bg_out.permute(0, 2, 3, 1))
+        # Removed ReLU: background residuals can be negative
+        bg = bg_out.permute(0, 2, 3, 1)
         
         return {
             "stars": torch.cat([p, dx, dy, m, c, shape], dim=-1),
