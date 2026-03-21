@@ -28,6 +28,9 @@ class Trainer:
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=5)
         self.start_epoch = 0
+        
+        # Extract loss parameters from config
+        self.loss_params = config["data_params"].get("loss_params", {})
 
     def resume(self, checkpoint_path=None):
         if checkpoint_path is None:
@@ -55,7 +58,7 @@ class Trainer:
                 
                 self.optimizer.zero_grad()
                 preds = self.model(images)
-                loss, p_loss, po_loss, f_loss, s_loss, b_loss = compute_grid_loss(preds, targets)
+                loss, p_loss, po_loss, f_loss, s_loss, b_loss = compute_grid_loss(preds, targets, **self.loss_params)
                 
                 if torch.isnan(loss):
                     print(f"⚠️ NaN detected at step {i}")
@@ -98,6 +101,6 @@ class Trainer:
                     images, targets = images.to(self.device), targets.to(self.device)
                     
                 preds = self.model(images)
-                loss, _, _, _, _, _ = compute_grid_loss(preds, targets)
+                loss, _, _, _, _, _ = compute_grid_loss(preds, targets, **self.loss_params)
                 val_loss += loss.item()
         return val_loss / len(self.val_loader)

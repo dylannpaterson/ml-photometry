@@ -6,6 +6,26 @@ import os
 from scipy.ndimage import zoom
 from astropy.io import fits
 
+def upsample_background(bg_map, target_size):
+    """
+    Upsamples a grid-based background map to full image resolution.
+    Uses bilinear interpolation with correct physical centering (cell centers).
+    """
+    from scipy.interpolate import RegularGridInterpolator
+    h, w = bg_map.shape
+    H, W = target_size
+    cell_size = H // h
+    
+    # Grid coordinates (cell centers)
+    x = np.arange(w) * cell_size + (cell_size - 1) / 2.0
+    y = np.arange(h) * cell_size + (cell_size - 1) / 2.0
+    
+    interp = RegularGridInterpolator((y, x), bg_map, method='linear', bounds_error=False, fill_value=None)
+    
+    # Target coordinates (all pixels)
+    yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing='ij')
+    return interp((yy, xx))
+
 class InferenceEngine:
     def __init__(self, model, device, config):
         self.model = model
@@ -40,15 +60,13 @@ class InferenceEngine:
 
     def visualize(self, image_tensor, true_catalogue, predicted_stars, predicted_shapes, bg_map, gt_bg_map, threshold, chunk_median=0.0, output_path="inference_comparison.png"):
         from src.engine.evaluator import match_stars
-        img_stretched = image_tensor.squeeze().numpy() # Input is Stretched: asinh((raw - median) / scale)
+        img_stretched = image_tensor.squeeze().numpy() # Input: asinh((raw - median) / scale)
         H, W = img_stretched.shape
         
-        bg_h, bg_w = bg_map.shape[:2]
-        zoom_h, zoom_w = H / bg_h, W / bg_w
-
         # 1. Component Preparation (Linear Residual Space: raw - median)
-        full_residual_bg = zoom(bg_map.squeeze(), (zoom_h, zoom_w), order=1)
-        full_gt_residual_bg = zoom(gt_bg_map.squeeze(), (zoom_h, zoom_w), order=1)
+        # Use physically aligned upsampling
+        full_residual_bg = upsample_background(bg_map.squeeze(), (H, W))
+        full_gt_residual_bg = upsample_background(gt_bg_map.squeeze(), (H, W))
         
         reconstruction_stars_linear = np.zeros_like(img_stretched)
         for (x, y, flux, c, p), shape in zip(predicted_stars, predicted_shapes):
@@ -66,12 +84,11 @@ class InferenceEngine:
         full_reconstruction_stretched = np.arcsinh(full_reconstruction_linear / self.stretch_scale)
         residual_stretched = img_stretched - full_reconstruction_stretched
 
-        # 4. Absolute Backgrounds for physical sanity check
+        # 4. Absolute Space Conversion (Raw Physical Photons)
+        img_linear_abs = (np.sinh(img_stretched) * self.stretch_scale) + chunk_median
+        full_reconstruction_linear_abs = full_reconstruction_linear + chunk_median
         full_bg_abs = full_residual_bg + chunk_median
         full_gt_bg_abs = full_gt_residual_bg + chunk_median
-
-        # 5. Reverse Stretch Input for Linear Plot (raw - median)
-        img_linear = np.sinh(img_stretched) * self.stretch_scale
 
         # --- FITS OUTPUT ---
         hdul = fits.HDUList([
@@ -79,8 +96,8 @@ class InferenceEngine:
             fits.ImageHDU(img_stretched, name="INPUT_STRETCHED"),
             fits.ImageHDU(full_reconstruction_stretched, name="MODEL_STRETCHED"),
             fits.ImageHDU(residual_stretched, name="RESIDUAL_STRETCHED"),
-            fits.ImageHDU(img_linear, name="INPUT_LINEAR_RESID"),
-            fits.ImageHDU(full_reconstruction_linear, name="MODEL_LINEAR_RESID"),
+            fits.ImageHDU(img_linear_abs, name="INPUT_LINEAR_ABS"),
+            fits.ImageHDU(full_reconstruction_linear_abs, name="MODEL_LINEAR_ABS"),
             fits.ImageHDU(full_bg_abs, name="BG_PRED_ABS"),
             fits.ImageHDU(full_gt_bg_abs, name="BG_TRUE_ABS")
         ])
@@ -117,23 +134,23 @@ class InferenceEngine:
         ax3.set_title("Residual (Stretched)")
         plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
 
-        # Row 3: Linear Comparisons (Physical Space)
+        # Row 3: Absolute Linear Comparisons (Physical Space)
         ax4 = fig.add_subplot(gs[2, 0])
-        # Use LogNorm for linear plot to see stars
-        l_vmin, l_vmax = np.percentile(img_linear, [10, 99.9])
-        ax4.imshow(img_linear, cmap='inferno', origin='lower', norm=LogNorm(vmin=max(1.0, l_vmin), vmax=l_vmax))
-        ax4.set_title("Input (Linear Residual)")
+        # Use LogNorm for absolute linear plot to see stars
+        l_vmin, l_vmax = np.percentile(img_linear_abs, [10, 99.9])
+        ax4.imshow(img_linear_abs, cmap='inferno', origin='lower', norm=LogNorm(vmin=max(1.0, l_vmin), vmax=l_vmax))
+        ax4.set_title("Input (Absolute Linear)")
         
         ax5 = fig.add_subplot(gs[2, 1])
-        ax5.imshow(full_reconstruction_linear, cmap='inferno', origin='lower', norm=LogNorm(vmin=max(1.0, l_vmin), vmax=l_vmax))
-        ax5.set_title("Model (Linear Residual)")
+        ax5.imshow(full_reconstruction_linear_abs, cmap='inferno', origin='lower', norm=LogNorm(vmin=max(1.0, l_vmin), vmax=l_vmax))
+        ax5.set_title("Model (Absolute Linear)")
 
-        # Background Side-by-Side
+        # Background Side-by-Side (Residuals)
         bg_vmin = min(full_residual_bg.min(), full_gt_residual_bg.min())
         bg_vmax = max(full_residual_bg.max(), full_gt_residual_bg.max())
         ax6 = fig.add_subplot(gs[2, 2])
         ax6.imshow(full_residual_bg, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax)
-        ax6.set_title("Pred Residual BG")
+        ax6.set_title("Predicted Residual BG")
         ax7 = fig.add_subplot(gs[2, 3])
         im7 = ax7.imshow(full_gt_residual_bg, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax)
         ax7.set_title("Truth Residual BG")
