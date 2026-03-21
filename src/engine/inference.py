@@ -85,26 +85,24 @@ class InferenceEngine:
         full_residual_bg_linear = self.transform.network_to_bg(full_residual_bg_stretched)
         full_reconstruction_linear = reconstruction_stars_linear + full_residual_bg_linear
         
-        # 3. Map back to Stretched Space for units-matching comparison
-        full_reconstruction_stretched = self.transform.target_bg_to_network(full_reconstruction_linear)
-        residual_stretched = img_stretched - full_reconstruction_stretched
-
-        # 4. Absolute Space Conversion (Raw Physical Photons)
+        # 3. Absolute Space Conversion (Raw Physical Photons)
         img_linear_abs = self.transform.network_to_image(img_stretched, chunk_median)
         full_reconstruction_linear_abs = full_reconstruction_linear + chunk_median
+        
+        # NEW: Linear Residual
+        residual_linear = img_linear_abs - full_reconstruction_linear_abs
+        
         full_bg_abs = full_residual_bg_linear + chunk_median
         full_gt_bg_abs = self.transform.network_to_bg(full_gt_residual_bg_stretched) + chunk_median
 
         # --- FITS OUTPUT ---
         hdul = fits.HDUList([
             fits.PrimaryHDU(),
-            fits.ImageHDU(img_stretched, name="INPUT_STRETCHED"),
-            fits.ImageHDU(full_reconstruction_stretched, name="MODEL_STRETCHED"),
-            fits.ImageHDU(residual_stretched, name="RESIDUAL_STRETCHED"),
-            fits.ImageHDU(img_linear_abs, name="INPUT_LINEAR_ABS"),
-            fits.ImageHDU(full_reconstruction_linear_abs, name="MODEL_LINEAR_ABS"),
-            fits.ImageHDU(full_bg_abs, name="BG_PRED_ABS"),
-            fits.ImageHDU(full_gt_bg_abs, name="BG_TRUE_ABS")
+            fits.ImageHDU(img_linear_abs, name="INPUT_LINEAR"),
+            fits.ImageHDU(full_reconstruction_linear_abs, name="MODEL_LINEAR"),
+            fits.ImageHDU(residual_linear, name="RESIDUAL_LINEAR"),
+            fits.ImageHDU(full_bg_abs, name="BG_PRED_LINEAR"),
+            fits.ImageHDU(full_gt_bg_abs, name="BG_TRUE_LINEAR")
         ])
         fits_path = output_path.replace(".png", ".fits")
         hdul.writeto(fits_path, overwrite=True)
@@ -126,47 +124,39 @@ class InferenceEngine:
             cax = divider.append_axes("right", size="5%", pad=0.05)
             fig.colorbar(im, cax=cax)
 
-        # Row 1-2: Stretched Comparisons (Network Space)
-        vmin, vmax = np.percentile(img_stretched, [1, 99.9])
+        # Row 1-2: Primary Linear Comparisons
+        l_vmin, l_vmax = np.percentile(img_linear_abs, [10, 99.9])
+        norm = LogNorm(vmin=max(1.0, l_vmin), vmax=l_vmax)
         
         ax1 = fig.add_subplot(gs[0:2, 0])
-        ax1.imshow(img_stretched, cmap='inferno', origin='lower', vmin=vmin, vmax=vmax, aspect='equal')
-        ax1.set_title("Input (Stretched)")
+        ax1.imshow(img_linear_abs, cmap='inferno', origin='lower', norm=norm, aspect='equal')
+        ax1.set_title("Input (Linear Photons)")
         for s in true_catalogue: ax1.plot(s[0], s[1], 'g+', markersize=8, alpha=0.4)
         
         ax2 = fig.add_subplot(gs[0:2, 1], sharex=ax1, sharey=ax1)
-        im2 = ax2.imshow(full_reconstruction_stretched, cmap='inferno', origin='lower', vmin=vmin, vmax=vmax, aspect='equal')
-        ax2.set_title("Model (Stretched)")
+        im2 = ax2.imshow(full_reconstruction_linear_abs, cmap='inferno', origin='lower', norm=norm, aspect='equal')
+        ax2.set_title("Model (Linear Photons)")
         add_colorbar(im2, ax2)
         
         ax3 = fig.add_subplot(gs[0:2, 2], sharex=ax1, sharey=ax1)
-        rmax = max(0.1, np.percentile(np.abs(residual_stretched), 99))
-        im3 = ax3.imshow(residual_stretched, cmap='bwr', origin='lower', vmin=-rmax, vmax=rmax, aspect='equal')
-        ax3.set_title("Residual (Stretched)")
+        # Linear residual typically has wide range, center on 0 with symlog or robust limits
+        r_limit = np.percentile(np.abs(residual_linear), 99)
+        im3 = ax3.imshow(residual_linear, cmap='bwr', origin='lower', vmin=-r_limit, vmax=r_limit, aspect='equal')
+        ax3.set_title("Linear Residual (Data - Model)")
         add_colorbar(im3, ax3)
 
-        # Row 3: Absolute Linear Comparisons (Physical Space)
+        # Row 3: Background Comparisons (Linear)
+        bg_vmin = min(full_bg_abs.min(), full_gt_bg_abs.min())
+        bg_vmax = max(full_bg_abs.max(), full_gt_bg_abs.max())
+        
         ax4 = fig.add_subplot(gs[2, 0], sharex=ax1, sharey=ax1)
-        l_vmin, l_vmax = np.percentile(img_linear_abs, [10, 99.9])
-        ax4.imshow(img_linear_abs, cmap='inferno', origin='lower', norm=LogNorm(vmin=max(1.0, l_vmin), vmax=l_vmax), aspect='equal')
-        ax4.set_title("Input (Absolute Linear)")
+        ax4.imshow(full_bg_abs, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax, aspect='equal')
+        ax4.set_title("Predicted Background (Linear)")
         
         ax5 = fig.add_subplot(gs[2, 1], sharex=ax1, sharey=ax1)
-        im5 = ax5.imshow(full_reconstruction_linear_abs, cmap='inferno', origin='lower', norm=LogNorm(vmin=max(1.0, l_vmin), vmax=l_vmax), aspect='equal')
-        ax5.set_title("Model (Absolute Linear)")
+        im5 = ax5.imshow(full_gt_bg_abs, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax, aspect='equal')
+        ax5.set_title("Truth Background (Linear)")
         add_colorbar(im5, ax5)
-
-        # Background Side-by-Side (Residuals in Stretched Space)
-        bg_vmin = min(full_residual_bg_stretched.min(), full_gt_residual_bg_stretched.min())
-        bg_vmax = max(full_residual_bg_stretched.max(), full_gt_residual_bg_stretched.max())
-        ax6 = fig.add_subplot(gs[2, 2], sharex=ax1, sharey=ax1)
-        ax6.imshow(full_residual_bg_stretched, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax, aspect='equal')
-        ax6.set_title("Pred Residual BG (Stretched)")
-        
-        ax7 = fig.add_subplot(gs[2, 3], sharex=ax1, sharey=ax1)
-        im7 = ax7.imshow(full_gt_residual_bg_stretched, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax, aspect='equal')
-        ax7.set_title("Truth Residual BG (Stretched)")
-        add_colorbar(im7, ax7)
 
         # Row 4-5: PSF & Mag Plots
         if true_mags:
@@ -189,15 +179,11 @@ class InferenceEngine:
             num_to_plot = min(100, len(predicted_shapes))
             for i in range(num_to_plot):
                 shape = predicted_shapes[i]
-                # x-profile (average over Y)
                 prof_x = np.mean(shape, axis=0)
-                # y-profile (average over X)
                 prof_y = np.mean(shape, axis=1)
-                
                 ax_psf_x.plot(prof_x, color='C0', alpha=0.1, linewidth=1)
                 ax_psf_y.plot(prof_y, color='C1', alpha=0.1, linewidth=1)
             
-            # Add mean profile for clarity
             all_shapes = np.stack(predicted_shapes[:100])
             ax_psf_x.plot(np.mean(all_shapes, axis=(0, 1)), color='black', linewidth=2, label='Mean')
             ax_psf_y.plot(np.mean(all_shapes, axis=(0, 2)), color='black', linewidth=2, label='Mean')
