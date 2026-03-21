@@ -107,7 +107,7 @@ class DenseGridModel(nn.Module):
             "background": bg
         }
 
-def compute_grid_loss(preds, targets, lambda_prob=5.0, lambda_pos=50.0, lambda_flux=1.0, lambda_shape=1.0, lambda_bg=1.0, alpha=0.75, gamma=2.0):
+def compute_grid_loss(preds, targets, lambda_prob=5.0, lambda_pos=50.0, lambda_flux=1.0, lambda_shape=1.0, lambda_bg=0.5, focal_alpha=0.75, focal_gamma=2.0):
     """
     Standard Generative Loss without TV regularization (optimized for speed).
     Maintains positional weighting and faint-star boost.
@@ -136,8 +136,8 @@ def compute_grid_loss(preds, targets, lambda_prob=5.0, lambda_pos=50.0, lambda_f
     
     bce_loss = F.binary_cross_entropy(p_pred, p_target, reduction='none')
     p_t = p_pred * p_target + (1 - p_pred) * (1 - p_target)
-    focal_weight = (1 - p_t) ** gamma
-    alpha_t = alpha * p_target + (1 - alpha) * (1 - p_target)
+    focal_weight = (1 - p_t) ** focal_gamma
+    alpha_t = focal_alpha * p_target + (1 - focal_alpha) * (1 - p_target)
     
     with torch.no_grad():
         log_flux_target = star_targets[..., 3]
