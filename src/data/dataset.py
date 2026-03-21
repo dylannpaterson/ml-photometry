@@ -23,26 +23,29 @@ class PregeneratedDataset(Dataset):
         image = sparse_data["image"]
         base_grid = sparse_data["base_grid"] # [128, 128, K, 5]
         bg_map = sparse_data["background_map"] # [128, 128]
-        shapes = sparse_data["shapes"]       # [N_stars, 81]
+        shapes = sparse_data["shapes"]       # [N_stars, S2]
         indices = sparse_data["indices"]     # [N_stars, 3] (y, x, slot)
         
         H, W, K, _ = base_grid.shape
+        C_stars = K * (5 + self.S2)
         
-        # Target: [128, 128, K, 86 + 1]
-        # We add 1 for the shared background channel
-        target = torch.zeros((H, W, K, 5 + self.S2 + 1), dtype=torch.float32)
+        # Target: [128, 128, (K * 86) + 1] -> Flat channels to match DenseGridModel output
+        target = torch.zeros((H, W, C_stars + 1), dtype=torch.float32)
         
-        # 1. Fill the first 5 channels (p, dx, dy, m, c)
-        target[..., :5] = base_grid
+        # 1. Build K-slot star targets
+        star_target = torch.zeros((H, W, K, 5 + self.S2), dtype=torch.float32)
         
-        # 2. Re-densify the 81 shape channels
+        # Fill base metadata (p, dx, dy, m, c)
+        star_target[..., :5] = base_grid
+        
+        # Fill shapes
         if len(indices) > 0:
-            target[indices[:, 0], indices[:, 1], indices[:, 2], 5:-1] = shapes
+            # indices is [N, 3] (y, x, k)
+            star_target[indices[:, 0], indices[:, 1], indices[:, 2], 5:] = shapes
             
-        # 3. Add Background map (broadcast across slots for easy loss indexing)
-        # Even though background is shared per cell, we put it in the last channel
-        # of every slot to keep the tensor 4D.
-        target[..., -1] = bg_map.unsqueeze(-1)
+        # 2. Flatten K dimension and Append Background
+        target[..., :C_stars] = star_target.view(H, W, C_stars)
+        target[..., -1] = bg_map
             
         return image, target
 

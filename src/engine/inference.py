@@ -50,9 +50,11 @@ class InferenceEngine:
         for y in range(grid_h):
             for x in range(grid_w):
                 for k in range(K):
-                    p, dx, dy, log_m, c = prediction[y, x, k, :5]
+                    p, dx, dy, m_stretched, c = prediction[y, x, k, :5]
                     if p > threshold:
-                        predicted_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, 10**log_m, c, p))
+                        # Convert Arcsinh flux target back to linear flux
+                        flux_linear = np.sinh(m_stretched) * self.stretch_scale
+                        predicted_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, flux_linear, c, p))
                         shape_vector = prediction[y, x, k, 5:]
                         S = int(np.sqrt(len(shape_vector)))
                         predicted_shapes.append(shape_vector.reshape(S, S))
@@ -63,10 +65,10 @@ class InferenceEngine:
         img_stretched = image_tensor.squeeze().numpy() # Input: asinh((raw - median) / scale)
         H, W = img_stretched.shape
         
-        # 1. Component Preparation (Linear Residual Space: raw - median)
-        # Use physically aligned upsampling
-        full_residual_bg = upsample_background(bg_map.squeeze(), (H, W))
-        full_gt_residual_bg = upsample_background(gt_bg_map.squeeze(), (H, W))
+        # 1. Component Preparation (Network Space: Stretched)
+        # bg_map is predicted in stretched space: asinh((gt_bg - median) / scale)
+        full_residual_bg_stretched = upsample_background(bg_map.squeeze(), (H, W))
+        full_gt_residual_bg_stretched = upsample_background(gt_bg_map.squeeze(), (H, W))
         
         reconstruction_stars_linear = np.zeros_like(img_stretched)
         for (x, y, flux, c, p), shape in zip(predicted_stars, predicted_shapes):
@@ -78,7 +80,9 @@ class InferenceEngine:
             reconstruction_stars_linear[y0:y1, x0:x1] += flux * shape[sy0:sy1, sx0:sx1]
 
         # 2. Linear Reconstruction (Residual: raw - median)
-        full_reconstruction_linear = reconstruction_stars_linear + full_residual_bg
+        # Convert stretched background back to linear residual
+        full_residual_bg_linear = np.sinh(full_residual_bg_stretched) * self.stretch_scale
+        full_reconstruction_linear = reconstruction_stars_linear + full_residual_bg_linear
         
         # 3. Map back to Stretched Space for units-matching comparison
         full_reconstruction_stretched = np.arcsinh(full_reconstruction_linear / self.stretch_scale)
@@ -87,8 +91,8 @@ class InferenceEngine:
         # 4. Absolute Space Conversion (Raw Physical Photons)
         img_linear_abs = (np.sinh(img_stretched) * self.stretch_scale) + chunk_median
         full_reconstruction_linear_abs = full_reconstruction_linear + chunk_median
-        full_bg_abs = full_residual_bg + chunk_median
-        full_gt_bg_abs = full_gt_residual_bg + chunk_median
+        full_bg_abs = full_residual_bg_linear + chunk_median
+        full_gt_bg_abs = (np.sinh(full_gt_residual_bg_stretched) * self.stretch_scale) + chunk_median
 
         # --- FITS OUTPUT ---
         hdul = fits.HDUList([
@@ -136,7 +140,6 @@ class InferenceEngine:
 
         # Row 3: Absolute Linear Comparisons (Physical Space)
         ax4 = fig.add_subplot(gs[2, 0])
-        # Use LogNorm for absolute linear plot to see stars
         l_vmin, l_vmax = np.percentile(img_linear_abs, [10, 99.9])
         ax4.imshow(img_linear_abs, cmap='inferno', origin='lower', norm=LogNorm(vmin=max(1.0, l_vmin), vmax=l_vmax))
         ax4.set_title("Input (Absolute Linear)")
@@ -145,15 +148,15 @@ class InferenceEngine:
         ax5.imshow(full_reconstruction_linear_abs, cmap='inferno', origin='lower', norm=LogNorm(vmin=max(1.0, l_vmin), vmax=l_vmax))
         ax5.set_title("Model (Absolute Linear)")
 
-        # Background Side-by-Side (Residuals)
-        bg_vmin = min(full_residual_bg.min(), full_gt_residual_bg.min())
-        bg_vmax = max(full_residual_bg.max(), full_gt_residual_bg.max())
+        # Background Side-by-Side (Residuals in Stretched Space)
+        bg_vmin = min(full_residual_bg_stretched.min(), full_gt_residual_bg_stretched.min())
+        bg_vmax = max(full_residual_bg_stretched.max(), full_gt_residual_bg_stretched.max())
         ax6 = fig.add_subplot(gs[2, 2])
-        ax6.imshow(full_residual_bg, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax)
-        ax6.set_title("Predicted Residual BG")
+        ax6.imshow(full_residual_bg_stretched, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax)
+        ax6.set_title("Pred Residual BG (Stretched)")
         ax7 = fig.add_subplot(gs[2, 3])
-        im7 = ax7.imshow(full_gt_residual_bg, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax)
-        ax7.set_title("Truth Residual BG")
+        im7 = ax7.imshow(full_gt_residual_bg_stretched, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax)
+        ax7.set_title("Truth Residual BG (Stretched)")
         plt.colorbar(im7, ax=ax7, fraction=0.046, pad=0.04)
 
         # Row 4-5: PSF & Mag Plots

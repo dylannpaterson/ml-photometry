@@ -34,7 +34,7 @@ class GaussianPretrainingProvider(Dataset):
         if self.use_fixed_seed:
             np.random.seed(idx)
         sparse_sample = self.generate_chunk()
-        image = sparse_sample["image"] # This is already stretched
+        image = sparse_sample["image"]
         
         # Redensify exactly like PregeneratedDataset (including shapes)
         base_grid = sparse_sample["base_grid"]
@@ -106,7 +106,7 @@ class GaussianPretrainingProvider(Dataset):
             return 100 + 900 * relative_density
 
     def generate_chunk(self):
-        """Generates a realistic Roman-like chunk with guaranteed truth density and separate tail."""
+        """Generates a realistic Roman-like chunk with Arcsinh-space targets."""
         center_l = np.random.uniform(-5.0, 5.0)
         center_b = np.random.uniform(-3.0, 3.0)
         expected_stars = self._get_local_density(center_l, center_b)
@@ -167,7 +167,11 @@ class GaussianPretrainingProvider(Dataset):
             sorted_stars = sorted(cell_stars, key=lambda x: x[0], reverse=True)
             for slot in range(min(self.K, len(sorted_stars))):
                 flux, tx, ty, snr, tcomp = sorted_stars[slot]
-                base_grid[cy, cx, slot] = [1.0, tx % self.cell_size, ty % self.cell_size, np.log10(flux + 1e-9), tcomp]
+                
+                # TARGET FIX: Target m is now arcsinh(flux / scale)
+                m_target = np.arcsinh(flux / self.global_stretch_scale)
+                
+                base_grid[cy, cx, slot] = [1.0, tx % self.cell_size, ty % self.cell_size, m_target, tcomp]
                 shapes.append(psf_shape)
                 indices.append([cy, cx, slot])
                 ix, iy = int(np.clip(tx, 0, self.img_size-1)), int(np.clip(ty, 0, self.img_size-1))
@@ -200,12 +204,15 @@ class GaussianPretrainingProvider(Dataset):
         normalized_image = np.arcsinh((raw_image - chunk_median) / self.global_stretch_scale)
 
         # 7. Grid Assembly (Residual Background)
-        residual_bg = gt_background - chunk_median
-        bg_grid = residual_bg.reshape(self.grid_size, self.cell_size, self.grid_size, self.cell_size).mean(axis=(1, 3))
+        # TARGET FIX: Residual BG is also stretched: asinh((gt_bg - median) / scale)
+        residual_bg_linear = gt_background - chunk_median
+        residual_bg_stretched = np.arcsinh(residual_bg_linear / self.global_stretch_scale)
+        
+        bg_grid = residual_bg_stretched.reshape(self.grid_size, self.cell_size, self.grid_size, self.cell_size).mean(axis=(1, 3))
 
         return {
             "image": torch.from_numpy(normalized_image).unsqueeze(0),
-            "raw_image": torch.from_numpy(raw_image), # Added for mosaic saving
+            "raw_image": torch.from_numpy(raw_image),
             "base_grid": torch.from_numpy(base_grid),
             "background_map": torch.from_numpy(bg_grid),
             "shapes": torch.from_numpy(np.array(shapes)) if shapes else torch.tensor([]),
@@ -268,15 +275,26 @@ class GaussianMosaicDataset(Dataset):
         normalized_image = np.arcsinh((raw_image - chunk_median) / self.global_stretch_scale)
         image_tensor = torch.from_numpy(normalized_image).unsqueeze(0).float()
 
+        # Handle target normalization consistent with generate_chunk
         if len(target_raw.shape) == 4:
+            # target_raw is legacy [H, W, K, C]
+            # base_grid has linear flux in log10 form or raw?
+            # actually our generate_mosaics saves the output of generate_chunk
+            # so we need to be careful. For now, assume we'll regenerate mosaics.
             star_grid = target_raw[..., :-1]
             bg_map = target_raw[..., 0, -1] 
-            bg_residual = bg_map - chunk_median
+            bg_residual_stretched = np.arcsinh((bg_map - chunk_median) / self.global_stretch_scale)
             flattened_stars = star_grid.reshape(self.grid_size, self.grid_size, -1)
-            target = torch.cat([torch.from_numpy(flattened_stars), torch.from_numpy(bg_residual).unsqueeze(-1)], dim=-1)
+            target = torch.cat([torch.from_numpy(flattened_stars), torch.from_numpy(bg_residual_stretched).unsqueeze(-1)], dim=-1)
         else:
+            # target_raw is flattened [H, W, C_stars + 1]
+            # Extract and update BG
             target = torch.from_numpy(target_raw.copy())
-            target[..., -1] -= chunk_median
+            bg_linear_abs = target[..., -1] # Assuming mosaic saves absolute BG?
+            # Actually generate_mosaics currently saves what generate_chunk returns.
+            # If we regenerate, it will be absolute physical photons.
+            bg_residual_stretched = torch.arcsinh((bg_linear_abs - chunk_median) / self.global_stretch_scale)
+            target[..., -1] = bg_residual_stretched
             
         return {
             "image": image_tensor,
