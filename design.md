@@ -8,20 +8,20 @@ To develop a machine learning pipeline capable of performing fast, direct point-
 ### Input (Edge-to-Edge Prediction)
 *   **Format:** 2D Image Tensor
 *   **Dimensions:** $256 \times 256 \times 1$ (Single-band image chunk).
-*   **Preprocessing:** Background subtraction is performed during training via a dedicated model head.
+*   **Preprocessing:** **"Dynamic Input, Residual Target" Strategy**. Each chunk is median-subtracted and normalized using a global Arcsinh stretch: $I_{norm} = \text{asinh}((I_{raw} - \text{median}(I_{raw})) / \text{scale})$. This ensures the noise floor always rides on the linear portion of the Arcsinh curve.
 
 ### Output (The Spatial Grid)
-*   **Format:** 4D Tensor
+*   **Format:** 3D Tensor (Flattened Channels)
 *   **Dimensions:** $128 \times 128 \times (K \times 86 + 1)$ (where $K=3$ is optimized for Bulge densities).
 *   **Structure:** The output is a $128 \times 128$ spatial grid. Each cell predicts star parameters for $K$ slots plus one shared local background value. **Canonical Slot Sorting:** Stars within each cell are sorted by flux (brightest to faintest) before being assigned to the $K$ slots. This provides a stable and consistent learning target.
 *   **Slot Values (86 per slot):**
     1.  **p:** Probability (Objectness score, $0.0 \to 1.0$)
     2.  **dx, dy:** Sub-pixel offset from the cell's top-left corner ($0.0 \to 2.0$)
-    3.  **m:** Log-transformed Flux ($\log_{10}(\text{Flux})$).
+    3.  **m:** Stretched Flux ($\text{asinh}(\text{Flux} / \text{scale})$). Matches the input feature space for stable regression.
     4.  **c:** Completeness / Recoverability Score ($0.0 \to 1.0$)
     5.  **S (Shape):** 9x9 Point Source Profile (81 values). Represents the isolated, centered PSF shape.
 *   **Background Value (1 per cell):**
-    1.  **b:** Local Background Level. Represents the smoothly varying sky/unresolved light surface.
+    1.  **b:** Residual Background Level ($\text{asinh}((\text{BG}_{raw} - \text{median}(I_{raw})) / \text{scale})$). Represents local deviations from the chunk's median sky.
 
 ## 3. Neural Network Architecture
 
@@ -41,17 +41,17 @@ A **Feature Pyramid Network (FPN)** merges deep semantic context from the lower 
 *   **Activations:**
     *   **p, c:** Sigmoid.
     *   **dx, dy:** Sigmoid $\times \text{cell\_size}$.
-    *   **m:** Linear.
+    *   **m, b:** Linear (predicting in stretched space).
     *   **S:** Softmax over the $S^2$ values per slot.
-    *   **b:** ReLU (ensures positive background levels).
 
 ## 4. The Loss Function
-*   **Total Loss:** $\mathcal{L}_{Total} = \lambda_1 \mathcal{L}_{Prob} + \lambda_2 \mathcal{L}_{Pos} + \lambda_3 \mathcal{L}_{Flux} + \lambda_4 \mathcal{L}_{Shape} + \lambda_5 \mathcal{L}_{BG} + \lambda_6 \mathcal{L}_{TV}$
+*   **Total Loss:** $\mathcal{L}_{Total} = \lambda_1 \mathcal{L}_{Prob} + \lambda_2 \mathcal{L}_{Pos} + \lambda_3 \mathcal{L}_{Flux} + \lambda_4 \mathcal{L}_{Comp} + \lambda_5 \mathcal{L}_{Shape} + \lambda_6 \mathcal{L}_{BG}$
 *   **$\mathcal{L}_{Prob}$:** Focal Loss with inverse-flux importance weighting to boost the detection of faint sources.
-*   **$\mathcal{L}_{Pos}$:** Masked MSE for $dx, dy$ sub-pixel offsets, heavily weighted ($\lambda_2 \approx 5.0$) to force geometric precision.
-*   **$\mathcal{L}_{Flux}$:** Masked MSE for log-flux ($m$) and completeness ($c$).
+*   **$\mathcal{L}_{Pos}$:** Masked MSE for $dx, dy$ sub-pixel offsets, heavily weighted ($\lambda_2 \approx 50.0$) to force geometric precision.
+*   **$\mathcal{L}_{Flux}$:** Masked MSE for stretched flux ($m$). Weighted ($\lambda_3 \approx 5.0$) to compensate for Arcsinh compression.
+*   **$\mathcal{L}_{Comp}$:** Masked MSE for completeness ($c$).
 *   **$\mathcal{L}_{Shape}$:** Masked MSE for the 9x9 PSF.
-*   **$\mathcal{L}_{BG}$:** Global MSE for the background map.
+*   **$\mathcal{L}_{BG}$:** Global MSE for the Arcsinh-stretched background map.
 
 ## 5. Success Metrics (Acceptance Criteria)
 | Metric | Target | Description |
@@ -67,7 +67,7 @@ A **Feature Pyramid Network (FPN)** merges deep semantic context from the lower 
 ## 6. Implementation Strategy: Sparse Storage
 To maintain a < 100 GB disk footprint:
 *   **Storage:** Samples save the image, the 5-channel star grid, the 1-channel background map, and a compressed list of 81-pixel shapes.
-*   **JIT Re-densification:** The `Dataset` class re-inflates these into the full $128 \times 128 \times 259$ tensor during training.
+*   **JIT Re-densification:** The `Dataset` class re-inflates these into the full flattened tensor during training, applying Arcsinh normalization on-the-fly to raw photon counts.
 
 ## 7. Training Curriculum
 The pipeline uses a multi-stage curriculum to build a robust foundation model for space-based point source recovery.
