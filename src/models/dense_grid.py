@@ -52,7 +52,6 @@ class DenseGridModel(nn.Module):
         self.layer4 = resnet.layer4 # 8x8, 512ch
 
         # 2. FPN Neck: Merge deep context back to the 64x64 prediction grid
-        # We want to end up at 64x64 resolution (Stride 4)
         self.top_layer = nn.Conv2d(512, 128, kernel_size=1) # 8x8
         self.fpn3 = FPNBlock(256, 128, 128) # 16x16
         self.fpn2 = FPNBlock(128, 128, 128) # 32x32
@@ -64,8 +63,6 @@ class DenseGridModel(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(256, self.num_output_channels, kernel_size=1)
         )
-        
-        # Removed 100.0 bias init: background is now a zero-centered residual
 
     def forward(self, x):
         # Bottom-up
@@ -93,14 +90,14 @@ class DenseGridModel(nn.Module):
         p = torch.sigmoid(star_out[..., 0:1])
         dx = torch.sigmoid(star_out[..., 1:2]) * self.cell_size
         dy = torch.sigmoid(star_out[..., 2:3]) * self.cell_size
-        # FLUX FIX: Use exp activation to map to wide physical fluxes stably
-        m = torch.exp(star_out[..., 3:4])
+        # REVERTED: Predict arcsinh stretched flux linearly
+        m = star_out[..., 3:4]
         c = torch.sigmoid(star_out[..., 4:5])
         
         shape_logits = star_out[..., 5:]
         shape = F.softmax(shape_logits, dim=-1)
         
-        # Removed ReLU: background residuals can be negative
+        # Background residuals can be negative
         bg = bg_out.permute(0, 2, 3, 1)
         
         return {
@@ -124,8 +121,7 @@ def compute_grid_loss(preds, targets, lambda_prob=5.0, lambda_pos=50.0, lambda_f
     star_targets_flat = targets[..., :-1]
     
     # Infer K: C_pred = K * (5 + S2)
-    # C_pred is star_preds.shape[-1]
-    K = star_preds.shape[-2] # star_preds is [B, H, W, K, 5+S2]
+    K = star_preds.shape[-2]
     S2_plus_5 = star_preds.shape[-1]
     star_targets = star_targets_flat.view(B, H, W, K, S2_plus_5)
     
@@ -141,12 +137,9 @@ def compute_grid_loss(preds, targets, lambda_prob=5.0, lambda_pos=50.0, lambda_f
     alpha_t = focal_alpha * p_target + (1 - focal_alpha) * (1 - p_target)
     
     with torch.no_grad():
-        # IMPORTANT: Flux target in dataset is now arcsinh(flux / scale)
-        # We boost based on the true flux magnitude
-        # We need to invert arcsinh here to get linear flux for boosting
-        # Actually we can just use the target m directly since it's monotonic
         m_target = star_targets[..., 3]
-        boost_weight = torch.where(obj_mask, 1.0 + (4.0 - m_target) / 4.0, torch.tensor(1.0, device=p_pred.device))
+        # Boost based on stretched magnitude
+        boost_weight = torch.where(obj_mask, 1.0 + (12.0 - m_target) / 6.0, torch.tensor(1.0, device=p_pred.device))
         boost_weight = torch.clamp(boost_weight, 1.0, 5.0)
     
     prob_loss = (alpha_t * focal_weight * bce_loss * boost_weight).mean()
