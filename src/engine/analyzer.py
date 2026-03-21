@@ -9,8 +9,8 @@ class ThresholdAnalyzer:
         self.model = model
         self.device = device
         self.dataset = dataset
-        self.stretch_scale = dataset.global_stretch_scale
-        self.transform = AstroSpaceTransform(stretch_scale=self.stretch_scale)
+        self.stretch_scale = dataset.transform.stretch_scale
+        self.transform = dataset.transform
 
     def run_analysis(self, num_chunks=20, output_path="threshold_analysis.png"):
         self.model.eval()
