@@ -204,13 +204,16 @@ class GaussianPretrainingProvider(Dataset):
         residual_bg_linear = gt_background - chunk_median
         residual_bg_stretched = self.transform.target_bg_to_network(residual_bg_linear)
         
-        bg_grid = residual_bg_stretched.reshape(self.grid_size, self.cell_size, self.grid_size, self.cell_size).mean(axis=(1, 3))
+        bg_grid_stretched = residual_bg_stretched.reshape(self.grid_size, self.cell_size, self.grid_size, self.cell_size).mean(axis=(1, 3))
+        # Add absolute linear BG for mosaic generation
+        bg_grid_linear = gt_background.reshape(self.grid_size, self.cell_size, self.grid_size, self.cell_size).mean(axis=(1, 3))
 
         return {
             "image": torch.from_numpy(normalized_image).unsqueeze(0),
             "raw_image": torch.from_numpy(raw_image),
             "base_grid": torch.from_numpy(base_grid),
-            "background_map": torch.from_numpy(bg_grid),
+            "background_map": torch.from_numpy(bg_grid_stretched),
+            "bg_linear_grid": torch.from_numpy(bg_grid_linear), # For mosaic script
             "shapes": torch.from_numpy(np.array(shapes)) if shapes else torch.tensor([]),
             "indices": torch.from_numpy(np.array(indices)) if indices else torch.tensor([]),
             "chunk_median": float(chunk_median)

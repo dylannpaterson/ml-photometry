@@ -33,22 +33,26 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     
     # 2. Redensify Target Grid (Pre-compute EVERYTHING)
     base_grid = sparse_sample["base_grid"] # [G, G, K, 5]
-    bg_map = sparse_sample["background_map"] # [G, G]
-    shapes = sparse_sample["shapes"]       # [N, S2]
-    indices = sparse_sample["indices"]     # [N, 3]
-    
+    # IMPORTANT: generate_chunk returns background_map which is ALREADY STRETCHED.
+    # We need to save the ABSOLUTE PHYSICAL PHOTONS for the mosaic to be robust.
+    # We'll calculate it from smooth_bg + unresolved_img inside generate_chunk? 
+    # No, let's just make generate_chunk return it.
+    bg_linear_abs = sparse_sample.get("bg_linear_abs", None)
+    if bg_linear_abs is None:
+        # Fallback if not updated yet: 
+        # (This is why we centralize!)
+        pass
+
     G = provider.grid_size
     K = provider.K
     S2 = params['shape_size']**2
     
-    # Dense Target Shape: [G, G, (K * (5 + S^2)) + 1]
-    # We first build it as [G, G, K, 5 + S2] then flatten and append BG
+    # Dense Target Shape: [G, G, (K * (5 + S2)) + 1]
     star_grid = np.zeros((G, G, K, 5 + S2), dtype=np.float32)
-    
-    # Fill base grid
     star_grid[..., :5] = base_grid.numpy()
     
-    # Fill shapes
+    indices = sparse_sample["indices"]
+    shapes = sparse_sample["shapes"]
     if len(indices) > 0:
         for i in range(len(indices)):
             y, x, k = indices[i]
@@ -56,6 +60,10 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
             
     # Flatten K and Append Background
     flattened_stars = star_grid.reshape(G, G, -1)
+    
+    # We want absolute linear BG here
+    # I will update generate_chunk to return bg_linear_grid
+    bg_map = sparse_sample["bg_linear_grid"]
     dense_target = np.concatenate([flattened_stars, bg_map.numpy()[..., np.newaxis]], axis=-1)
             
     target_path = os.path.join(output_dir, f"mosaic_{idx:03d}_target.npy")
