@@ -41,20 +41,22 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     K = provider.K
     S2 = params['shape_size']**2
     
-    # Dense Target Shape: [G, G, K, 5 + S2 + 1]
-    dense_target = np.zeros((G, G, K, 5 + S2 + 1), dtype=np.float32)
+    # Dense Target Shape: [G, G, (K * (5 + S2)) + 1]
+    # We first build it as [G, G, K, 5 + S2] then flatten and append BG
+    star_grid = np.zeros((G, G, K, 5 + S2), dtype=np.float32)
     
     # Fill base grid
-    dense_target[..., :5] = base_grid.numpy()
-    
-    # Fill background (shared per cell, broadcast to all slots)
-    dense_target[..., -1] = bg_map.numpy()[..., np.newaxis]
+    star_grid[..., :5] = base_grid.numpy()
     
     # Fill shapes
     if len(indices) > 0:
         for i in range(len(indices)):
             y, x, k = indices[i]
-            dense_target[y, x, k, 5:5+S2] = shapes[i].numpy()
+            star_grid[y, x, k, 5:5+S2] = shapes[i].numpy()
+            
+    # Flatten K and Append Background
+    flattened_stars = star_grid.reshape(G, G, -1)
+    dense_target = np.concatenate([flattened_stars, bg_map.numpy()[..., np.newaxis]], axis=-1)
             
     target_path = os.path.join(output_dir, f"mosaic_{idx:03d}_target.npy")
     np.save(target_path, dense_target)

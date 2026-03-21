@@ -40,8 +40,8 @@ curriculum:
 data_params:
   num_train_samples: 50000
   num_val_samples: 2000
-  min_stars: 100
-  max_stars: 600
+  min_stars: 500
+  max_stars: 1000
   image_size: 256
   max_capacity_per_cell: 3
   shape_size: 9

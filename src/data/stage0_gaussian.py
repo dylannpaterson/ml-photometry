@@ -313,8 +313,18 @@ class GaussianMosaicDataset(Dataset):
         # 3. Direct Slices (No logic, just memory access)
         image = torch.from_numpy(full_img[py:py+self.img_size, px:px+self.img_size].copy()).unsqueeze(0).float()
         
-        # Note: In the dual-mmap case, the target is already flattened during generation in generate_mosaics.py
-        # but for the JIT provider, we do it in __getitem__.
-        target = torch.from_numpy(full_tgt[gy:gy+self.grid_size, gx:gx+self.grid_size].copy())
+        target_raw = full_tgt[gy:gy+self.grid_size, gx:gx+self.grid_size]
+        
+        # Robustly handle legacy 5D targets (B, H, W, K, C) and new 4D targets (B, H, W, flattened)
+        if len(target_raw.shape) == 4:
+            # Legacy format: [grid_h, grid_w, K, channels_per_star + 1]
+            # Background is in the last channel of every K slot
+            star_grid = target_raw[..., :-1]
+            bg_map = target_raw[..., 0, -1] # Just take one slot's background
+            flattened_stars = star_grid.reshape(self.grid_size, self.grid_size, -1)
+            target = torch.cat([torch.from_numpy(flattened_stars), torch.from_numpy(bg_map).unsqueeze(-1)], dim=-1)
+        else:
+            # Already flattened format: [grid_h, grid_w, flattened_channels]
+            target = torch.from_numpy(target_raw.copy())
             
         return image, target
