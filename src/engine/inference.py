@@ -89,17 +89,16 @@ class InferenceEngine:
         gs = fig.add_gridspec(5, 4)
         
         # Row 1-2: Primary Comparisons
-        # Use background-relative vmin to make stars visible
-        bg_level = np.percentile(img, 10)
-        norm = LogNorm(vmin=max(1.0, bg_level), vmax=max(img.max(), full_reconstruction.max()))
+        # Arcsinh images are already stretched, use linear normalization with percentiles
+        vmin, vmax = np.percentile(img, [1, 99.9])
         
         ax1 = fig.add_subplot(gs[0:2, 0])
-        ax1.imshow(img, cmap='inferno', origin='lower', norm=norm)
-        ax1.set_title("Original Input")
+        ax1.imshow(img, cmap='inferno', origin='lower', vmin=vmin, vmax=vmax)
+        ax1.set_title("Original Input (Arcsinh)")
         for s in true_catalogue: ax1.plot(s[0], s[1], 'g+', markersize=8, alpha=0.4)
         
         ax2 = fig.add_subplot(gs[0:2, 1])
-        ax2.imshow(full_reconstruction, cmap='inferno', origin='lower', norm=norm)
+        ax2.imshow(full_reconstruction, cmap='inferno', origin='lower', vmin=vmin, vmax=vmax)
         ax2.set_title("Model Reconstruction")
         
         ax3 = fig.add_subplot(gs[0:2, 2])

@@ -67,6 +67,7 @@ def run_train(stage_idx, config, device):
     K = data_cfg["max_capacity_per_cell"]
     S = data_cfg["shape_size"]
     cell_size = stage_cfg.get("cell_size", 4)
+    stretch_scale = data_cfg.get("GLOBAL_STRETCH_SCALE", 10.0)
 
     if stage_idx == 0:
         mosaic_dir = os.path.join(stage_cfg["data_dir"], "mosaics")
@@ -85,14 +86,16 @@ def run_train(stage_idx, config, device):
             mosaic_dir,
             num_samples=data_cfg["num_train_samples"],
             image_size=data_cfg["image_size"],
-            cell_size=cell_size
+            cell_size=cell_size,
+            global_stretch_scale=stretch_scale
         )
         # Use the same mosaics for validation but with a fixed sample count
         val_dataset = GaussianMosaicDataset(
             mosaic_dir,
             num_samples=data_cfg["num_val_samples"],
             image_size=data_cfg["image_size"],
-            cell_size=cell_size
+            cell_size=cell_size,
+            global_stretch_scale=stretch_scale
         )
     else:
         data_dir = stage_cfg["data_dir"]
@@ -162,12 +165,14 @@ def run_infer(stage_idx, config, device, checkpoint=None):
     # Stage-specific provider
     if stage_idx == 0:
         data_cfg = config["data_params"]
+        stretch_scale = data_cfg.get("GLOBAL_STRETCH_SCALE", 10.0)
         provider = GaussianPretrainingProvider(
             min_stars=data_cfg["min_stars"],
             max_stars=data_cfg["max_stars"],
             image_size=data_cfg["image_size"],
             max_capacity_per_cell=data_cfg["max_capacity_per_cell"],
-            shape_size=data_cfg["shape_size"]
+            shape_size=data_cfg["shape_size"],
+            global_stretch_scale=stretch_scale
         )
         
         # generate_chunk now returns a sparse dict
@@ -225,7 +230,8 @@ def run_analyze(stage_idx, config, device, checkpoint=None):
         provider = GaussianPretrainingProvider(
             min_stars=config["data_params"]["min_stars"],
             max_stars=config["data_params"]["max_stars"],
-            image_size=config["data_params"]["image_size"]
+            image_size=config["data_params"]["image_size"],
+            global_stretch_scale=config["data_params"].get("GLOBAL_STRETCH_SCALE", 10.0)
         )
         analyzer = ThresholdAnalyzer(model, device, provider)
         analyzer.run_analysis(num_chunks=20)

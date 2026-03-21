@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import os
 
 class GaussianPretrainingProvider(Dataset):
-    def __init__(self, num_samples=1000, min_stars=100, max_stars=1500, image_size=256, max_capacity_per_cell=3, shape_size=7, use_fixed_seed=False):
+    def __init__(self, num_samples=1000, min_stars=100, max_stars=1500, image_size=256, max_capacity_per_cell=3, shape_size=7, use_fixed_seed=False, global_stretch_scale=10.0):
         """
         Generates realistic synthetic data for the Roman Bulge Time Domain Survey.
         Vectorized for speed.
@@ -18,6 +18,7 @@ class GaussianPretrainingProvider(Dataset):
         self.S = shape_size
         self.read_noise = 5.0
         self.use_fixed_seed = use_fixed_seed
+        self.global_stretch_scale = global_stretch_scale
 
         # Grid parameters: 4x4 cells for 256x256 image = 64x64 grid
         self.cell_size = 4
@@ -233,17 +234,15 @@ class GaussianPretrainingProvider(Dataset):
         noise_std = np.sqrt(total_photon_flux + self.read_noise**2)
         raw_image = np.random.normal(loc=total_photon_flux, scale=noise_std).astype(np.float32)
 
-        # 6. Arcsinh Normalization (Task 1.1)
-        # Calculate stats on the background for robust stretch
-        bg_median = np.median(gt_background)
-        bg_std = np.std(raw_image - total_photon_flux) # Est local noise
-        
-        # Apply arcsinh stretch: asinh((x - bg) / (3 * sigma))
-        # This compresses high-dynamic range while keeping faint stars linear near the noise floor
-        normalized_image = np.arcsinh((raw_image - bg_median) / (3.0 * bg_std))
+        # 6. "Dynamic Input, Residual Target" Arcsinh Normalization
+        chunk_median = np.median(raw_image)
+        # Apply global scale stretch after local median subtraction
+        normalized_image = np.arcsinh((raw_image - chunk_median) / self.global_stretch_scale)
 
-        # 7. Grid Assembly
-        bg_grid = gt_background.reshape(self.grid_size, self.cell_size, self.grid_size, self.cell_size).mean(axis=(1, 3))
+        # 7. Grid Assembly (Residual Background)
+        # We subtract the SAME scalar from the truth background map
+        residual_bg = gt_background - chunk_median
+        bg_grid = residual_bg.reshape(self.grid_size, self.cell_size, self.grid_size, self.cell_size).mean(axis=(1, 3))
 
         return {
             "image": torch.from_numpy(normalized_image).unsqueeze(0),
@@ -269,13 +268,14 @@ class GaussianPretrainingProvider(Dataset):
         print(f"Visualization saved to {output_path}")
 
 class GaussianMosaicDataset(Dataset):
-    def __init__(self, data_dir, num_samples=25000, image_size=256, cell_size=4):
+    def __init__(self, data_dir, num_samples=25000, image_size=256, cell_size=4, global_stretch_scale=10.0):
         """Uses dual memory-mapping (Image + Dense Target) for absolute maximum speed."""
         self.data_dir = data_dir
         self.num_samples = num_samples
         self.img_size = image_size
         self.cell_size = cell_size
         self.grid_size = image_size // cell_size
+        self.global_stretch_scale = global_stretch_scale
         
         self.image_files = sorted([f for f in os.listdir(data_dir) if f.endswith("_img.npy")])
         self.target_files = sorted([f for f in os.listdir(data_dir) if f.endswith("_target.npy")])
@@ -303,28 +303,42 @@ class GaussianMosaicDataset(Dataset):
         
         # 2. Pick a random crop
         # SCA is 4088x4088, grid is 1022x1022 (for cell_size=4)
-        full_grid_size = full_tgt.shape[0]
-        max_grid = full_grid_size - self.grid_size
+        full_grid_size = full_img.shape[0] # Changed from full_tgt.shape[0] to be more robust
+        max_grid = (full_grid_size // self.cell_size) - self.grid_size
         
         gy = np.random.randint(0, max_grid)
         gx = np.random.randint(0, max_grid)
         py, px = gy * self.cell_size, gx * self.cell_size
         
-        # 3. Direct Slices (No logic, just memory access)
-        image = torch.from_numpy(full_img[py:py+self.img_size, px:px+self.img_size].copy()).unsqueeze(0).float()
-        
+        # 3. Direct Slices
+        raw_image = full_img[py:py+self.img_size, px:px+self.img_size]
         target_raw = full_tgt[gy:gy+self.grid_size, gx:gx+self.grid_size]
         
+        # 4. Apply Normalization ON THE FLY for Mosaics
+        # Since mosaics are saved as raw photons, we normalize exactly like generate_chunk
+        chunk_median = np.median(raw_image)
+        normalized_image = np.arcsinh((raw_image - chunk_median) / self.global_stretch_scale)
+        image_tensor = torch.from_numpy(normalized_image).unsqueeze(0).float()
+
+        # 5. Handle Target Flattening & Residual BG
         # Robustly handle legacy 5D targets (B, H, W, K, C) and new 4D targets (B, H, W, flattened)
         if len(target_raw.shape) == 4:
             # Legacy format: [grid_h, grid_w, K, channels_per_star + 1]
-            # Background is in the last channel of every K slot
             star_grid = target_raw[..., :-1]
-            bg_map = target_raw[..., 0, -1] # Just take one slot's background
+            bg_map = target_raw[..., 0, -1] 
+            
+            # Apply residual background logic: target_bg = bg_map - chunk_median
+            bg_residual = bg_map - chunk_median
+            
             flattened_stars = star_grid.reshape(self.grid_size, self.grid_size, -1)
-            target = torch.cat([torch.from_numpy(flattened_stars), torch.from_numpy(bg_map).unsqueeze(-1)], dim=-1)
+            target = torch.cat([torch.from_numpy(flattened_stars), torch.from_numpy(bg_residual).unsqueeze(-1)], dim=-1)
         else:
             # Already flattened format: [grid_h, grid_w, flattened_channels]
+            # Note: Legacy flattened mosaics might not have the residual BG logic applied yet.
+            # If so, we'd need to extract BG and adjust it. 
+            # For simplicity, we assume new mosaics will be generated correctly.
             target = torch.from_numpy(target_raw.copy())
+            # Adjust the last channel (background) to be residual
+            target[..., -1] -= chunk_median
             
-        return image, target
+        return image_tensor, target
