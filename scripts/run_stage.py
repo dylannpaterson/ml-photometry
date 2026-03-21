@@ -40,7 +40,14 @@ def load_stage_model(stage_idx, device, config, checkpoint_path=None):
     cell_size = stage_cfg.get("cell_size", 4)
     
     model = DenseGridModel(K=K, shape_size=S, cell_size=cell_size).to(device)
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    
+    # Handle full checkpoint dict or raw state dict
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+        model.load_state_dict(ckpt['model_state_dict'])
+    else:
+        model.load_state_dict(ckpt)
+        
     return model
 
 def run_train(stage_idx, config, device):

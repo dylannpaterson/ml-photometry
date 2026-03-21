@@ -40,46 +40,47 @@ class InferenceEngine:
 
     def visualize(self, image_tensor, true_catalogue, predicted_stars, predicted_shapes, bg_map, gt_bg_map, threshold, chunk_median=0.0, output_path="inference_comparison.png"):
         from src.engine.evaluator import match_stars
-        img = image_tensor.squeeze().numpy() # This is Stretched Input: asinh((raw - median) / scale)
-        H, W = img.shape
+        img_stretched = image_tensor.squeeze().numpy() # Input is Stretched: asinh((raw - median) / scale)
+        H, W = img_stretched.shape
         
-        # Calculate zoom factor for background upsampling
         bg_h, bg_w = bg_map.shape[:2]
         zoom_h, zoom_w = H / bg_h, W / bg_w
 
-        # 1. Component Preparation (Linear Space)
-        # Background is linear residual: (gt_bg - median)
+        # 1. Component Preparation (Linear Residual Space: raw - median)
         full_residual_bg = zoom(bg_map.squeeze(), (zoom_h, zoom_w), order=1)
         full_gt_residual_bg = zoom(gt_bg_map.squeeze(), (zoom_h, zoom_w), order=1)
         
-        reconstruction_linear = np.zeros_like(img)
+        reconstruction_stars_linear = np.zeros_like(img_stretched)
         for (x, y, flux, c, p), shape in zip(predicted_stars, predicted_shapes):
             ix, iy, S = int(round(x)), int(round(y)), shape.shape[0]
             half = S // 2
             y0, y1 = max(0, iy - half), min(H, iy + half + 1)
             x0, x1 = max(0, ix - half), min(W, ix + half + 1)
             sy0, sy1, sx0, sx1 = half - (iy - y0), half + (y1 - iy), half - (ix - x0), half + (x1 - ix)
-            reconstruction_linear[y0:y1, x0:x1] += flux * shape[sy0:sy1, sx0:sx1]
+            reconstruction_stars_linear[y0:y1, x0:x1] += flux * shape[sy0:sy1, sx0:sx1]
 
-        # 2. Map Reconstruction to Stretched Space for Valid Residuals
-        # Network sees: asinh((raw - median) / scale)
-        # We have: (reconstruction_linear + full_residual_bg) which is effectively (stars + bg - median)
-        full_reconstruction_linear = reconstruction_linear + full_residual_bg
-        full_reconstruction_stretched = np.arcsinh(full_reconstruction_linear / self.stretch_scale)
+        # 2. Linear Reconstruction (Residual: raw - median)
+        full_reconstruction_linear = reconstruction_stars_linear + full_residual_bg
         
-        # Residual in Stretched Space (what the loss function optimizes)
-        residual_stretched = img - full_reconstruction_stretched
+        # 3. Map back to Stretched Space for units-matching comparison
+        full_reconstruction_stretched = np.arcsinh(full_reconstruction_linear / self.stretch_scale)
+        residual_stretched = img_stretched - full_reconstruction_stretched
 
-        # Absolute Backgrounds for FITS
+        # 4. Absolute Backgrounds for physical sanity check
         full_bg_abs = full_residual_bg + chunk_median
         full_gt_bg_abs = full_gt_residual_bg + chunk_median
+
+        # 5. Reverse Stretch Input for Linear Plot (raw - median)
+        img_linear = np.sinh(img_stretched) * self.stretch_scale
 
         # --- FITS OUTPUT ---
         hdul = fits.HDUList([
             fits.PrimaryHDU(),
-            fits.ImageHDU(img, name="INPUT_STRETCHED"),
+            fits.ImageHDU(img_stretched, name="INPUT_STRETCHED"),
             fits.ImageHDU(full_reconstruction_stretched, name="MODEL_STRETCHED"),
             fits.ImageHDU(residual_stretched, name="RESIDUAL_STRETCHED"),
+            fits.ImageHDU(img_linear, name="INPUT_LINEAR_RESID"),
+            fits.ImageHDU(full_reconstruction_linear, name="MODEL_LINEAR_RESID"),
             fits.ImageHDU(full_bg_abs, name="BG_PRED_ABS"),
             fits.ImageHDU(full_gt_bg_abs, name="BG_TRUE_ABS")
         ])
@@ -87,83 +88,64 @@ class InferenceEngine:
         hdul.writeto(fits_path, overwrite=True)
         print(f"FITS data saved to {fits_path}")
 
-        # 2. Statistics for Plots
+        # Statistics
         matches, _, _ = match_stars(true_catalogue, predicted_stars)
-        true_mags, pred_mags, true_comps, pred_comps = [], [], [], []
+        true_mags, pred_mags = [], []
         for t_idx, p_idx, _ in matches:
             true_mags.append(np.log10(true_catalogue[t_idx][2] + 1e-9))
             pred_mags.append(np.log10(predicted_stars[p_idx][2] + 1e-9))
-            true_comps.append(true_catalogue[t_idx][3])
-            pred_comps.append(predicted_stars[p_idx][3])
 
-        # 3. Figure Layout
+        # 6. Figure Layout
         fig = plt.figure(figsize=(30, 24))
         gs = fig.add_gridspec(5, 4)
         
-        # Row 1-2: Primary Comparisons (Stretched Space)
-        vmin, vmax = np.percentile(img, [1, 99.9])
+        # Row 1-2: Stretched Comparisons (Network Space)
+        vmin, vmax = np.percentile(img_stretched, [1, 99.9])
         
         ax1 = fig.add_subplot(gs[0:2, 0])
-        ax1.imshow(img, cmap='inferno', origin='lower', vmin=vmin, vmax=vmax)
-        ax1.set_title("Original Input (Stretched)")
+        ax1.imshow(img_stretched, cmap='inferno', origin='lower', vmin=vmin, vmax=vmax)
+        ax1.set_title("Input (Stretched)")
         for s in true_catalogue: ax1.plot(s[0], s[1], 'g+', markersize=8, alpha=0.4)
         
         ax2 = fig.add_subplot(gs[0:2, 1])
         ax2.imshow(full_reconstruction_stretched, cmap='inferno', origin='lower', vmin=vmin, vmax=vmax)
-        ax2.set_title("Model Reconstruction (Stretched)")
+        ax2.set_title("Model (Stretched)")
         
         ax3 = fig.add_subplot(gs[0:2, 2])
-        rmax = np.percentile(np.abs(residual_stretched), 99)
+        rmax = max(0.1, np.percentile(np.abs(residual_stretched), 99))
         im3 = ax3.imshow(residual_stretched, cmap='bwr', origin='lower', vmin=-rmax, vmax=rmax)
         ax3.set_title("Residual (Stretched)")
         plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
 
-        # Row 3: Metrics & Background
-        # Magnitude
+        # Row 3: Linear Comparisons (Physical Space)
         ax4 = fig.add_subplot(gs[2, 0])
-        if true_mags:
-            ax4.scatter(true_mags, pred_mags, alpha=0.5, color='blue')
-            ax4.plot([min(true_mags), max(true_mags)], [min(true_mags), max(true_mags)], 'r--')
-            ax4.set_title("Magnitude Recovery"); ax4.set_aspect('equal')
+        # Use LogNorm for linear plot to see stars
+        l_vmin, l_vmax = np.percentile(img_linear, [10, 99.9])
+        ax4.imshow(img_linear, cmap='inferno', origin='lower', norm=LogNorm(vmin=max(1.0, l_vmin), vmax=l_vmax))
+        ax4.set_title("Input (Linear Residual)")
         
-        # Completeness
         ax5 = fig.add_subplot(gs[2, 1])
-        if true_comps:
-            ax5.scatter(true_comps, pred_comps, alpha=0.5, color='green')
-            ax5.plot([0, 1], [0, 1], 'r--')
-            ax5.set_title("Completeness Reliability"); ax5.set_aspect('equal')
+        ax5.imshow(full_reconstruction_linear, cmap='inferno', origin='lower', norm=LogNorm(vmin=max(1.0, l_vmin), vmax=l_vmax))
+        ax5.set_title("Model (Linear Residual)")
 
-        # Background Side-by-Side (Residuals)
+        # Background Side-by-Side
         bg_vmin = min(full_residual_bg.min(), full_gt_residual_bg.min())
         bg_vmax = max(full_residual_bg.max(), full_gt_residual_bg.max())
-        
         ax6 = fig.add_subplot(gs[2, 2])
         ax6.imshow(full_residual_bg, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax)
-        ax6.set_title("Predicted Residual BG")
-        
+        ax6.set_title("Pred Residual BG")
         ax7 = fig.add_subplot(gs[2, 3])
         im7 = ax7.imshow(full_gt_residual_bg, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax)
         ax7.set_title("Truth Residual BG")
         plt.colorbar(im7, ax=ax7, fraction=0.046, pad=0.04)
 
-        # Row 4-5: PSF Comparisons
-        if predicted_stars:
-            indices = np.argsort([s[4] for s in predicted_stars])[::-1]
-            psf_gs = gs[3:5, :].subgridspec(2, 8)
-            def get_ideal_psf(size=9):
-                half = size // 2
-                xx, yy = np.meshgrid(np.arange(-half, half + 1), np.arange(-half, half + 1))
-                psf = np.exp(-(xx**2 + yy**2) / (2 * 1.5**2))
-                return psf / (psf.sum() + 1e-9)
-            ideal_psf = get_ideal_psf(size=predicted_shapes[0].shape[0])
-            for i in range(min(8, len(indices))):
-                idx = indices[i]
-                ax_pred = fig.add_subplot(psf_gs[0, i])
-                ax_pred.imshow(predicted_shapes[idx], cmap='viridis', origin='lower')
-                ax_pred.set_title(f"p={predicted_stars[idx][4]:.2f}\nc={predicted_stars[idx][3]:.2f}"); ax_pred.axis('off')
-                ax_true = fig.add_subplot(psf_gs[1, i])
-                ax_true.imshow(ideal_psf, cmap='viridis', origin='lower'); ax_true.axis('off')
+        # Row 4-5: PSF & Mag Plots
+        if true_mags:
+            ax8 = fig.add_subplot(gs[3, 0])
+            ax8.scatter(true_mags, pred_mags, alpha=0.5)
+            ax8.plot([min(true_mags), max(true_mags)], [min(true_mags), max(true_mags)], 'r--')
+            ax8.set_title("Mag Recovery"); ax8.set_aspect('equal')
 
-        plt.suptitle("Generative Diagnostic: Star & Background Recovery", fontsize=24)
+        plt.suptitle(f"Generative Diagnostic (Scale={self.stretch_scale}) | Predicted Stars: {len(predicted_stars)}", fontsize=24)
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         plt.savefig(output_path); print(f"Comparison saved to {output_path}")

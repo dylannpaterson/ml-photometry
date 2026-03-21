@@ -27,9 +27,9 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     print(f"Generating Mosaic {idx} ({mosaic_size}x{mosaic_size}, cell_size={cell_size}, approx {sca_max_stars} stars)...")
     sparse_sample = provider.generate_chunk()
     
-    # 1. Save Dense Image
+    # 1. Save Dense Image (RAW PHOTONS for GaussianMosaicDataset to stretch on the fly)
     image_path = os.path.join(output_dir, f"mosaic_{idx:03d}_img.npy")
-    np.save(image_path, sparse_sample["image"].squeeze(0).numpy().astype(np.float32))
+    np.save(image_path, sparse_sample["raw_image"].numpy().astype(np.float32))
     
     # 2. Redensify Target Grid (Pre-compute EVERYTHING)
     base_grid = sparse_sample["base_grid"] # [G, G, K, 5]
@@ -41,7 +41,7 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     K = provider.K
     S2 = params['shape_size']**2
     
-    # Dense Target Shape: [G, G, (K * (5 + S2)) + 1]
+    # Dense Target Shape: [G, G, (K * (5 + S^2)) + 1]
     # We first build it as [G, G, K, 5 + S2] then flatten and append BG
     star_grid = np.zeros((G, G, K, 5 + S2), dtype=np.float32)
     

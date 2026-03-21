@@ -34,7 +34,7 @@ class GaussianPretrainingProvider(Dataset):
         if self.use_fixed_seed:
             np.random.seed(idx)
         sparse_sample = self.generate_chunk()
-        image = sparse_sample["image"]
+        image = sparse_sample["image"] # This is already stretched
         
         # Redensify exactly like PregeneratedDataset (including shapes)
         base_grid = sparse_sample["base_grid"]
@@ -59,7 +59,6 @@ class GaussianPretrainingProvider(Dataset):
                 star_targets[y, x, k, 5:5+S2] = shapes[i]
         
         # 2. Flatten K dimension and Append Background
-        # Final shape: [H, W, K*(5+S2) + 1]
         flattened_stars = star_targets.view(grid_size, grid_size, -1)
         target = torch.cat([flattened_stars, bg_map.unsqueeze(-1)], dim=-1)
         
@@ -88,58 +87,31 @@ class GaussianPretrainingProvider(Dataset):
         return psf.astype(np.float32).flatten()
 
     def _get_local_density(self, l, b):
-        """
-        Calculates the expected number of detectable stars per 256x256 patch
-        by integrating the Coleman 2020 3D Bulge Density model along the line of sight.
-        """
+        """Calculates expected detectable stars by integrating Coleman model."""
         try:
             from coleman_bulge_density import bulge_density_model
-            
-            # Integrate from 4 kpc to 12 kpc (covering the bulge)
             r_vals = np.linspace(4.0, 12.0, 50)
-            dr_pc = (r_vals[1] - r_vals[0]) * 1000.0 # Step size in pc
-            
-            # Evaluate model at (r, l, b)
-            # Note: Coleman model uses (r, lat, lon) mapping to (r, b, l)
+            dr_pc = (r_vals[1] - r_vals[0]) * 1000.0
             l_array = np.full_like(r_vals, l)
             b_array = np.full_like(r_vals, b)
             density_3d, _ = bulge_density_model(r=r_vals, lat=b_array, lon=l_array)
-            
-            # Integrate density * r^2 * solid_angle
-            # Solid angle of one 256x256 Roman patch (0.11 arcsec/px)
             patch_deg2 = (256 * 0.11 / 3600.0)**2
             solid_angle_sr = patch_deg2 * (np.pi / 180.0)**2
-            
-            r_pc = r_vals * 1000.0
-            volume_elements = r_pc**2 * dr_pc * solid_angle_sr
-            
-            total_stars_in_cone = np.sum(np.array(density_3d) * volume_elements)
-            
-            # The model gives total stars; we assume ~5% are above our detection threshold
-            detectable_fraction = 0.05
-            expected_detectable = total_stars_in_cone * detectable_fraction
-            
-            # Clip to sane bounds to prevent OOM
-            return np.clip(expected_detectable, 100, 5000)
-            
-        except ImportError:
-            # Fallback if package is not installed
+            volume_elements = (r_vals * 1000.0)**2 * dr_pc * solid_angle_sr
+            total_stars = np.sum(np.array(density_3d) * volume_elements)
+            return np.clip(total_stars * 0.05, 100, 5000)
+        except:
             scale_l, scale_b = 5.0, 2.0
             relative_density = np.exp(-np.sqrt((l/scale_l)**2 + (b/scale_b)**2))
             return 100 + 900 * relative_density
 
     def generate_chunk(self):
         """Generates a realistic Roman-like chunk with guaranteed truth density and separate tail."""
-        # 0. Pick a random pointing within the Bulge survey area (-5 to 5, -3 to 3)
         center_l = np.random.uniform(-5.0, 5.0)
         center_b = np.random.uniform(-3.0, 3.0)
-        
-        # Determine density for this pointing
         expected_stars = self._get_local_density(center_l, center_b)
-        # Stochastic realization of number of stars
         num_stars = int(np.random.poisson(expected_stars))
 
-        # 1. Smooth Background Surface (Zodiacal Light)
         zodiacal_level = np.random.uniform(20.0, 40.0)
         smooth_bg = np.full((self.img_size, self.img_size), zodiacal_level, dtype=np.float32)
         
@@ -147,12 +119,9 @@ class GaussianPretrainingProvider(Dataset):
         u_patch = 3
         star_patch = int(round(5 * sigma))
         
-        # 2. Generate the "Morass" (Tail Population - Physically Unresolved)
+        # 2. Generate the "Morass"
         unresolved_img = np.zeros_like(smooth_bg)
-        # The morass density scales directly with the main stellar density
-        # REDUCED multiplier for Stage 0 (Task 1.3)
         num_tail = num_stars * 2 
-        # Sample tail from power law (alpha=2.0) between 1 and 10 photons
         u_tail = np.random.uniform(0, 1, num_tail)
         f_min_t, f_max_t = 1.0, 10.0
         tail_fluxes = ((f_max_t**(1-2.0) - f_min_t**(1-2.0)) * u_tail + f_min_t**(1-2.0))**(1/(1-2.0))
@@ -168,10 +137,10 @@ class GaussianPretrainingProvider(Dataset):
             patch = (tail_fluxes[i] / (2 * np.pi * sigma**2)) * np.exp(-((xx - tail_x[i])**2 + (yy - tail_y[i])**2) / (2 * sigma**2))
             unresolved_img[y0:y1, x0:x1] += patch
 
-        # 3. Clean Noise Floor for Detectability (BG + Morass + ReadNoise)
+        # 3. Clean Noise Floor
         noise_floor = np.sqrt(smooth_bg + unresolved_img + self.read_noise**2)
 
-        # 4. Generate Potential Truth Population (Discrete Stars)
+        # 4. Generate Potential Truth Population
         fluxes = self._sample_luminosity_function(num_stars * 2) 
         x_centers = np.random.uniform(0, self.img_size, num_stars * 2)
         y_centers = np.random.uniform(0, self.img_size, num_stars * 2)
@@ -181,9 +150,7 @@ class GaussianPretrainingProvider(Dataset):
         psf_shape = self._generate_psf_shape(sigma=1.5)
         shapes, indices = [], []
         
-        # Temp storage for canonical sorting
-        cell_assignments = {} # (cy, cx) -> list of [flux, x, y, snr, completeness]
-
+        cell_assignments = {}
         for i in range(len(fluxes)):
             px, py = int(np.clip(x_centers[i], 0, self.img_size-1)), int(np.clip(y_centers[i], 0, self.img_size-1))
             local_noise = noise_floor[py, px]
@@ -192,35 +159,25 @@ class GaussianPretrainingProvider(Dataset):
             if snr >= 2.0:
                 cx, cy = int(x_centers[i] // self.cell_size), int(y_centers[i] // self.cell_size)
                 cx, cy = min(cx, self.grid_size - 1), min(cy, self.grid_size - 1)
-                
                 if (cy, cx) not in cell_assignments: cell_assignments[(cy, cx)] = []
-                
                 completeness = float(np.clip((snr - 3.5) / 4.5, 0.0, 1.0))
                 cell_assignments[(cy, cx)].append([fluxes[i], x_centers[i], y_centers[i], snr, completeness])
-            # REMOVED sub-threshold star injection into unresolved_img (Task 1.2)
 
-        # CANONICAL SORTING: Process each cell and assign to slots by flux
         for (cy, cx), cell_stars in cell_assignments.items():
-            # Sort stars in this cell by flux (brightest first)
             sorted_stars = sorted(cell_stars, key=lambda x: x[0], reverse=True)
-            
             for slot in range(min(self.K, len(sorted_stars))):
                 flux, tx, ty, snr, tcomp = sorted_stars[slot]
-                
                 base_grid[cy, cx, slot] = [1.0, tx % self.cell_size, ty % self.cell_size, np.log10(flux + 1e-9), tcomp]
                 shapes.append(psf_shape)
                 indices.append([cy, cx, slot])
-                
-                # Add to star signal for Poisson noise calculation
                 ix, iy = int(np.clip(tx, 0, self.img_size-1)), int(np.clip(ty, 0, self.img_size-1))
                 x0, x1 = max(0, ix - star_patch), min(self.img_size, ix + star_patch + 1)
                 y0, y1 = max(0, iy - star_patch), min(self.img_size, iy + star_patch + 1)
                 xx = np.arange(x0, x1)
                 yy = np.arange(y0, y1)[:, np.newaxis]
-                patch = (flux * (2 * np.pi * sigma**2)**-1) * np.exp(-((xx - tx)**2 + (yy - ty)**2) / (2 * sigma**2))
+                patch = (flux / (2 * np.pi * sigma**2)) * np.exp(-((xx - tx)**2 + (yy - ty)**2) / (2 * sigma**2))
                 star_signal[y0:y1, x0:x1] += patch
             
-            # Overflow stars (beyond K) become background confusion
             if len(sorted_stars) > self.K:
                 for i in range(self.K, len(sorted_stars)):
                     flux, tx, ty, _, _ = sorted_stars[i]
@@ -238,18 +195,17 @@ class GaussianPretrainingProvider(Dataset):
         noise_std = np.sqrt(total_photon_flux + self.read_noise**2)
         raw_image = np.random.normal(loc=total_photon_flux, scale=noise_std).astype(np.float32)
 
-        # 6. "Dynamic Input, Residual Target" Arcsinh Normalization
+        # 6. Normalization
         chunk_median = np.median(raw_image)
-        # Apply global scale stretch after local median subtraction
         normalized_image = np.arcsinh((raw_image - chunk_median) / self.global_stretch_scale)
 
         # 7. Grid Assembly (Residual Background)
-        # We subtract the SAME scalar from the truth background map
         residual_bg = gt_background - chunk_median
         bg_grid = residual_bg.reshape(self.grid_size, self.cell_size, self.grid_size, self.cell_size).mean(axis=(1, 3))
 
         return {
             "image": torch.from_numpy(normalized_image).unsqueeze(0),
+            "raw_image": torch.from_numpy(raw_image), # Added for mosaic saving
             "base_grid": torch.from_numpy(base_grid),
             "background_map": torch.from_numpy(bg_grid),
             "shapes": torch.from_numpy(np.array(shapes)) if shapes else torch.tensor([]),
@@ -260,7 +216,6 @@ class GaussianPretrainingProvider(Dataset):
     def visualize_chunk(self, image_tensor, true_catalogue, output_path="visualization_bulge.png"):
         img = image_tensor.squeeze().numpy()
         fig, ax = plt.subplots(figsize=(10, 10))
-        # No LogNorm needed for arcsinh-stretched images
         im = ax.imshow(img, cmap='inferno', origin='lower')
         fig.colorbar(im, ax=ax, label='Arcsinh Intensity')
         sample_size = min(200, len(true_catalogue))
@@ -268,13 +223,10 @@ class GaussianPretrainingProvider(Dataset):
         for idx in indices:
             x, y, flux, comp = true_catalogue[idx]
             ax.plot(x, y, 'g+', markersize=5, alpha=comp)
-        ax.set_title(f"Synthetic Chunk (Arcsinh Stretched): {len(true_catalogue)} stars")
         plt.savefig(output_path)
-        print(f"Visualization saved to {output_path}")
 
 class GaussianMosaicDataset(Dataset):
     def __init__(self, data_dir, num_samples=25000, image_size=256, cell_size=4, global_stretch_scale=10.0):
-        """Uses dual memory-mapping (Image + Dense Target) for absolute maximum speed."""
         self.data_dir = data_dir
         self.num_samples = num_samples
         self.img_size = image_size
@@ -291,59 +243,39 @@ class GaussianMosaicDataset(Dataset):
         print(f"🔗 Memory-mapping {len(self.image_files)} SCA Mosaics (Dual-mmap)...")
         self.mosaics = []
         for img_f, tgt_f in zip(self.image_files, self.target_files):
-            # Memory-map the large image
             img_mmap = np.load(os.path.join(data_dir, img_f), mmap_mode='r')
-            # Memory-map the large dense target grid
             tgt_mmap = np.load(os.path.join(data_dir, tgt_f), mmap_mode='r')
             self.mosaics.append((img_mmap, tgt_mmap))
-        print(f"✅ Ready to sample {num_samples} chunks (zero-overhead).")
 
     def __len__(self):
         return self.num_samples
 
     def __getitem__(self, idx):
-        # 1. Pick a random mosaic
         mosaic_idx = np.random.randint(0, len(self.mosaics))
         full_img, full_tgt = self.mosaics[mosaic_idx]
         
-        # 2. Pick a random crop
-        # SCA is 4088x4088, grid is 1022x1022 (for cell_size=4)
-        full_grid_size = full_img.shape[0] # Changed from full_tgt.shape[0] to be more robust
+        full_grid_size = full_img.shape[0] 
         max_grid = (full_grid_size // self.cell_size) - self.grid_size
         
         gy = np.random.randint(0, max_grid)
         gx = np.random.randint(0, max_grid)
         py, px = gy * self.cell_size, gx * self.cell_size
         
-        # 3. Direct Slices
         raw_image = full_img[py:py+self.img_size, px:px+self.img_size]
         target_raw = full_tgt[gy:gy+self.grid_size, gx:gx+self.grid_size]
         
-        # 4. Apply Normalization ON THE FLY for Mosaics
-        # Since mosaics are saved as raw photons, we normalize exactly like generate_chunk
         chunk_median = np.median(raw_image)
         normalized_image = np.arcsinh((raw_image - chunk_median) / self.global_stretch_scale)
         image_tensor = torch.from_numpy(normalized_image).unsqueeze(0).float()
 
-        # 5. Handle Target Flattening & Residual BG
-        # Robustly handle legacy 5D targets (B, H, W, K, C) and new 4D targets (B, H, W, flattened)
         if len(target_raw.shape) == 4:
-            # Legacy format: [grid_h, grid_w, K, channels_per_star + 1]
             star_grid = target_raw[..., :-1]
             bg_map = target_raw[..., 0, -1] 
-            
-            # Apply residual background logic: target_bg = bg_map - chunk_median
             bg_residual = bg_map - chunk_median
-            
             flattened_stars = star_grid.reshape(self.grid_size, self.grid_size, -1)
             target = torch.cat([torch.from_numpy(flattened_stars), torch.from_numpy(bg_residual).unsqueeze(-1)], dim=-1)
         else:
-            # Already flattened format: [grid_h, grid_w, flattened_channels]
-            # Note: Legacy flattened mosaics might not have the residual BG logic applied yet.
-            # If so, we'd need to extract BG and adjust it. 
-            # For simplicity, we assume new mosaics will be generated correctly.
             target = torch.from_numpy(target_raw.copy())
-            # Adjust the last channel (background) to be residual
             target[..., -1] -= chunk_median
             
         return {
