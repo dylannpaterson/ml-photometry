@@ -30,7 +30,8 @@ class Trainer:
         self.start_epoch = 0
         
         # Extract loss parameters from config
-        self.loss_params = config["data_params"].get("loss_params", {})
+        self.loss_params = config["data_params"].get("loss_params", {}).copy()
+        self.loss_params["stretch_scale"] = config["data_params"].get("GLOBAL_STRETCH_SCALE", 10.0)
 
     def resume(self, checkpoint_path=None):
         if checkpoint_path is None:

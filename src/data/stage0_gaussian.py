@@ -166,10 +166,8 @@ class GaussianPretrainingProvider(Dataset):
             for slot in range(min(self.K, len(sorted_stars))):
                 flux, tx, ty, snr, tcomp = sorted_stars[slot]
                 
-                # CENTRALIZED: Convert linear flux to network target
-                m_target = self.transform.target_flux_to_network(flux)
-                
-                base_grid[cy, cx, slot] = [1.0, tx % self.cell_size, ty % self.cell_size, m_target, tcomp]
+                # Use raw physical flux directly
+                base_grid[cy, cx, slot] = [1.0, tx % self.cell_size, ty % self.cell_size, flux, tcomp]
                 shapes.append(psf_shape)
                 indices.append([cy, cx, slot])
                 ix, iy = int(np.clip(tx, 0, self.img_size-1)), int(np.clip(ty, 0, self.img_size-1))

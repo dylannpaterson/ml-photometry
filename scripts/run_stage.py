@@ -197,12 +197,12 @@ def run_infer(stage_idx, config, device, checkpoint=None):
             for x in range(grid_size):
                 for k in range(K):
                     slot = target_grid[y, x, k]
-                    tp, tdx, tdy, tm, tc = slot
+                    tp, tdx, tdy, raw_flux, tc = slot
                     if tp == 1.0:
                         tgx = (x * cell_size) + tdx
                         tgy = (y * cell_size) + tdy
-                        # m in target is log10(flux), convert to linear for visualize
-                        true_stars.append((tgx, tgy, 10**tm, tc))
+                        # NEW: Target already contains raw physical photons
+                        true_stars.append((tgx, tgy, float(raw_flux), tc))
         
         predicted_stars, predicted_shapes, bg_map = engine.predict(image_tensor)
         

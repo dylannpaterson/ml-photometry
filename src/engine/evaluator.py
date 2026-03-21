@@ -107,22 +107,20 @@ class Evaluator:
                     for x in range(grid_w):
                         for k in range(K):
                             slot = target_reshaped[y, x, k]
-                            tp, tdx, tdy, m_target, tc = slot[:5]
+                            tp, tdx, tdy, raw_flux_target, tc = slot[:5]
                             if tp == 1.0:
-                                # CENTRALIZED: Target m is in Arcsinh space, map back to physical
-                                linear_flux = self.transform.network_to_flux(m_target)
-                                true_stars.append(((x * cell_size) + tdx, (y * cell_size) + tdy, linear_flux, tc))
+                                # NEW: target already contains raw physical photons
+                                true_stars.append(((x * cell_size) + tdx, (y * cell_size) + tdy, float(raw_flux_target), tc))
                 
                 # Extract Predicted Stars (p > threshold)
                 pred_stars = []
                 for y in range(grid_h):
                     for x in range(grid_w):
                         for k in range(K):
-                            p, dx, dy, m_pred, c = prediction[y, x, k, :5]
+                            p, dx, dy, physical_flux_pred, c = prediction[y, x, k, :5]
                             if p > threshold:
-                                # CENTRALIZED: Network Space -> Physical Space
-                                linear_flux_pred = self.transform.network_to_flux(m_pred)
-                                pred_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, linear_flux_pred, c, p))
+                                # NEW: model output is already raw physical photons
+                                pred_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, float(physical_flux_pred), c, p))
                 
                 matches, unmatched_true, unmatched_pred = match_stars(true_stars, pred_stars)
                 

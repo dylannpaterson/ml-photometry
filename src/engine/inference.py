@@ -52,12 +52,10 @@ class InferenceEngine:
         for y in range(grid_h):
             for x in range(grid_w):
                 for k in range(K):
-                    p, dx, dy, m_network, c = prediction[y, x, k, :5]
+                    p, dx, dy, physical_flux, c = prediction[y, x, k, :5]
                     if p > threshold:
-                        # FIX: m_network is the network's estimate of the STRETCHED flux.
-                        # We must map it back to physical photons.
-                        linear_flux = self.transform.network_to_flux(m_network)
-                        predicted_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, float(linear_flux), c, p))
+                        # NEW: The model now outputs raw physical photons directly!
+                        predicted_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, float(physical_flux), c, p))
                         shape_vector = prediction[y, x, k, 5:]
                         S = int(np.sqrt(len(shape_vector)))
                         predicted_shapes.append(shape_vector.reshape(S, S))

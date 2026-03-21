@@ -90,10 +90,14 @@ class DenseGridModel(nn.Module):
         p = torch.sigmoid(star_out[..., 0:1])
         dx = torch.sigmoid(star_out[..., 1:2]) * self.cell_size
         dy = torch.sigmoid(star_out[..., 2:3]) * self.cell_size
-        # REVERTED: Predict arcsinh stretched flux linearly
-        m = star_out[..., 3:4]
-        c = torch.sigmoid(star_out[..., 4:5])
         
+        # NEW: Predict in log-space, but output raw physical flux
+        raw_log_flux = star_out[..., 3:4]
+        # CRITICAL: Clamp before exp() to prevent exploding gradients during early epochs
+        raw_log_flux = torch.clamp(raw_log_flux, min=-10.0, max=22.0) 
+        flux = torch.exp(raw_log_flux)
+        
+        c = torch.sigmoid(star_out[..., 4:5])
         shape_logits = star_out[..., 5:]
         shape = F.softmax(shape_logits, dim=-1)
         
@@ -101,11 +105,12 @@ class DenseGridModel(nn.Module):
         bg = bg_out.permute(0, 2, 3, 1)
         
         return {
-            "stars": torch.cat([p, dx, dy, m, c, shape], dim=-1),
+            "stars": torch.cat([p, dx, dy, flux, c, shape], dim=-1),
+            "raw_log_flux": raw_log_flux, # Logit Bypass
             "background": bg
         }
 
-def compute_grid_loss(preds, targets, lambda_prob=5.0, lambda_pos=50.0, lambda_flux=5.0, lambda_comp=1.0, lambda_shape=1.0, lambda_bg=0.1, focal_alpha=0.75, focal_gamma=2.0):
+def compute_grid_loss(preds, targets, lambda_prob=5.0, lambda_pos=50.0, lambda_flux=5.0, lambda_comp=1.0, lambda_shape=1.0, lambda_bg=0.1, focal_alpha=0.75, focal_gamma=2.0, stretch_scale=10.0):
     """
     Standard Generative Loss without TV regularization (optimized for speed).
     Maintains positional weighting and faint-star boost.
@@ -137,9 +142,13 @@ def compute_grid_loss(preds, targets, lambda_prob=5.0, lambda_pos=50.0, lambda_f
     alpha_t = focal_alpha * p_target + (1 - focal_alpha) * (1 - p_target)
     
     with torch.no_grad():
-        m_target = star_targets[..., 3]
-        # Boost based on stretched magnitude
-        boost_weight = torch.where(obj_mask, 1.0 + (12.0 - m_target) / 6.0, torch.tensor(1.0, device=p_pred.device))
+        raw_flux_target = star_targets[..., 3]
+        
+        # Recreate the stretch locally just to calculate the curriculum boost weight
+        stretched_target = torch.arcsinh(raw_flux_target / stretch_scale)
+        
+        # Boost based on the stretched value, keeping your original logic intact
+        boost_weight = torch.where(obj_mask, 1.0 + (12.0 - stretched_target) / 6.0, torch.tensor(1.0, device=p_pred.device))
         boost_weight = torch.clamp(boost_weight, 1.0, 5.0)
     
     prob_loss = (alpha_t * focal_weight * bce_loss * boost_weight).mean()
@@ -150,9 +159,12 @@ def compute_grid_loss(preds, targets, lambda_prob=5.0, lambda_pos=50.0, lambda_f
         pos_target = star_targets[..., 1:3][obj_mask]
         pos_loss = F.mse_loss(pos_pred, pos_target, reduction='mean')
         
-        flux_pred = star_preds[..., 3:4][obj_mask]
+        # LOGIT BYPASS: Use pre-activation log-flux directly for stability
+        log_flux_pred = preds["raw_log_flux"][obj_mask]
+        
         flux_target = star_targets[..., 3:4][obj_mask]
-        flux_loss = F.mse_loss(flux_pred, flux_target, reduction='mean')
+        log_flux_target = torch.log(flux_target + 1e-6)
+        flux_loss = F.mse_loss(log_flux_pred, log_flux_target, reduction='mean')
         
         comp_pred = star_preds[..., 4:5][obj_mask]
         comp_target = star_targets[..., 4:5][obj_mask]
