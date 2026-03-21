@@ -34,18 +34,38 @@ class Trainer:
             checkpoint_path, self.start_epoch = find_latest_checkpoint(prefix=self.checkpoint_prefix)
         if checkpoint_path:
             print(f"Resuming from checkpoint: {checkpoint_path} (Epoch {self.start_epoch})")
-            self.model.load_state_dict(torch.load(checkpoint_path, map_location=self.device))
+            # Handle full checkpoint dict or state dict
+            ckpt = torch.load(checkpoint_path, map_location=self.device)
+            if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+                self.model.load_state_dict(ckpt['model_state_dict'])
+            else:
+                self.model.load_state_dict(ckpt)
 
     def train(self):
         print(f"Starting Training [{self.checkpoint_prefix}]: {self.epochs} epochs")
         for epoch in range(self.start_epoch, self.epochs):
             self.model.train(); epoch_loss, start_time = 0, time.time()
-            for i, (images, targets) in enumerate(self.train_loader):
-                images, targets = images.to(self.device), targets.to(self.device)
+            for i, batch in enumerate(self.train_loader):
+                if isinstance(batch, dict):
+                    images = batch["image"].to(self.device)
+                    targets = batch["target"].to(self.device)
+                else:
+                    images, targets = batch
+                    images, targets = images.to(self.device), targets.to(self.device)
+                
                 self.optimizer.zero_grad()
                 preds = self.model(images)
                 loss, p_loss, po_loss, f_loss, s_loss, b_loss = compute_grid_loss(preds, targets)
-                loss.backward(); self.optimizer.step(); epoch_loss += loss.item()
+                
+                if torch.isnan(loss):
+                    print(f"⚠️ NaN detected at step {i}")
+                    continue
+                    
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.optimizer.step()
+                epoch_loss += loss.item()
+                
                 if i % 100 == 0:
                     print(f"Epoch [{epoch+1}/{self.epochs}], Step [{i}/{len(self.train_loader)}], Loss: {loss.item():.4f} (P:{p_loss.item():.4f}, Pos:{po_loss.item():.4f}, F:{f_loss.item():.4f}, S:{s_loss.item():.4f}, B:{b_loss.item():.4f})")
             
@@ -53,21 +73,30 @@ class Trainer:
             print(f"==> Epoch {epoch+1} Complete | Avg Loss: {avg_epoch_loss:.4f} | Time: {time.time()-start_time:.1f}s")
             val_loss = self.validate(); print(f"Validation Loss: {val_loss:.4f}")
             
-            # Step the scheduler
             self.scheduler.step(val_loss)
-            curr_lr = self.optimizer.param_groups[0]['lr']
-            if curr_lr < self.lr:
-                print(f"📉 Learning rate adjusted to: {curr_lr:.6f}")
-
+            
             os.makedirs("checkpoints", exist_ok=True)
-            torch.save(self.model.state_dict(), os.path.join("checkpoints", f"{self.checkpoint_prefix}_epoch_{epoch+1}.pth"))
+            # Save full checkpoint dict for easier resuming
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'val_loss': val_loss,
+            }
+            torch.save(checkpoint, os.path.join("checkpoints", f"{self.checkpoint_prefix}_epoch_{epoch+1}.pth"))
         torch.save(self.model.state_dict(), os.path.join("checkpoints", f"{self.checkpoint_prefix}_final.pth"))
 
     def validate(self):
         self.model.eval(); val_loss = 0
         with torch.no_grad():
-            for images, targets in self.val_loader:
-                images, targets = images.to(self.device), targets.to(self.device)
+            for batch in self.val_loader:
+                if isinstance(batch, dict):
+                    images = batch["image"].to(self.device)
+                    targets = batch["target"].to(self.device)
+                else:
+                    images, targets = batch
+                    images, targets = images.to(self.device), targets.to(self.device)
+                    
                 preds = self.model(images)
                 loss, _, _, _, _, _ = compute_grid_loss(preds, targets)
                 val_loss += loss.item()
