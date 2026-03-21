@@ -49,9 +49,10 @@ data_params:
   loss_params:
     lambda_prob: 5.0
     lambda_pos: 50.0
-    lambda_flux: 1.0
+    lambda_flux: 5.0
+    lambda_comp: 1.0
     lambda_shape: 1.0
-    lambda_bg: 0.5
+    lambda_bg: 0.1
     focal_alpha: 0.75
     focal_gamma: 2.0
 

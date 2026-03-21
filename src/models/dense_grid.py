@@ -107,11 +107,11 @@ class DenseGridModel(nn.Module):
             "background": bg
         }
 
-def compute_grid_loss(preds, targets, lambda_prob=5.0, lambda_pos=50.0, lambda_flux=1.0, lambda_shape=1.0, lambda_bg=0.5, focal_alpha=0.75, focal_gamma=2.0):
+def compute_grid_loss(preds, targets, lambda_prob=5.0, lambda_pos=50.0, lambda_flux=5.0, lambda_comp=1.0, lambda_shape=1.0, lambda_bg=0.1, focal_alpha=0.75, focal_gamma=2.0):
     """
     Standard Generative Loss without TV regularization (optimized for speed).
     Maintains positional weighting and faint-star boost.
-    Supports flattened target tensors.
+    Supports flattened target tensors and independent flux/completeness weights.
     """
     star_preds = preds["stars"]
     bg_preds = preds["background"]
@@ -173,7 +173,8 @@ def compute_grid_loss(preds, targets, lambda_prob=5.0, lambda_pos=50.0, lambda_f
         
     total_loss = (lambda_prob * prob_loss + 
                   lambda_pos * pos_loss + 
-                  lambda_flux * (flux_loss + comp_loss) + 
+                  lambda_flux * flux_loss +
+                  lambda_comp * comp_loss +
                   lambda_shape * shape_loss + 
                   lambda_bg * bg_loss)
                   
