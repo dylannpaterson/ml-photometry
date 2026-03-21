@@ -3,6 +3,7 @@ import torch
 from torch.utils.data import Dataset
 import matplotlib.pyplot as plt
 import os
+from scipy.ndimage import gaussian_filter
 from src.data.transforms import AstroSpaceTransform
 
 class GaussianPretrainingProvider(Dataset):
@@ -106,6 +107,23 @@ class GaussianPretrainingProvider(Dataset):
             relative_density = np.exp(-np.sqrt((l/scale_l)**2 + (b/scale_b)**2))
             return 100 + 900 * relative_density
 
+    def _distribute_flux(self, img, x, y, flux):
+        """Bilinearly distributes flux to the 4 nearest pixels to preserve centroid."""
+        x0 = np.floor(x).astype(int)
+        y0 = np.floor(y).astype(int)
+        dx = x - x0
+        dy = y - y0
+        
+        # Mask valid pixels (within boundaries)
+        H, W = img.shape
+        mask = (x0 >= 0) & (x0 < W - 1) & (y0 >= 0) & (y0 < H - 1)
+        x0, y0, dx, dy, flux = x0[mask], y0[mask], dx[mask], dy[mask], flux[mask]
+        
+        np.add.at(img, (y0, x0), flux * (1 - dx) * (1 - dy))
+        np.add.at(img, (y0, x0 + 1), flux * dx * (1 - dy))
+        np.add.at(img, (y0 + 1, x0), flux * (1 - dx) * dy)
+        np.add.at(img, (y0 + 1, x0 + 1), flux * dx * dy)
+
     def generate_chunk(self):
         """Generates a realistic Roman-like chunk using configured star density."""
         # Simple uniform density between configured limits for pre-training
@@ -115,10 +133,8 @@ class GaussianPretrainingProvider(Dataset):
         smooth_bg = np.full((self.img_size, self.img_size), zodiacal_level, dtype=np.float32)
         
         sigma = 1.5
-        u_patch = 3
-        star_patch = int(round(5 * sigma))
         
-        unresolved_img = np.zeros_like(smooth_bg)
+        # Tail (unresolved) stars
         num_tail = num_stars * 2 
         u_tail = np.random.uniform(0, 1, num_tail)
         f_min_t, f_max_t = 1.0, 10.0
@@ -126,14 +142,10 @@ class GaussianPretrainingProvider(Dataset):
         tail_x = np.random.uniform(0, self.img_size, num_tail)
         tail_y = np.random.uniform(0, self.img_size, num_tail)
         
-        for i in range(num_tail):
-            ix, iy = int(round(tail_x[i])), int(round(tail_y[i]))
-            x0, x1 = max(0, ix - u_patch), min(self.img_size, ix + u_patch + 1)
-            y0, y1 = max(0, iy - u_patch), min(self.img_size, iy + u_patch + 1)
-            xx = np.arange(x0, x1)
-            yy = np.arange(y0, y1)[:, np.newaxis]
-            patch = (tail_fluxes[i] / (2 * np.pi * sigma**2)) * np.exp(-((xx - tail_x[i])**2 + (yy - tail_y[i])**2) / (2 * sigma**2))
-            unresolved_img[y0:y1, x0:x1] += patch
+        # OPTIMIZED: Use bilinear distribution + convolution for unresolved stars
+        unresolved_flux_map = np.zeros_like(smooth_bg)
+        self._distribute_flux(unresolved_flux_map, tail_x, tail_y, tail_fluxes)
+        unresolved_img = gaussian_filter(unresolved_flux_map, sigma=sigma, mode='constant')
 
         noise_floor = np.sqrt(smooth_bg + unresolved_img + self.read_noise**2)
 
@@ -142,9 +154,11 @@ class GaussianPretrainingProvider(Dataset):
         y_centers = np.random.uniform(0, self.img_size, num_stars * 2)
         
         base_grid = np.zeros((self.grid_size, self.grid_size, self.K, 5), dtype=np.float32)
-        star_signal = np.zeros_like(smooth_bg)
         psf_shape = self._generate_psf_shape(sigma=1.5)
         shapes, indices = [], []
+        
+        target_flux_map = np.zeros_like(smooth_bg)
+        unresolved_extra_flux_map = np.zeros_like(smooth_bg)
         
         cell_assignments = {}
         for i in range(len(fluxes)):
@@ -168,24 +182,21 @@ class GaussianPretrainingProvider(Dataset):
                 base_grid[cy, cx, slot] = [1.0, tx % self.cell_size, ty % self.cell_size, flux, tcomp]
                 shapes.append(psf_shape)
                 indices.append([cy, cx, slot])
-                ix, iy = int(np.clip(tx, 0, self.img_size-1)), int(np.clip(ty, 0, self.img_size-1))
-                x0, x1 = max(0, ix - star_patch), min(self.img_size, ix + star_patch + 1)
-                y0, y1 = max(0, iy - star_patch), min(self.img_size, iy + star_patch + 1)
-                xx = np.arange(x0, x1)
-                yy = np.arange(y0, y1)[:, np.newaxis]
-                patch = (flux * (2 * np.pi * sigma**2)**-1) * np.exp(-((xx - tx)**2 + (yy - ty)**2) / (2 * sigma**2))
-                star_signal[y0:y1, x0:x1] += patch
+                
+                # Accumulate for optimized rendering
+                self._distribute_flux(target_flux_map, np.array([tx]), np.array([ty]), np.array([flux]))
             
             if len(sorted_stars) > self.K:
                 for i in range(self.K, len(sorted_stars)):
                     flux, tx, ty, _, _ = sorted_stars[i]
-                    ix, iy = int(np.clip(tx, 0, self.img_size-1)), int(np.clip(ty, 0, self.img_size-1))
-                    x0, x1 = max(0, ix - u_patch), min(self.img_size, ix + u_patch + 1)
-                    y0, y1 = max(0, iy - u_patch), min(self.img_size, iy + u_patch + 1)
-                    xx = np.arange(x0, x1)
-                    yy = np.arange(y0, y1)[:, np.newaxis]
-                    patch = (flux / (2 * np.pi * sigma**2)) * np.exp(-((xx - tx)**2 + (yy - ty)**2) / (2 * sigma**2))
-                    unresolved_img[y0:y1, x0:x1] += patch
+                    self._distribute_flux(unresolved_extra_flux_map, np.array([tx]), np.array([ty]), np.array([flux]))
+
+        # OPTIMIZED: Render all star signals via convolution
+        star_signal = gaussian_filter(target_flux_map, sigma=sigma, mode='constant')
+        extra_unresolved = gaussian_filter(unresolved_extra_flux_map, sigma=sigma, mode='constant')
+        
+        # Merge extra unresolved stars into the unresolved image
+        unresolved_img += extra_unresolved
 
         gt_background = (smooth_bg + unresolved_img).astype(np.float32)
         total_photon_flux = gt_background + star_signal
