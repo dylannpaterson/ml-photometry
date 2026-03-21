@@ -181,15 +181,31 @@ class InferenceEngine:
             ax8.set_aspect('equal')
             ax8.grid(True, alpha=0.3)
 
-        # 3x3 PSF Shape Grid
+        # PSF Profile Plots
         if predicted_shapes:
-            psf_gs = gs[3:, 2:].subgridspec(3, 3)
-            num_psfs = min(9, len(predicted_shapes))
-            for i in range(num_psfs):
-                ax_psf = fig.add_subplot(psf_gs[i // 3, i % 3])
-                ax_psf.imshow(predicted_shapes[i], cmap='viridis', origin='lower')
-                ax_psf.axis('off')
-                if i == 1: ax_psf.set_title("Sample Predicted 9x9 PSFs")
+            ax_psf_x = fig.add_subplot(gs[3:, 2])
+            ax_psf_y = fig.add_subplot(gs[3:, 3])
+            
+            num_to_plot = min(100, len(predicted_shapes))
+            for i in range(num_to_plot):
+                shape = predicted_shapes[i]
+                # x-profile (average over Y)
+                prof_x = np.mean(shape, axis=0)
+                # y-profile (average over X)
+                prof_y = np.mean(shape, axis=1)
+                
+                ax_psf_x.plot(prof_x, color='C0', alpha=0.1, linewidth=1)
+                ax_psf_y.plot(prof_y, color='C1', alpha=0.1, linewidth=1)
+            
+            # Add mean profile for clarity
+            all_shapes = np.stack(predicted_shapes[:100])
+            ax_psf_x.plot(np.mean(all_shapes, axis=(0, 1)), color='black', linewidth=2, label='Mean')
+            ax_psf_y.plot(np.mean(all_shapes, axis=(0, 2)), color='black', linewidth=2, label='Mean')
+            
+            ax_psf_x.set_title("PSF X-Profiles (Y-avg)")
+            ax_psf_y.set_title("PSF Y-Profiles (X-avg)")
+            ax_psf_x.set_xlabel("Pixels"); ax_psf_y.set_xlabel("Pixels")
+            ax_psf_x.grid(True, alpha=0.2); ax_psf_y.grid(True, alpha=0.2)
 
         plt.suptitle(f"Generative Diagnostic (Scale={self.stretch_scale}) | Predicted Stars: {len(predicted_stars)}", fontsize=24)
         plt.savefig(output_path); print(f"Comparison saved to {output_path}")
