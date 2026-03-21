@@ -52,7 +52,6 @@ A **Feature Pyramid Network (FPN)** merges deep semantic context from the lower 
 *   **$\mathcal{L}_{Flux}$:** Masked MSE for log-flux ($m$) and completeness ($c$).
 *   **$\mathcal{L}_{Shape}$:** Masked MSE for the 9x9 PSF.
 *   **$\mathcal{L}_{BG}$:** Global MSE for the background map.
-*   **$\mathcal{L}_{TV}$:** Total Variation regularization on the predicted background map to enforce smoothness and prevent the model from "absorbing" star light into the background head.
 
 ## 5. Success Metrics (Acceptance Criteria)
 | Metric | Target | Description |

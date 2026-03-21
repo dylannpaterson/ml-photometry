@@ -111,16 +111,26 @@ def compute_grid_loss(preds, targets, lambda_prob=5.0, lambda_pos=50.0, lambda_f
     """
     Standard Generative Loss without TV regularization (optimized for speed).
     Maintains positional weighting and faint-star boost.
+    Supports flattened target tensors.
     """
     star_preds = preds["stars"]
     bg_preds = preds["background"]
     
-    bg_targets = targets[..., 0, -1:]
-    star_targets = targets[..., :-1]
+    # 1. Unpack Flattened Target
+    # Shape: [B, H, W, (K * (5 + S2)) + 1]
+    B, H, W, C_target = targets.shape
+    bg_targets = targets[..., -1:]
+    star_targets_flat = targets[..., :-1]
+    
+    # Infer K: C_pred = K * (5 + S2)
+    # C_pred is star_preds.shape[-1]
+    K = star_preds.shape[-2] # star_preds is [B, H, W, K, 5+S2]
+    S2_plus_5 = star_preds.shape[-1]
+    star_targets = star_targets_flat.view(B, H, W, K, S2_plus_5)
     
     obj_mask = star_targets[..., 0] == 1.0
     
-    # 1. Probability Loss (p) with Faint Star Boosting
+    # 2. Probability Loss (p) with Faint Star Boosting
     p_pred = torch.clamp(star_preds[..., 0], 1e-7, 1.0 - 1e-7)
     p_target = star_targets[..., 0]
     
@@ -135,7 +145,7 @@ def compute_grid_loss(preds, targets, lambda_prob=5.0, lambda_pos=50.0, lambda_f
     
     prob_loss = (alpha_t * focal_weight * bce_loss * boost_weight).mean()
     
-    # 2. Regression Losses (Masked)
+    # 3. Regression Losses (Masked)
     if obj_mask.sum() > 0:
         pos_pred = star_preds[..., 1:3][obj_mask]
         pos_target = star_targets[..., 1:3][obj_mask]
@@ -158,7 +168,7 @@ def compute_grid_loss(preds, targets, lambda_prob=5.0, lambda_pos=50.0, lambda_f
         comp_loss = torch.tensor(0.0, device=star_preds.device)
         shape_loss = torch.tensor(0.0, device=star_preds.device)
         
-    # 3. Background Loss (Global MSE)
+    # 4. Background Loss (Global MSE)
     bg_loss = F.mse_loss(bg_preds, bg_targets, reduction='mean')
         
     total_loss = (lambda_prob * prob_loss + 
