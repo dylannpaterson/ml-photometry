@@ -13,7 +13,7 @@ To develop a machine learning pipeline capable of performing fast, direct point-
 ### Output (The Spatial Grid)
 *   **Format:** 4D Tensor
 *   **Dimensions:** $128 \times 128 \times (K \times 86 + 1)$ (where $K=3$ is optimized for Bulge densities).
-*   **Structure:** The output is a $128 \times 128$ spatial grid. Each cell predicts star parameters for $K$ slots plus one shared local background value.
+*   **Structure:** The output is a $128 \times 128$ spatial grid. Each cell predicts star parameters for $K$ slots plus one shared local background value. **Canonical Slot Sorting:** Stars within each cell are sorted by flux (brightest to faintest) before being assigned to the $K$ slots. This provides a stable and consistent learning target.
 *   **Slot Values (86 per slot):**
     1.  **p:** Probability (Objectness score, $0.0 \to 1.0$)
     2.  **dx, dy:** Sub-pixel offset from the cell's top-left corner ($0.0 \to 2.0$)
