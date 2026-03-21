@@ -5,6 +5,7 @@ from matplotlib.colors import LogNorm
 import os
 from scipy.ndimage import zoom
 from astropy.io import fits
+from src.data.transforms import AstroSpaceTransform
 
 def upsample_background(bg_map, target_size):
     """
@@ -33,6 +34,7 @@ class InferenceEngine:
         self.config = config
         self.img_size = config["data_params"]["image_size"]
         self.stretch_scale = config["data_params"].get("GLOBAL_STRETCH_SCALE", 10.0)
+        self.transform = AstroSpaceTransform(stretch_scale=self.stretch_scale)
 
     def predict(self, image_tensor, threshold=0.5):
         """Runs inference on a single 2D image tensor [1, H, W]."""
@@ -50,11 +52,11 @@ class InferenceEngine:
         for y in range(grid_h):
             for x in range(grid_w):
                 for k in range(K):
-                    p, dx, dy, m_stretched, c = prediction[y, x, k, :5]
+                    p, dx, dy, m_network, c = prediction[y, x, k, :5]
                     if p > threshold:
-                        # Convert Arcsinh flux target back to linear flux
-                        flux_linear = np.sinh(m_stretched) * self.stretch_scale
-                        predicted_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, flux_linear, c, p))
+                        # CENTRALIZED: Network Space -> Physical Space (Flux)
+                        linear_flux = self.transform.network_to_flux(m_network)
+                        predicted_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, linear_flux, c, p))
                         shape_vector = prediction[y, x, k, 5:]
                         S = int(np.sqrt(len(shape_vector)))
                         predicted_shapes.append(shape_vector.reshape(S, S))
@@ -62,11 +64,11 @@ class InferenceEngine:
 
     def visualize(self, image_tensor, true_catalogue, predicted_stars, predicted_shapes, bg_map, gt_bg_map, threshold, chunk_median=0.0, output_path="inference_comparison.png"):
         from src.engine.evaluator import match_stars
-        img_stretched = image_tensor.squeeze().numpy() # Input: asinh((raw - median) / scale)
+        img_stretched = image_tensor.squeeze().numpy()
         H, W = img_stretched.shape
         
         # 1. Component Preparation (Network Space: Stretched)
-        # bg_map is predicted in stretched space: asinh((gt_bg - median) / scale)
+        # bg_map is predicted in stretched space
         full_residual_bg_stretched = upsample_background(bg_map.squeeze(), (H, W))
         full_gt_residual_bg_stretched = upsample_background(gt_bg_map.squeeze(), (H, W))
         
@@ -79,20 +81,23 @@ class InferenceEngine:
             sy0, sy1, sx0, sx1 = half - (iy - y0), half + (y1 - iy), half - (ix - x0), half + (x1 - ix)
             reconstruction_stars_linear[y0:y1, x0:x1] += flux * shape[sy0:sy1, sx0:sx1]
 
-        # 2. Linear Reconstruction (Residual: raw - median)
-        # Convert stretched background back to linear residual
-        full_residual_bg_linear = np.sinh(full_residual_bg_stretched) * self.stretch_scale
+        # 2. Linear Reconstruction (Residual Space)
+        # CENTRALIZED: Network Space -> Physical Space (BG Residual)
+        full_residual_bg_linear = self.transform.network_to_bg(full_residual_bg_stretched)
         full_reconstruction_linear = reconstruction_stars_linear + full_residual_bg_linear
         
         # 3. Map back to Stretched Space for units-matching comparison
-        full_reconstruction_stretched = np.arcsinh(full_reconstruction_linear / self.stretch_scale)
+        # CENTRALIZED: Physical Space (Residual) -> Network Space
+        # We can use target_bg_to_network since it takes linear residual
+        full_reconstruction_stretched = self.transform.target_bg_to_network(full_reconstruction_linear)
         residual_stretched = img_stretched - full_reconstruction_stretched
 
         # 4. Absolute Space Conversion (Raw Physical Photons)
-        img_linear_abs = (np.sinh(img_stretched) * self.stretch_scale) + chunk_median
+        # CENTRALIZED: Network Space -> Physical Space (Absolute)
+        img_linear_abs = self.transform.network_to_image(img_stretched, chunk_median)
         full_reconstruction_linear_abs = full_reconstruction_linear + chunk_median
         full_bg_abs = full_residual_bg_linear + chunk_median
-        full_gt_bg_abs = (np.sinh(full_gt_residual_bg_stretched) * self.stretch_scale) + chunk_median
+        full_gt_bg_abs = self.transform.network_to_bg(full_gt_residual_bg_stretched) + chunk_median
 
         # --- FITS OUTPUT ---
         hdul = fits.HDUList([

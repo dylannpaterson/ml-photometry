@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 from scipy.spatial import cKDTree
+from src.data.transforms import AstroSpaceTransform
 
 def match_stars(true_stars, pred_stars, distance_threshold=1.0):
     """
@@ -52,6 +53,8 @@ class Evaluator:
         self.config = config
         self.stage_idx = stage_idx
         self.K = config["data_params"]["max_capacity_per_cell"]
+        self.stretch_scale = config["data_params"].get("GLOBAL_STRETCH_SCALE", 10.0)
+        self.transform = AstroSpaceTransform(stretch_scale=self.stretch_scale)
 
     def run_evaluation(self, num_chunks=100, threshold=0.5):
         print(f"Evaluating model on {num_chunks} chunks...")
@@ -77,7 +80,7 @@ class Evaluator:
                 image_size=data_cfg["image_size"],
                 max_capacity_per_cell=data_cfg["max_capacity_per_cell"],
                 shape_size=data_cfg["shape_size"],
-                global_stretch_scale=data_cfg.get("GLOBAL_STRETCH_SCALE", 10.0)
+                global_stretch_scale=self.stretch_scale
             )
             
             for _ in range(num_chunks):
@@ -104,18 +107,22 @@ class Evaluator:
                     for x in range(grid_w):
                         for k in range(K):
                             slot = target_reshaped[y, x, k]
-                            tp, tdx, tdy, tm, tc = slot[:5]
+                            tp, tdx, tdy, m_target, tc = slot[:5]
                             if tp == 1.0:
-                                true_stars.append(((x * cell_size) + tdx, (y * cell_size) + tdy, 10**tm, tc))
+                                # CENTRALIZED: Target m is in Arcsinh space, map back to physical
+                                linear_flux = self.transform.network_to_flux(m_target)
+                                true_stars.append(((x * cell_size) + tdx, (y * cell_size) + tdy, linear_flux, tc))
                 
                 # Extract Predicted Stars (p > threshold)
                 pred_stars = []
                 for y in range(grid_h):
                     for x in range(grid_w):
                         for k in range(K):
-                            p, dx, dy, log_m, c = prediction[y, x, k, :5]
+                            p, dx, dy, m_pred, c = prediction[y, x, k, :5]
                             if p > threshold:
-                                pred_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, 10**log_m, c, p))
+                                # CENTRALIZED: Network Space -> Physical Space
+                                linear_flux_pred = self.transform.network_to_flux(m_pred)
+                                pred_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, linear_flux_pred, c, p))
                 
                 matches, unmatched_true, unmatched_pred = match_stars(true_stars, pred_stars)
                 
@@ -147,7 +154,7 @@ class Evaluator:
                     t_comp = true_stars[t_idx][3]
                     p_comp = pred_stars[p_idx][3]
                     
-                    ratios.append(p_flux / t_flux)
+                    ratios.append(p_flux / (t_flux + 1e-9))
                     comp_errors.append(abs(p_comp - t_comp))
                     
         precision = all_tp / (all_tp + all_fp) if (all_tp + all_fp) > 0 else 0

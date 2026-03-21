@@ -3,6 +3,7 @@ import torch
 from torch.utils.data import Dataset
 import matplotlib.pyplot as plt
 import os
+from src.data.transforms import AstroSpaceTransform
 
 class GaussianPretrainingProvider(Dataset):
     def __init__(self, num_samples=1000, min_stars=100, max_stars=1500, image_size=256, max_capacity_per_cell=3, shape_size=7, use_fixed_seed=False, global_stretch_scale=10.0):
@@ -18,7 +19,7 @@ class GaussianPretrainingProvider(Dataset):
         self.S = shape_size
         self.read_noise = 5.0
         self.use_fixed_seed = use_fixed_seed
-        self.global_stretch_scale = global_stretch_scale
+        self.transform = AstroSpaceTransform(stretch_scale=global_stretch_scale)
 
         # Grid parameters: 4x4 cells for 256x256 image = 64x64 grid
         self.cell_size = 4
@@ -106,7 +107,7 @@ class GaussianPretrainingProvider(Dataset):
             return 100 + 900 * relative_density
 
     def generate_chunk(self):
-        """Generates a realistic Roman-like chunk with Arcsinh-space targets."""
+        """Generates a realistic Roman-like chunk using AstroSpaceTransform."""
         center_l = np.random.uniform(-5.0, 5.0)
         center_b = np.random.uniform(-3.0, 3.0)
         expected_stars = self._get_local_density(center_l, center_b)
@@ -119,7 +120,6 @@ class GaussianPretrainingProvider(Dataset):
         u_patch = 3
         star_patch = int(round(5 * sigma))
         
-        # 2. Generate the "Morass"
         unresolved_img = np.zeros_like(smooth_bg)
         num_tail = num_stars * 2 
         u_tail = np.random.uniform(0, 1, num_tail)
@@ -137,10 +137,8 @@ class GaussianPretrainingProvider(Dataset):
             patch = (tail_fluxes[i] / (2 * np.pi * sigma**2)) * np.exp(-((xx - tail_x[i])**2 + (yy - tail_y[i])**2) / (2 * sigma**2))
             unresolved_img[y0:y1, x0:x1] += patch
 
-        # 3. Clean Noise Floor
         noise_floor = np.sqrt(smooth_bg + unresolved_img + self.read_noise**2)
 
-        # 4. Generate Potential Truth Population
         fluxes = self._sample_luminosity_function(num_stars * 2) 
         x_centers = np.random.uniform(0, self.img_size, num_stars * 2)
         y_centers = np.random.uniform(0, self.img_size, num_stars * 2)
@@ -168,8 +166,8 @@ class GaussianPretrainingProvider(Dataset):
             for slot in range(min(self.K, len(sorted_stars))):
                 flux, tx, ty, snr, tcomp = sorted_stars[slot]
                 
-                # TARGET FIX: Target m is now arcsinh(flux / scale)
-                m_target = np.arcsinh(flux / self.global_stretch_scale)
+                # CENTRALIZED: Convert linear flux to network target
+                m_target = self.transform.target_flux_to_network(flux)
                 
                 base_grid[cy, cx, slot] = [1.0, tx % self.cell_size, ty % self.cell_size, m_target, tcomp]
                 shapes.append(psf_shape)
@@ -179,7 +177,7 @@ class GaussianPretrainingProvider(Dataset):
                 y0, y1 = max(0, iy - star_patch), min(self.img_size, iy + star_patch + 1)
                 xx = np.arange(x0, x1)
                 yy = np.arange(y0, y1)[:, np.newaxis]
-                patch = (flux / (2 * np.pi * sigma**2)) * np.exp(-((xx - tx)**2 + (yy - ty)**2) / (2 * sigma**2))
+                patch = (flux * (2 * np.pi * sigma**2)**-1) * np.exp(-((xx - tx)**2 + (yy - ty)**2) / (2 * sigma**2))
                 star_signal[y0:y1, x0:x1] += patch
             
             if len(sorted_stars) > self.K:
@@ -193,20 +191,18 @@ class GaussianPretrainingProvider(Dataset):
                     patch = (flux / (2 * np.pi * sigma**2)) * np.exp(-((xx - tx)**2 + (yy - ty)**2) / (2 * sigma**2))
                     unresolved_img[y0:y1, x0:x1] += patch
 
-        # 5. Final Image Assembly
         gt_background = (smooth_bg + unresolved_img).astype(np.float32)
         total_photon_flux = gt_background + star_signal
         noise_std = np.sqrt(total_photon_flux + self.read_noise**2)
         raw_image = np.random.normal(loc=total_photon_flux, scale=noise_std).astype(np.float32)
 
-        # 6. Normalization
         chunk_median = np.median(raw_image)
-        normalized_image = np.arcsinh((raw_image - chunk_median) / self.global_stretch_scale)
+        # CENTRALIZED: Linear image -> Network Space
+        normalized_image = self.transform.image_to_network(raw_image, chunk_median)
 
-        # 7. Grid Assembly (Residual Background)
-        # TARGET FIX: Residual BG is also stretched: asinh((gt_bg - median) / scale)
+        # CENTRALIZED: Linear BG residual -> Network Space
         residual_bg_linear = gt_background - chunk_median
-        residual_bg_stretched = np.arcsinh(residual_bg_linear / self.global_stretch_scale)
+        residual_bg_stretched = self.transform.target_bg_to_network(residual_bg_linear)
         
         bg_grid = residual_bg_stretched.reshape(self.grid_size, self.cell_size, self.grid_size, self.cell_size).mean(axis=(1, 3))
 
@@ -239,7 +235,7 @@ class GaussianMosaicDataset(Dataset):
         self.img_size = image_size
         self.cell_size = cell_size
         self.grid_size = image_size // cell_size
-        self.global_stretch_scale = global_stretch_scale
+        self.transform = AstroSpaceTransform(stretch_scale=global_stretch_scale)
         
         self.image_files = sorted([f for f in os.listdir(data_dir) if f.endswith("_img.npy")])
         self.target_files = sorted([f for f in os.listdir(data_dir) if f.endswith("_target.npy")])
@@ -272,28 +268,22 @@ class GaussianMosaicDataset(Dataset):
         target_raw = full_tgt[gy:gy+self.grid_size, gx:gx+self.grid_size]
         
         chunk_median = np.median(raw_image)
-        normalized_image = np.arcsinh((raw_image - chunk_median) / self.global_stretch_scale)
+        # CENTRALIZED: Linear -> Network
+        normalized_image = self.transform.image_to_network(raw_image, chunk_median)
         image_tensor = torch.from_numpy(normalized_image).unsqueeze(0).float()
 
-        # Handle target normalization consistent with generate_chunk
         if len(target_raw.shape) == 4:
-            # target_raw is legacy [H, W, K, C]
-            # base_grid has linear flux in log10 form or raw?
-            # actually our generate_mosaics saves the output of generate_chunk
-            # so we need to be careful. For now, assume we'll regenerate mosaics.
             star_grid = target_raw[..., :-1]
             bg_map = target_raw[..., 0, -1] 
-            bg_residual_stretched = np.arcsinh((bg_map - chunk_median) / self.global_stretch_scale)
+            # CENTRALIZED: Linear -> Network
+            bg_residual_stretched = self.transform.target_bg_to_network(bg_map - chunk_median)
             flattened_stars = star_grid.reshape(self.grid_size, self.grid_size, -1)
             target = torch.cat([torch.from_numpy(flattened_stars), torch.from_numpy(bg_residual_stretched).unsqueeze(-1)], dim=-1)
         else:
-            # target_raw is flattened [H, W, C_stars + 1]
-            # Extract and update BG
             target = torch.from_numpy(target_raw.copy())
-            bg_linear_abs = target[..., -1] # Assuming mosaic saves absolute BG?
-            # Actually generate_mosaics currently saves what generate_chunk returns.
-            # If we regenerate, it will be absolute physical photons.
-            bg_residual_stretched = torch.arcsinh((bg_linear_abs - chunk_median) / self.global_stretch_scale)
+            bg_linear_abs = target[..., -1]
+            # CENTRALIZED: Linear -> Network
+            bg_residual_stretched = self.transform.target_bg_to_network(bg_linear_abs - chunk_median)
             target[..., -1] = bg_residual_stretched
             
         return {
