@@ -1,6 +1,6 @@
 run_config:
   resume_from_checkpoint: true
-  force_regenerate_data: true
+  force_regenerate_data: false
 
 
 curriculum:
@@ -49,7 +49,7 @@ data_params:
   GLOBAL_STRETCH_SCALE: 10.0
   loss_params:
     lambda_prob: 50.0
-    lambda_pos: 50.0
+    lambda_pos: 1.0
     lambda_flux: 5.0
     lambda_comp: 1.0
     lambda_shape: 1.0

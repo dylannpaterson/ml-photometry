@@ -131,19 +131,19 @@ class InferenceEngine:
         
         ax1 = fig.add_subplot(gs[0:2, 0])
         ax1.imshow(img_linear_abs, cmap='inferno', origin='lower', norm=norm, aspect='equal')
-        ax1.set_title("Input (Missed Sources = Red)")
+        ax1.set_title("Input (Missed Sources = Cyan)")
         
         ax2 = fig.add_subplot(gs[0:2, 1], sharex=ax1, sharey=ax1)
         im2 = ax2.imshow(full_reconstruction_linear_abs, cmap='inferno', origin='lower', norm=norm, aspect='equal')
-        ax2.set_title("Model (Matched Sources = Green)")
+        ax2.set_title("Model (Matched Sources = Lime)")
         
         # Overlay Match Results
         matched_true_indices = [m[0] for m in matches]
         for i, s in enumerate(true_catalogue):
             if i in matched_true_indices:
-                ax2.plot(s[0], s[1], 'g+', markersize=8, alpha=0.6)
+                ax2.plot(s[0], s[1], color='lime', marker='+', linestyle='None', markersize=10, alpha=0.8)
             else:
-                ax1.plot(s[0], s[1], 'r+', markersize=8, alpha=0.6)
+                ax1.plot(s[0], s[1], color='cyan', marker='+', linestyle='None', markersize=10, alpha=0.8)
         
         add_colorbar(im2, ax2)
         
@@ -151,7 +151,13 @@ class InferenceEngine:
         # Linear residual typically has wide range, center on 0 with symlog or robust limits
         r_limit = np.percentile(np.abs(residual_linear), 99)
         im3 = ax3.imshow(residual_linear, cmap='bwr', origin='lower', vmin=-r_limit, vmax=r_limit, aspect='equal')
-        ax3.set_title("Linear Residual (Data - Model)")
+        ax3.set_title("Linear Residual (Missed = Black)")
+        
+        # Overlay Missed Sources on Residual
+        for i, s in enumerate(true_catalogue):
+            if i not in matched_true_indices:
+                ax3.plot(s[0], s[1], 'k+', markersize=10, alpha=0.8)
+        
         add_colorbar(im3, ax3)
 
         # Row 3: Background Comparisons (Linear)

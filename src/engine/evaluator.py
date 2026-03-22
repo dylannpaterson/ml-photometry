@@ -3,13 +3,10 @@ import numpy as np
 from scipy.spatial import cKDTree
 from src.data.transforms import AstroSpaceTransform
 
-def match_stars(true_stars, pred_stars, distance_threshold=1.0):
+def match_stars(true_stars, pred_stars, distance_threshold=1.0, flux_threshold_dex=0.5):
     """
     Matches predicted stars to true stars using a KDTree for efficiency.
-    Returns:
-        matches: list of (true_idx, pred_idx, distance)
-        unmatched_true: list of true_indices
-        unmatched_pred: list of pred_indices
+    Adds a flux-consistency constraint to prevent mis-assignment in dense fields.
     """
     if not pred_stars:
         return [], list(range(len(true_stars))), []
@@ -20,19 +17,28 @@ def match_stars(true_stars, pred_stars, distance_threshold=1.0):
     pred_coords = np.array([(s[0], s[1]) for s in pred_stars])
 
     tree = cKDTree(true_coords)
-    # query returns (distance, index)
     distances, indices = tree.query(pred_coords, distance_upper_bound=distance_threshold)
 
     matches = []
     matched_true = set()
     matched_pred = set()
 
-    # Sort matches by distance to handle duplicates (closest first)
+    # 1. Gather potential matches that satisfy BOTH distance and flux constraints
     potential_matches = []
     for p_idx, (dist, t_idx) in enumerate(zip(distances, indices)):
         if dist < distance_threshold:
-            potential_matches.append((dist, t_idx, p_idx))
+            # Flux Consistency Check (dex difference)
+            t_flux = true_stars[t_idx][2]
+            p_flux = pred_stars[p_idx][2]
+            
+            # Avoid log of zero/negative
+            log_t = np.log10(max(1e-9, t_flux))
+            log_p = np.log10(max(1e-9, p_flux))
+            
+            if abs(log_t - log_p) < flux_threshold_dex:
+                potential_matches.append((dist, t_idx, p_idx))
     
+    # 2. Greedy assignment (closest first)
     potential_matches.sort()
 
     for dist, t_idx, p_idx in potential_matches:
