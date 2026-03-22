@@ -165,9 +165,9 @@ class InferenceEngine:
         ax5.set_title("Truth Background (Linear)")
         add_colorbar(im5, ax5)
 
-        # Row 4-5: PSF & Mag Plots
+        # Row 4-5: PSF & Mag Plots & Missed Stats
         if true_mags:
-            ax8 = fig.add_subplot(gs[3:, 0:2])
+            ax8 = fig.add_subplot(gs[3:, 0])
             ax8.scatter(true_mags, pred_mags, alpha=0.5, s=10)
             all_mags = true_mags + pred_mags
             mmin, mmax = min(all_mags), max(all_mags)
@@ -177,6 +177,20 @@ class InferenceEngine:
             ax8.set_title("Magnitude Recovery Accuracy")
             ax8.set_aspect('equal')
             ax8.grid(True, alpha=0.3)
+
+        # NEW: Completeness (SNR Proxy) Histogram for Missed Stars
+        ax9 = fig.add_subplot(gs[3:, 1])
+        missed_comps = [true_catalogue[i][3] for i in range(len(true_catalogue)) if i not in matched_true_indices]
+        matched_comps = [true_catalogue[i][3] for i in matched_true_indices]
+        
+        if missed_comps or matched_comps:
+            ax9.hist([matched_comps, missed_comps], bins=20, stacked=True, 
+                    label=['Detected', 'Missed'], color=['g', 'r'], alpha=0.7)
+            ax9.set_xlabel("Target Completeness Score (SNR Proxy)")
+            ax9.set_ylabel("Star Count")
+            ax9.set_title("Detection Success vs. Target Completeness")
+            ax9.legend()
+            ax9.grid(True, alpha=0.2)
 
         # PSF Profile Plots
         if predicted_shapes:
