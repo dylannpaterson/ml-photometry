@@ -108,8 +108,9 @@ class InferenceEngine:
         hdul.writeto(fits_path, overwrite=True)
         print(f"FITS data saved to {fits_path}")
 
-        # Statistics
-        matches, _, _ = match_stars(true_catalogue, predicted_stars)
+        # Statistics & Matching for Visualization
+        matches, unmatched_true, unmatched_pred = match_stars(true_catalogue, predicted_stars, distance_threshold=2.0)
+        
         true_mags, pred_mags = [], []
         for t_idx, p_idx, _ in matches:
             true_mags.append(np.log10(true_catalogue[t_idx][2] + 1e-9))
@@ -131,11 +132,17 @@ class InferenceEngine:
         ax1 = fig.add_subplot(gs[0:2, 0])
         ax1.imshow(img_linear_abs, cmap='inferno', origin='lower', norm=norm, aspect='equal')
         ax1.set_title("Input (Linear Photons)")
-        for s in true_catalogue: ax1.plot(s[0], s[1], 'g+', markersize=8, alpha=0.4)
         
         ax2 = fig.add_subplot(gs[0:2, 1], sharex=ax1, sharey=ax1)
         im2 = ax2.imshow(full_reconstruction_linear_abs, cmap='inferno', origin='lower', norm=norm, aspect='equal')
-        ax2.set_title("Model (Linear Photons)")
+        ax2.set_title("Model (Matched=Green, Missed=Red)")
+        
+        # Overlay Match Results
+        matched_true_indices = [m[0] for m in matches]
+        for i, s in enumerate(true_catalogue):
+            color = 'g' if i in matched_true_indices else 'r'
+            ax2.plot(s[0], s[1], color + '+', markersize=8, alpha=0.6)
+        
         add_colorbar(im2, ax2)
         
         ax3 = fig.add_subplot(gs[0:2, 2], sharex=ax1, sharey=ax1)
