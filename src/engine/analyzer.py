@@ -51,13 +51,12 @@ class ThresholdAnalyzer:
                     for k in range(K):
                         p_pred = prediction[y, x, k, 0]
                         slot = target_grid[y, x, k]
-                        tp, tdx, tdy, m_target, tc = slot
+                        tp, tdx, tdy, raw_flux_target, tc = slot
                         if tp == 1.0:
                             tgx = (x * cell_size) + tdx
                             tgy = (y * cell_size) + tdy
-                            # Convert Arcsinh target back to linear flux for consistency
-                            linear_flux = self.transform.network_to_flux(m_target)
-                            true_stars.append((tgx, tgy, linear_flux, tc))
+                            # NEW: target already contains raw physical photons
+                            true_stars.append((tgx, tgy, float(raw_flux_target), tc))
                             obj_p_scores.append(p_pred)
                         else:
                             bg_p_scores.append(p_pred)
@@ -71,16 +70,16 @@ class ThresholdAnalyzer:
             tp, fp, fn = 0, 0, 0
             for true_catalogue, prediction in zip(all_true_catalogues, all_raw_predictions):
                 pred_stars = []
-                for y in range(grid_size):
-                    for x in range(grid_size):
-                        for k in range(K):
-                            p, dx, dy, m_pred, c = prediction[y, x, k, :5]
+                grid_h, grid_w, K_pred, _ = prediction.shape
+                for y in range(grid_h):
+                    for x in range(grid_w):
+                        for k in range(K_pred):
+                            p, dx, dy, physical_flux_pred, c = prediction[y, x, k, :5]
                             if p > thresh:
                                 gx = (x * cell_size) + dx
                                 gy = (y * cell_size) + dy
-                                # Convert predicted Arcsinh flux back to linear
-                                linear_flux_pred = self.transform.network_to_flux(m_pred)
-                                pred_stars.append((gx, gy, linear_flux_pred, c, p))
+                                # NEW: model output is already raw physical photons
+                                pred_stars.append((gx, gy, float(physical_flux_pred), c, p))
                 
                 matches, unmatched_true, unmatched_pred = match_stars(true_catalogue, pred_stars)
                 tp += len(matches)
