@@ -2,6 +2,7 @@ run_config:
   resume_from_checkpoint: false
   force_regenerate_data: true
 
+
 curriculum:
   # Stage 0: Gaussian Pre-training (The Base Model)
   stage0:
@@ -52,7 +53,7 @@ data_params:
     lambda_flux: 5.0
     lambda_comp: 1.0
     lambda_shape: 1.0
-    lambda_bg: 0.1
-    focal_alpha: 0.75
+    lambda_bg: 1.0
+    focal_alpha: 0.25
     focal_gamma: 2.0
 
