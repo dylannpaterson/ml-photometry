@@ -74,10 +74,18 @@ A **Feature Pyramid Network (FPN)** merges deep semantic context from the lower 
 | **Completeness MAE** | $< 0.10$ | Reliability of predicted recoverability score. |
 | **Shape Loss ($S$)** | $< 0.0001$ | PSF profile fidelity. |
 
-## 6. Implementation Strategy: Sparse Storage
-To maintain a < 100 GB disk footprint:
-*   **Storage:** Samples save the image, the 5-channel star grid, the 1-channel background map, and a compressed list of 81-pixel shapes.
-*   **JIT Re-densification:** The `Dataset` class re-inflates these into the full flattened tensor during training, applying Arcsinh normalization on-the-fly to raw photon counts.
+## 6. Implementation Strategy: The Macro-Sparse Pipeline
+To maintain a virtually negligible disk footprint (< 2 GB for 30 million simulated stars) while preserving extremely high I/O throughput, the pipeline uses a **"Cached Physics, Live Noise"** dual-mmap architecture combined with Just-In-Time (JIT) grid densification.
+
+* **Macro-Sparse Storage:** Instead of saving massive 259-channel target tensors, the offline generator only saves:
+    1.  **The Base Image:** A flat, clean float32 array containing the simulated optical physics (e.g., $4088 \times 4088$).
+    2.  **The Target Catalog:** A lightweight Parquet or HDF5 table containing the ground truth for each star. 
+* **Tabular Shape Integration ($S$):** The exact $9 \times 9$ optical PSF shape profile for every star is flattened into an 81-value array and saved directly as a column in the Target Catalog alongside its $x, y$, and `flux` coordinates.
+* **JIT Densification & Live Noise:** During training, the PyTorch `Dataset`:
+    1. Memory-maps the clean image and slices a random $256 \times 256$ crop.
+    2. Dynamically injects sky background, Poisson noise, and Gaussian read noise on the fly, ensuring infinite noise realizations.
+    3. Queries the catalog for stars within the crop bounds and instantly "paints" their $x, y, m$, and $S$ values into a dense $128 \times 128 \times 259$ target tensor in RAM.
+* **Dynamic Completeness Calculation ($c$):** Because noise is injected live, the completeness/recoverability score cannot be pre-calculated. The dataloader calculates $c$ analytically on the fly for each star by computing its penalized Signal-to-Noise Ratio (factoring in the newly injected sky/read noise and local crowding from neighbor fluxes) and passing it through a logistic sigmoid centered on the detection threshold.
 
 ## 7. Training Curriculum
 The pipeline uses a multi-stage curriculum to build a robust foundation model for space-based point source recovery.
@@ -88,14 +96,15 @@ The pipeline uses a multi-stage curriculum to build a robust foundation model fo
 *   **Goal:** Reach basic competency in detection and flux recovery on smooth, well-defined sources.
 
 ### Stage 1: Multi-Telescope Foundation Training (The "Universal Photometrist" Phase)
-*   **Objective:** Build instrument-agnostic features by training on diverse space-based instruments.
-*   **Data:** High-fidelity simulations using **GalSim** for:
-    1. **Roman** (Wide-field, 0.11"/px)
-    2. **Hubble (WFC3/IR)** (Diffraction-limited, 0.13"/px)
-    3. **JWST (NIRCam)** (Hexagonal diffraction, 0.031"/px)
-    4. **Euclid (VIS)** (Unique stable PSF, 0.1"/px)
-    5. **Gaia-like** (Extremely sparse, super-resolution)
-*   **Goal:** Learn to decouple the intrinsic stellar signal from the varied instrumental PSF and noise profiles.
+* **Objective:** Build instrument-agnostic features by training the FPN to handle diverse space-based and ground-based optical physics without overfitting to a single telescope's noise profile or diffraction geometry.
+* **Data Generation:** An offline multiprocessing script uses **GalSim** to render a bank of 20 massive $4088 \times 4088$ clean "physics mosaics" representing four optical archetypes:
+    1. **Roman-like:** 6-strut, heavy diffraction.
+    2. **Hubble-like:** 4-strut perpendicular diffraction.
+    3. **Ideal Space:** Unobscured, pure Airy disks with varying aberrations (coma, astigmatism).
+    4. **Ground-based:** Seeing-limited Moffat profiles simulating atmospheric blur.
+* **Astrophysical Priors:** Star counts and fluxes (~150,000 per mosaic) are drawn from an empirical Galactic Bulge luminosity function (e.g., VVV or Besançon) to ensure authentic density ratios and severe crowding.
+* **Training Mechanics:** Utilizing the Macro-Sparse Pipeline, the dataloader slices crops from the 20-mosaic bank, applies $D_4$ symmetry augmentations, and injects live noise. This provides ~50,000 unique, dynamically noisy training chunks for a 100-epoch curriculum.
+* **Goal:** Learn to decouple the intrinsic stellar signal from varied instrumental PSFs, smoothly mapping core structures and naturally suppressing diffraction spikes before encountering Romanisim data.
 
 ### Stage 2: Roman-specific High-Fidelity Fine-tuning (The "Mission" Phase)
 *   **Objective:** Master the specific artifacts and complex PSF of the Roman Space Telescope.
