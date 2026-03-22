@@ -3,49 +3,65 @@ import numpy as np
 from scipy.spatial import cKDTree
 from src.data.transforms import AstroSpaceTransform
 
-def match_stars(true_stars, pred_stars, distance_threshold=1.0, flux_threshold_dex=0.5):
+def match_stars(true_stars, pred_stars, distance_threshold=2.0, flux_threshold_dex=0.5):
     """
-    Matches predicted stars to true stars using a KDTree for efficiency.
-    Adds a flux-consistency constraint to prevent mis-assignment in dense fields.
+    Matches predicted stars to true stars using a Bright-to-Faint priority strategy.
+    
+    The cost function balances positional error and magnitude difference:
+    Cost = (dist / dist_thresh)**2 + (abs(log_flux_diff) / flux_thresh_dex)**2
     """
     if not pred_stars:
         return [], list(range(len(true_stars))), []
     if not true_stars:
         return [], [], list(range(len(pred_stars)))
 
+    # Convert to arrays for efficiency
     true_coords = np.array([(s[0], s[1]) for s in true_stars])
+    true_fluxes = np.array([s[2] for s in true_stars])
+    
     pred_coords = np.array([(s[0], s[1]) for s in pred_stars])
+    pred_fluxes = np.array([s[2] for s in pred_stars])
 
-    tree = cKDTree(true_coords)
-    distances, indices = tree.query(pred_coords, distance_upper_bound=distance_threshold)
+    # Pre-calculate log fluxes
+    log_true = np.log10(np.maximum(1e-9, true_fluxes))
+    log_pred = np.log10(np.maximum(1e-9, pred_fluxes))
 
+    # Search tree for predictions
+    tree = cKDTree(pred_coords)
+    
+    # 1. Sort True Stars by Flux (Brightest First)
+    true_indices_sorted = np.argsort(true_fluxes)[::-1]
+    
     matches = []
     matched_true = set()
     matched_pred = set()
 
-    # 1. Gather potential matches that satisfy BOTH distance and flux constraints
-    potential_matches = []
-    for p_idx, (dist, t_idx) in enumerate(zip(distances, indices)):
-        if dist < distance_threshold:
-            # Flux Consistency Check (dex difference)
-            t_flux = true_stars[t_idx][2]
-            p_flux = pred_stars[p_idx][2]
+    for t_idx in true_indices_sorted:
+        # Find all predictions within the search radius
+        p_indices = tree.query_ball_point(true_coords[t_idx], r=distance_threshold)
+        
+        best_p_idx = -1
+        min_cost = 2.0 # Maximum allowed cost (1.0 from dist + 1.0 from flux)
+        
+        for p_idx in p_indices:
+            if p_idx in matched_pred:
+                continue
+                
+            dist = np.sqrt(np.sum((true_coords[t_idx] - pred_coords[p_idx])**2))
+            flux_diff = abs(log_true[t_idx] - log_pred[p_idx])
             
-            # Avoid log of zero/negative
-            log_t = np.log10(max(1e-9, t_flux))
-            log_p = np.log10(max(1e-9, p_flux))
+            # Hybrid Cost Function
+            # Each component is normalized by its respective threshold
+            cost = (dist / distance_threshold)**2 + (flux_diff / flux_threshold_dex)**2
             
-            if abs(log_t - log_p) < flux_threshold_dex:
-                potential_matches.append((dist, t_idx, p_idx))
-    
-    # 2. Greedy assignment (closest first)
-    potential_matches.sort()
-
-    for dist, t_idx, p_idx in potential_matches:
-        if t_idx not in matched_true and p_idx not in matched_pred:
-            matches.append((t_idx, p_idx, dist))
+            if cost < min_cost:
+                min_cost = cost
+                best_p_idx = p_idx
+        
+        if best_p_idx != -1:
+            matches.append((t_idx, best_p_idx, min_cost))
             matched_true.add(t_idx)
-            matched_pred.add(p_idx)
+            matched_pred.add(best_p_idx)
 
     unmatched_true = [i for i in range(len(true_stars)) if i not in matched_true]
     unmatched_pred = [i for i in range(len(pred_stars)) if i not in matched_pred]
@@ -102,7 +118,6 @@ class Evaluator:
                 
                 # Extract True Stars (Filter by completeness for honest recall)
                 true_stars = []
-                true_stars_all = [] # For internal reference
                 grid_h, grid_w = target_grid.shape[:2]
                 K = data_cfg["max_capacity_per_cell"]
                 S2_plus_5 = (target_grid.shape[-1] - 1) // K
@@ -116,7 +131,6 @@ class Evaluator:
                             tp, tdx, tdy, raw_flux_target, tc = slot[:5]
                             if tp == 1.0:
                                 star_info = ((x * cell_size) + tdx, (y * cell_size) + tdy, float(raw_flux_target), tc)
-                                true_stars_all.append(star_info)
                                 # NEW: Only expect the model to find "detectable" stars (c > 0.5)
                                 if tc > 0.5:
                                     true_stars.append(star_info)
@@ -130,9 +144,8 @@ class Evaluator:
                             if p > threshold:
                                 pred_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, float(physical_flux_pred), c, p))
                 
-                # Match using 2.0 pixel threshold
-                dist_thresh = 2.0
-                matches, unmatched_true, unmatched_pred = match_stars(true_stars, pred_stars, distance_threshold=dist_thresh)
+                # Match using Bright-to-Faint Hybrid strategy
+                matches, unmatched_true, unmatched_pred = match_stars(true_stars, pred_stars, distance_threshold=2.0)
                 
                 all_tp += len(matches)
                 all_fp += len(unmatched_pred)
@@ -155,8 +168,11 @@ class Evaluator:
                                 comp_tp[b] += 1
                             break
 
-                for t_idx, p_idx, dist in matches:
+                for t_idx, p_idx, cost in matches:
+                    # For distance RMSE we need to re-calculate distance
+                    dist = np.sqrt(np.sum((np.array(true_stars[t_idx][:2]) - np.array(pred_stars[p_idx][:2]))**2))
                     pos_errors.append(dist)
+                    
                     t_flux = true_stars[t_idx][2]
                     p_flux = pred_stars[p_idx][2]
                     t_comp = true_stars[t_idx][3]
@@ -175,7 +191,7 @@ class Evaluator:
         print("\n=============================================")
         print(" STAGE 0 ACCEPTANCE CRITERIA CHECK")
         print("=============================================")
-        self._print_metric("Recall (All Sources)", recall, 0.95)
+        self._print_metric("Recall (Visible Stars)", recall, 0.95)
         self._print_metric("Precision", precision, 0.98)
         self._print_metric("Positional RMSE", rmse, 0.15, reverse=True)
         self._print_metric("Flux Ratio Accuracy", flux_accuracy, 0.95)
