@@ -1,5 +1,5 @@
 run_config:
-  resume_from_checkpoint: false
+  resume_from_checkpoint: true
   force_regenerate_data: true
 
 
@@ -48,7 +48,7 @@ data_params:
   shape_size: 9
   GLOBAL_STRETCH_SCALE: 10.0
   loss_params:
-    lambda_prob: 5.0
+    lambda_prob: 50.0
     lambda_pos: 50.0
     lambda_flux: 5.0
     lambda_comp: 1.0

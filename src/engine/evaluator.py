@@ -94,12 +94,12 @@ class Evaluator:
                     prediction_dict = self.model(input_tensor)
                     prediction = prediction_dict["stars"].squeeze(0).cpu().numpy()
                 
-                # Extract True Stars
+                # Extract True Stars (Filter by completeness for honest recall)
                 true_stars = []
+                true_stars_all = [] # For internal reference
                 grid_h, grid_w = target_grid.shape[:2]
                 K = data_cfg["max_capacity_per_cell"]
                 S2_plus_5 = (target_grid.shape[-1] - 1) // K
-                # Reshape back to [H, W, K, 5+S2] to extract metadata
                 target_reshaped = target_grid[..., :-1].view(grid_h, grid_w, K, S2_plus_5).numpy()
                 
                 cell_size = provider.cell_size
@@ -109,8 +109,11 @@ class Evaluator:
                             slot = target_reshaped[y, x, k]
                             tp, tdx, tdy, raw_flux_target, tc = slot[:5]
                             if tp == 1.0:
-                                # NEW: target already contains raw physical photons
-                                true_stars.append(((x * cell_size) + tdx, (y * cell_size) + tdy, float(raw_flux_target), tc))
+                                star_info = ((x * cell_size) + tdx, (y * cell_size) + tdy, float(raw_flux_target), tc)
+                                true_stars_all.append(star_info)
+                                # NEW: Only expect the model to find "detectable" stars (c > 0.5)
+                                if tc > 0.5:
+                                    true_stars.append(star_info)
                 
                 # Extract Predicted Stars (p > threshold)
                 pred_stars = []
@@ -119,10 +122,11 @@ class Evaluator:
                         for k in range(K):
                             p, dx, dy, physical_flux_pred, c = prediction[y, x, k, :5]
                             if p > threshold:
-                                # NEW: model output is already raw physical photons
                                 pred_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, float(physical_flux_pred), c, p))
                 
-                matches, unmatched_true, unmatched_pred = match_stars(true_stars, pred_stars)
+                # Match using 2.0 pixel threshold
+                dist_thresh = 2.0
+                matches, unmatched_true, unmatched_pred = match_stars(true_stars, pred_stars, distance_threshold=dist_thresh)
                 
                 all_tp += len(matches)
                 all_fp += len(unmatched_pred)
