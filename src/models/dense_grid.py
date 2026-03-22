@@ -30,6 +30,38 @@ class FPNBlock(nn.Module):
         # low_res comes from deeper in the network, needs upsampling
         return self.smooth(self.lateral(high_res) + self.up(low_res))
 
+class DiffractionAwareFilter(nn.Module):
+    def __init__(self, kernel_size=21, sigma=3.0):
+        super(DiffractionAwareFilter, self).__init__()
+        
+        # 1 in channel (raw flux), 1 out channel (filter response)
+        self.conv = nn.Conv2d(1, 1, kernel_size=kernel_size, padding=kernel_size//2, bias=False)
+        
+        # 1. Generate the 2D Mexican Hat (Laplacian of Gaussian) kernel
+        grid = torch.arange(-kernel_size // 2 + 1., kernel_size // 2 + 1.)
+        y, x = torch.meshgrid(grid, grid, indexing='ij')
+        r2 = x**2 + y**2
+        
+        # LoG Formula
+        kernel = -(1.0 / (np.pi * sigma**4)) * (1.0 - r2 / (2 * sigma**2)) * torch.exp(-r2 / (2 * sigma**2))
+        
+        # Normalize the kernel so it doesn't blow up the activations
+        kernel = kernel - kernel.mean()
+        kernel = kernel / torch.max(torch.abs(kernel))
+        
+        # 2. Assign the mathematical prior to the Conv2d weights
+        # Reshape to match PyTorch weight format: [out_channels, in_channels, H, W]
+        self.conv.weight.data = kernel.view(1, 1, kernel_size, kernel_size).float()
+        
+        # 3. CRITICAL: Allow the network to backpropagate and warp this shape 
+        # to match the true Roman PSF diffraction spikes!
+        self.conv.weight.requires_grad = True
+
+    def forward(self, x):
+        # Concatenate the original raw image with the filtered response
+        # Output shape: [Batch, 2, H, W]
+        return torch.cat([x, self.conv(x)], dim=1)
+
 class DenseGridModel(nn.Module):
     def __init__(self, K=3, shape_size=9, cell_size=4):
         super(DenseGridModel, self).__init__()
@@ -38,10 +70,14 @@ class DenseGridModel(nn.Module):
         self.cell_size = float(cell_size)
         self.num_output_channels = self.K * (5 + self.S2) + 1
 
-        # 1. Backbone: Full ResNet-34
+        # 1. Physics Prior Filter
+        self.diffraction_filter = DiffractionAwareFilter(kernel_size=21)
+
+        # 2. Backbone: Full ResNet-34
         resnet = models.resnet34(weights=None)
         self.initial = nn.Sequential(
-            nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False),
+            # CHANGED: Now takes 2 channels (Raw Flux + Wavelet Response)
+            nn.Conv2d(2, 64, kernel_size=7, stride=2, padding=3, bias=False),
             resnet.bn1,
             resnet.relu,
             resnet.maxpool, # Stride 4, Output 64x64
@@ -51,13 +87,13 @@ class DenseGridModel(nn.Module):
         self.layer3 = resnet.layer3 # 16x16, 256ch
         self.layer4 = resnet.layer4 # 8x8, 512ch
 
-        # 2. FPN Neck: Merge deep context back to the 64x64 prediction grid
+        # 3. FPN Neck: Merge deep context back to the 64x64 prediction grid
         self.top_layer = nn.Conv2d(512, 128, kernel_size=1) # 8x8
         self.fpn3 = FPNBlock(256, 128, 128) # 16x16
         self.fpn2 = FPNBlock(128, 128, 128) # 32x32
         self.fpn1 = FPNBlock(64, 128, 128)  # 64x64
 
-        # 3. Prediction Head with CoordConv for spatial awareness
+        # 4. Prediction Head with CoordConv for spatial awareness
         self.head = nn.Sequential(
             CoordConv(128, 256, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
@@ -66,7 +102,11 @@ class DenseGridModel(nn.Module):
 
     def forward(self, x):
         # Bottom-up
-        c0 = self.initial(x)
+        # 1. Pass through trainable physics prior (Outputs 2 channels)
+        x_physics = self.diffraction_filter(x)
+        
+        # 2. Feed 2-channel input into ResNet
+        c0 = self.initial(x_physics)
         c1 = self.layer1(c0)
         c2 = self.layer2(c1)
         c3 = self.layer3(c2)

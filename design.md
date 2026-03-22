@@ -25,9 +25,16 @@ To develop a machine learning pipeline capable of performing fast, direct point-
 
 ## 3. Neural Network Architecture
 
+### Stage 0: Trainable Physics Prior
+Before entering the backbone, the raw input image passes through a **DiffractionAwareFilter (LoG)**.
+*   **Filter Type:** Laplacian of Gaussian (Mexican Hat) wavelet.
+*   **Kernel Size:** $21 \times 21$.
+*   **Purpose:** Provides a mathematical prior optimized for blob detection and edge suppression. By concatenating the original image with this filter response, the network is immediately alerted to point-source structures vs. diffraction spikes or background gradients.
+*   **Trainability:** The filter weights are initialized using the LoG formula but remain trainable, allowing the model to "warp" the prior to perfectly match the unique diffraction profile of the Roman PSF.
+
 ### Stage 1: The Backbone
 *   **Backbone:** Full ResNet-34 (all 4 stages).
-*   **Input:** $256 \times 256 \times 1$.
+*   **Input:** $256 \times 256 \times 2$ (Original Stretched Image + Physics Prior Response).
 *   **Multi-scale Features:** Extracts features at $1/4, 1/8, 1/16, 1/32$ resolutions.
 
 ### Stage 2: The FPN Neck
