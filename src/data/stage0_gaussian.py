@@ -7,7 +7,7 @@ from scipy.ndimage import gaussian_filter
 from src.data.transforms import AstroSpaceTransform
 
 class GaussianPretrainingProvider(Dataset):
-    def __init__(self, num_samples=1000, min_stars=100, max_stars=1500, image_size=256, max_capacity_per_cell=3, shape_size=7, use_fixed_seed=False, global_stretch_scale=10.0):
+    def __init__(self, num_samples=1000, min_stars=100, max_stars=1500, image_size=256, max_capacity_per_cell=3, shape_size=7, use_fixed_seed=False, global_stretch_scale=10.0, min_snr=5.0):
         """
         Generates realistic synthetic data for the Roman Bulge Time Domain Survey.
         Vectorized for speed.
@@ -20,6 +20,7 @@ class GaussianPretrainingProvider(Dataset):
         self.S = shape_size
         self.read_noise = 5.0
         self.use_fixed_seed = use_fixed_seed
+        self.min_snr = min_snr
         self.transform = AstroSpaceTransform(stretch_scale=global_stretch_scale)
 
         # Grid parameters: 4x4 cells for 256x256 image = 64x64 grid
@@ -161,17 +162,49 @@ class GaussianPretrainingProvider(Dataset):
         unresolved_extra_flux_map = np.zeros_like(smooth_bg)
         
         cell_assignments = {}
+        all_stars_for_crowding = []
         for i in range(len(fluxes)):
             px, py = int(np.clip(x_centers[i], 0, self.img_size-1)), int(np.clip(y_centers[i], 0, self.img_size-1))
             local_noise = noise_floor[py, px]
             snr = fluxes[i] / (local_noise * 4.0)
             
-            if snr >= 2.0:
-                cx, cy = int(x_centers[i] // self.cell_size), int(y_centers[i] // self.cell_size)
+            if snr >= self.min_snr:
+                all_stars_for_crowding.append({
+                    'flux': fluxes[i], 'x': x_centers[i], 'y': y_centers[i], 'snr': snr
+                })
+
+        # CROWDING PASS: Penalty based on proximity to brighter stars
+        from scipy.spatial import cKDTree
+        if all_stars_for_crowding:
+            coords = np.array([[s['x'], s['y']] for s in all_stars_for_crowding])
+            tree = cKDTree(coords)
+            
+            for i, star in enumerate(all_stars_for_crowding):
+                # Search for neighbors within 4 pixels (approx 2.5 * sigma)
+                neighbor_indices = tree.query_ball_point(coords[i], r=4.0)
+                
+                crowding_penalty = 1.0
+                for n_idx in neighbor_indices:
+                    if n_idx == i: continue
+                    neighbor = all_stars_for_crowding[n_idx]
+                    if neighbor['flux'] > star['flux']:
+                        # Stronger penalty for brighter neighbors
+                        dist = np.sqrt(np.sum((coords[i] - coords[n_idx])**2))
+                        # Penalty formula: scales with (Bright / Faint) and proximity
+                        ratio = neighbor['flux'] / star['flux']
+                        # 0.2 base factor, exponential spatial decay
+                        penalty = 1.0 - np.clip(0.2 * ratio * np.exp(-dist/2.0), 0.0, 0.8)
+                        crowding_penalty *= penalty
+                
+                # Base completeness (Sigmoid SNR)
+                base_c = 1.0 / (1.0 + np.exp(-2.0 * (star['snr'] - self.min_snr)))
+                # Final crowding-aware completeness
+                completeness = float(np.clip(base_c * crowding_penalty, 0.0, 1.0))
+                
+                cx, cy = int(star['x'] // self.cell_size), int(star['y'] // self.cell_size)
                 cx, cy = min(cx, self.grid_size - 1), min(cy, self.grid_size - 1)
                 if (cy, cx) not in cell_assignments: cell_assignments[(cy, cx)] = []
-                completeness = float(np.clip((snr - 3.5) / 4.5, 0.0, 1.0))
-                cell_assignments[(cy, cx)].append([fluxes[i], x_centers[i], y_centers[i], snr, completeness])
+                cell_assignments[(cy, cx)].append([star['flux'], star['x'], star['y'], star['snr'], completeness])
 
         for (cy, cx), cell_stars in cell_assignments.items():
             sorted_stars = sorted(cell_stars, key=lambda x: x[0], reverse=True)

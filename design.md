@@ -18,7 +18,10 @@ To develop a machine learning pipeline capable of performing fast, direct point-
     1.  **p:** Probability (Objectness score, $0.0 \to 1.0$)
     2.  **dx, dy:** Sub-pixel offset from the cell's top-left corner ($0.0 \to 2.0$)
     3.  **m:** Stretched Flux ($\text{asinh}(\text{Flux} / \text{scale})$). Matches the input feature space for stable regression.
-    4.  **c:** Completeness / Recoverability Score ($0.0 \to 1.0$)
+    4.  **c:** **Crowding-Aware Completeness Score ($0.0 \to 1.0$)**. Represents physical recoverability. 
+        *   **Base:** Sigmoid-scaled SNR ($0.5$ at SNR 5.0).
+        *   **Penalty:** Proximity-based suppression from brighter neighbors: $P = \prod (1 - \text{clip}(0.2 \cdot \frac{F_{bright}}{F_{target}} \cdot e^{-d/2}, 0, 0.8))$.
+        *   **Purpose:** Honest labeling—tells the network which stars are physically "drowned out" to prevent unstable gradients from impossible-to-recover sources.
     5.  **S (Shape):** 9x9 Point Source Profile (81 values). Represents the isolated, centered PSF shape.
 *   **Background Value (1 per cell):**
     1.  **b:** Residual Background Level ($\text{asinh}((\text{BG}_{raw} - \text{median}(I_{raw})) / \text{scale})$). Represents local deviations from the chunk's median sky.
