@@ -155,10 +155,10 @@ class Stage1MacroSparseDataset(Dataset):
 
         # 10. Background Target
         bg_target_linear = sky_level - chunk_median
-        bg_grid_stretched = self.transform.target_bg_to_network(np.full((self.grid_size, self.grid_size), bg_target_linear))
+        bg_grid_stretched = self.transform.target_bg_to_network(np.full((self.grid_size, self.grid_size), bg_target_linear, dtype=np.float32))
         
         # Flatten
         flattened_stars = grid_stars.view(self.grid_size, self.grid_size, -1)
-        target = torch.cat([flattened_stars, torch.from_numpy(bg_grid_stretched).unsqueeze(-1)], dim=-1)
+        target = torch.cat([flattened_stars, torch.from_numpy(bg_grid_stretched).unsqueeze(-1).float()], dim=-1)
         
         return image_tensor, target
