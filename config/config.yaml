@@ -1,10 +1,11 @@
 run_config:
-  resume_from_checkpoint: true
-  force_regenerate_data: false
+  resume_from_checkpoint: false
+  force_regenerate_data: true
 
 
 curriculum:
   # Stage 0: Gaussian Pre-training (The Base Model)
+  # Uses the Two-Tier Speed Hack and Dynamic RC Prior
   stage0:
     name: "Roman Bulge Stage 0 (Full)"
     data_dir: "data/bulge_stage0_full"
@@ -13,12 +14,13 @@ curriculum:
     learning_rate: 0.0001
     num_workers: 4
     resume_from_last_stage: false
-    cell_size: 4
+    cell_size: 4 # Centralized default: 4
     mosaic_params:
-      num_mosaics: 5
-      mosaic_size: 4088
+      num_mosaics: 500
+      mosaic_size: 1024
 
   # Stage 1: Multi-Telescope Foundation Training (GalSim)
+  # Parameterized LF (Apparent Magnitudes) + Decoupled Instrument Physics
   stage1:
     name: "Multi-Telescope Foundation"
     data_dir: "data/stage1_multitel"
@@ -27,6 +29,9 @@ curriculum:
     learning_rate: 0.0001
     num_workers: 4
     resume_from_last_stage: true
+    mosaic_params:
+      num_mosaics: 500
+      mosaic_size: 1024
 
   # Stage 2: Roman-specific High-Fidelity Fine-tuning (Romanisim)
   stage2:
@@ -39,14 +44,21 @@ curriculum:
     resume_from_last_stage: true
 
 data_params:
-  num_train_samples: 50000
-  num_val_samples: 2000
+  # Increased samples to cover the 500 unique parameter states
+  num_train_samples: 100000 
+  num_val_samples: 5000
+  
+  # Star density per 256x256 crop
   min_stars: 200
   max_stars: 5000
+  
   image_size: 256
+  
+  # Model-dependent constants (Aligned with castor.constants)
   max_capacity_per_cell: 3
   shape_size: 9
   GLOBAL_STRETCH_SCALE: 10.0
+  
   loss_params:
     lambda_prob: 50.0
     lambda_pos: 1.0
@@ -56,4 +68,3 @@ data_params:
     lambda_bg: 1.0
     focal_alpha: 0.25
     focal_gamma: 2.0
-

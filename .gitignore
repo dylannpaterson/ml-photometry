@@ -25,3 +25,4 @@ venv.bak/
 /data
 *.tar.gz
 *.asdf
+*.fits
