@@ -133,7 +133,7 @@ class GaussianPretrainingProvider(Dataset):
             rc_loc, rc_scale, rc_fraction = rc_params
 
         if exp_params is None:
-            exp_time = np.random.uniform(40.0, 80.0)
+            exp_time = np.random.uniform(30.0, 60.0)
             zp = 26.5
             sky_mag = 22.0
         else:
