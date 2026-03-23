@@ -7,10 +7,10 @@ import time
 from scipy.signal import fftconvolve
 
 # --- Configuration ---
-NUM_MOSAICS = 20
-MIN_STARS = 200000      
-MAX_STARS = 3500000     
-IMAGE_SIZE = 4088
+NUM_MOSAICS = 500              # Up from 20 to 500 unique parameter states
+IMAGE_SIZE = 1024              # Down from 4088 (1/16th the area)
+MIN_STARS = 12500              # Scaled down by 16 (matches 200k on 4088)
+MAX_STARS = 218750             # Scaled down by 16 (matches 3.5m on 4088)
 OUTPUT_DIR = "data/stage1_mosaics"
 
 # Native scales and detector limits

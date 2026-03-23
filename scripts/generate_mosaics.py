@@ -2,18 +2,20 @@ import argparse
 import os
 import torch
 import numpy as np
+import pandas as pd
 from castor.data.stage0_gaussian import GaussianPretrainingProvider
 from castor.cloud.config_utils import load_config
 import shutil
 from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE
 
 def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
-    """Generates a large mosaic and saves it compactly as dense arrays."""
+    """Generates a large mosaic and saves it compactly as physics image + catalog."""
     training_size = params['image_size']
     area_ratio = (mosaic_size / training_size)**2
     
-    sca_min_stars = int(params['min_stars'] * area_ratio * 0.8)
-    sca_max_stars = int(params['max_stars'] * area_ratio * 0.8)
+    # Scale stars for the full mosaic area
+    sca_min_stars = int(params['min_stars'] * area_ratio)
+    sca_max_stars = int(params['max_stars'] * area_ratio)
     
     provider = GaussianPretrainingProvider(
         min_stars=sca_min_stars,
@@ -25,52 +27,39 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     provider.cell_size = cell_size
     provider.grid_size = mosaic_size // cell_size
     
-    print(f"Generating Mosaic {idx} ({mosaic_size}x{mosaic_size}, cell_size={cell_size}, approx {sca_max_stars} stars)...")
-    sparse_sample = provider.generate_chunk()
+    # NEW: Draw Line-of-Sight Parameters for the Bulge
+    rc_loc = np.random.uniform(14.5, 16.5)
+    rc_scale = np.random.uniform(0.2, 0.5)
+    rc_fraction = np.random.uniform(0.05, 0.20)
     
-    # 1. Save Dense Image (RAW PHOTONS for GaussianMosaicDataset to stretch on the fly)
+    # Instrument params (Roman wide-band proxy)
+    exp_time = np.random.uniform(20.0, 100.0)
+    zp = 26.5
+    sky_mag = 22.0
+    
+    print(f"Generating Mosaic {idx} ({mosaic_size}x{mosaic_size}, approx {sca_max_stars} stars)...")
+    print(f"  RC_Mag={rc_loc:.2f}, exp={exp_time:.1f}s")
+    
+    # Use the speed-hack rendering
+    sample = provider.generate_chunk(
+        rc_params=(rc_loc, rc_scale, rc_fraction),
+        exp_params=(exp_time, zp, sky_mag)
+    )
+    
+    # 1. Save Clean Physics Image (Noiseless Photons)
     image_path = os.path.join(output_dir, f"mosaic_{idx:03d}_img.npy")
-    np.save(image_path, sparse_sample["raw_image"].numpy().astype(np.float32))
+    np.save(image_path, sample["physics_image"].numpy().astype(np.float32))
     
-    # 2. Redensify Target Grid (Pre-compute EVERYTHING)
-    base_grid = sparse_sample["base_grid"] # [G, G, K, 5]
-    # IMPORTANT: generate_chunk returns background_map which is ALREADY STRETCHED.
-    # We need to save the ABSOLUTE PHYSICAL PHOTONS for the mosaic to be robust.
-    # We'll calculate it from smooth_bg + unresolved_img inside generate_chunk? 
-    # No, let's just make generate_chunk return it.
-    bg_linear_abs = sparse_sample.get("bg_linear_abs", None)
-    if bg_linear_abs is None:
-        # Fallback if not updated yet: 
-        # (This is why we centralize!)
-        pass
-
-    G = provider.grid_size
-    K = provider.K
-    S2 = params['shape_size']**2
+    # 2. Save Rich Parquet Catalog (Astrophysics + Metadata)
+    catalog = sample["catalog"]
+    catalog['exp_time'] = exp_time
+    catalog['zp'] = zp
+    catalog['sky_mag'] = sky_mag
     
-    # Dense Target Shape: [G, G, (K * (5 + S2)) + 1]
-    star_grid = np.zeros((G, G, K, 5 + S2), dtype=np.float32)
-    star_grid[..., :5] = base_grid.numpy()
+    cat_path = os.path.join(output_dir, f"mosaic_{idx:03d}_catalog.parquet")
+    catalog.to_parquet(cat_path, index=False)
     
-    indices = sparse_sample["indices"]
-    shapes = sparse_sample["shapes"]
-    if len(indices) > 0:
-        for i in range(len(indices)):
-            y, x, k = indices[i]
-            star_grid[y, x, k, 5:5+S2] = shapes[i].numpy()
-            
-    # Flatten K and Append Background
-    flattened_stars = star_grid.reshape(G, G, -1)
-    
-    # We want absolute linear BG here
-    # I will update generate_chunk to return bg_linear_grid
-    bg_map = sparse_sample["bg_linear_grid"]
-    dense_target = np.concatenate([flattened_stars, bg_map.numpy()[..., np.newaxis]], axis=-1)
-            
-    target_path = os.path.join(output_dir, f"mosaic_{idx:03d}_target.npy")
-    np.save(target_path, dense_target)
-    
-    print(f"✅ Saved Dense Mosaic {idx} (Image + Target)")
+    print(f"✅ Saved Macro-Sparse Mosaic {idx}")
 
 def main():
     parser = argparse.ArgumentParser(description="Pregenerate Compact Mosaics")
@@ -85,11 +74,12 @@ def main():
     stage_cfg = config["curriculum"][stage_key]
     data_cfg = config["data_params"]
     
-    mos_cfg = stage_cfg.get("mosaic_params", {"num_mosaics": 10, "mosaic_size": 4088})
-    num_mosaics = mos_cfg["num_mosaics"]
+    # Standardize on the new Medium-Mosaic Strategy
+    num_mosaics = 100 # Default for local
     if args.num is not None:
         num_mosaics = args.num
-    mosaic_size = mos_cfg["mosaic_size"]
+        
+    mosaic_size = 1024 # 1/16th area of full SCA
     cell_size = stage_cfg.get("cell_size", DEFAULT_CELL_SIZE)
     
     output_dir = os.path.join(stage_cfg["data_dir"], "mosaics")
@@ -100,10 +90,14 @@ def main():
     params = {
         "min_stars": data_cfg["min_stars"],
         "max_stars": data_cfg["max_stars"],
-        "image_size": data_cfg["image_size"],
-        "max_capacity_per_cell": data_cfg.get("max_capacity_per_cell", MAX_CAPACITY_PER_CELL),
+        "image_size": data_cfg["image_size"], # 256
+        "max_capacity_per_cell": data_cfg["max_capacity_per_cell"],
         "shape_size": data_cfg.get("shape_size", SHAPE_SIZE)
     }
+    
+    # We need to scale the star density correctly for the 1024 canvas
+    # The config min/max is usually for 256x256. 
+    # Area ratio is (1024/256)^2 = 16.
     
     for i in range(num_mosaics):
         generate_mosaic(i, output_dir, params, mosaic_size, cell_size)
