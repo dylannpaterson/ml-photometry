@@ -62,6 +62,9 @@ class GaussianPretrainingProvider(Dataset):
         self.sigma_fixed = 1.5
         self.kernel_bank = self._precompute_kernel_bank(sigma=self.sigma_fixed)
         
+        # Effective PSF area for SNR calculation (FIX 1)
+        self.n_pix = 4 * np.pi * (self.sigma_fixed ** 2)
+        
         # Pre-allocate coordinate grids for vectorization
         self.xx, self.yy = np.meshgrid(np.arange(self.img_size), np.arange(self.img_size))
 
@@ -224,7 +227,10 @@ class GaussianPretrainingProvider(Dataset):
             cx, cy = int(tx // self.cell_size), int(ty // self.cell_size)
             if cx < 0 or cx >= self.grid_size or cy < 0 or cy >= self.grid_size: continue
             
-            snr = flux / np.sqrt(flux + sky_level + self.read_noise**2)
+            # Correct SNR formulation (FIX 1)
+            noise_variance = flux + self.n_pix * (sky_level + self.read_noise**2)
+            snr = flux / np.sqrt(noise_variance)
+            
             if snr >= self.min_snr:
                 if (cy, cx) not in cell_assignments: cell_assignments[(cy, cx)] = []
                 cell_assignments[(cy, cx)].append([flux, tx, ty, snr, mags[i]])
@@ -234,7 +240,8 @@ class GaussianPretrainingProvider(Dataset):
             for slot in range(min(self.K, len(sorted_stars))):
                 flux, tx, ty, snr, mag = sorted_stars[slot]
                 completeness = 1.0 / (1.0 + np.exp(-2.0 * (snr - self.min_snr)))
-                base_grid[cy, cx, slot] = [1.0, tx % self.cell_size, ty % self.cell_size, flux, completeness]
+                # Use completeness as soft probability target (FIX 3)
+                base_grid[cy, cx, slot] = [completeness, tx % self.cell_size, ty % self.cell_size, flux, completeness]
                 shapes.append(psf_shape_flat)
                 indices.append([cy, cx, slot])
                 catalog_stars.append({'x': tx, 'y': ty, 'flux': flux, 'mag': mag, 'shape': psf_shape_flat})
@@ -267,6 +274,11 @@ class GaussianMosaicDataset(Dataset):
         self.grid_size = image_size // cell_size
         self.transform = AstroSpaceTransform(stretch_scale=global_stretch_scale)
         self.K, self.S = MAX_CAPACITY_PER_CELL, SHAPE_SIZE
+        
+        # Effective PSF area for SNR calculation (FIX 1)
+        sigma_fixed = 1.5
+        self.n_pix = 4 * np.pi * (sigma_fixed ** 2)
+        self.min_snr = 5.0
         
         self.image_files = sorted([f for f in os.listdir(data_dir) if f.endswith("_img.npy")])
         if not self.image_files:
@@ -376,12 +388,21 @@ class GaussianMosaicDataset(Dataset):
             ly = local_stars[:, 1] - py
             fluxes = local_stars[:, 2]
             
+            # Correct SNR and filtering (FIX 1 & 2)
+            noise_variance = fluxes + self.n_pix * (sky_level + 25.0)
+            snrs = fluxes / np.sqrt(noise_variance)
+            comps = 1.0 / (1.0 + np.exp(-2.0 * (snrs - self.min_snr)))
+            
+            # Filter only detectable stars (FIX 2)
+            valid_mask = snrs >= self.min_snr
+            local_stars = local_stars[valid_mask]
+            lx = lx[valid_mask]
+            ly = ly[valid_mask]
+            fluxes = fluxes[valid_mask]
+            comps = comps[valid_mask]
+            
             cxs = (lx // self.cell_size).astype(int)
             cys = (ly // self.cell_size).astype(int)
-            
-            # Vectorize heavy math (FIX 2)
-            snrs = fluxes / np.sqrt(fluxes + sky_level + 25.0)
-            comps = 1.0 / (1.0 + np.exp(-2.0 * (snrs - 5.0)))
             
             grid_stars_np = np.zeros((self.grid_size, self.grid_size, self.K, 5 + self.S**2), dtype=np.float32)
             counts = np.zeros((self.grid_size, self.grid_size), dtype=np.int32)
@@ -392,7 +413,8 @@ class GaussianMosaicDataset(Dataset):
                 
                 slot = counts[cy, cx]
                 if slot < self.K:
-                    grid_stars_np[cy, cx, slot, 0] = 1.0
+                    # Soft probability target (FIX 3)
+                    grid_stars_np[cy, cx, slot, 0] = float(comps[i])
                     grid_stars_np[cy, cx, slot, 1] = float(lx[i] % self.cell_size)
                     grid_stars_np[cy, cx, slot, 2] = float(ly[i] % self.cell_size)
                     grid_stars_np[cy, cx, slot, 3] = float(fluxes[i])
