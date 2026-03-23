@@ -73,14 +73,14 @@ def generate_archetype_psf(archetype, lam, params):
         # Roman: 6 thick struts -> 12 spikes
         opt_psf = galsim.OpticalPSF(
             lam=lam, diam=2.4, obscuration=0.32, 
-            nstruts=6, strut_angle=15*galsim.degrees, strut_width=0.032,
+            nstruts=6, strut_angle=15*galsim.degrees, strut_thick=0.032,
             defocus=np.random.normal(0, 0.05), astig1=np.random.normal(0, 0.03), oversampling=1.5
         )
     elif archetype == 'hubble':
         # Hubble: 4 thick struts -> 4 spikes
         opt_psf = galsim.OpticalPSF(
             lam=lam, diam=2.4, obscuration=0.33, 
-            nstruts=4, strut_angle=np.random.uniform(0, 90)*galsim.degrees, strut_width=0.032,
+            nstruts=4, strut_angle=np.random.uniform(0, 90)*galsim.degrees, strut_thick=0.032,
             defocus=np.random.normal(0, 0.04), coma1=np.random.normal(0, 0.02), oversampling=1.5
         )
     elif archetype == 'ideal_space':
