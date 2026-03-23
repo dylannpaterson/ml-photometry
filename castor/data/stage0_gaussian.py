@@ -295,19 +295,17 @@ class GaussianMosaicDataset(Dataset):
                 img_path = os.path.join(data_dir, img_f)
                 cat_path = os.path.join(data_dir, cat_f[0])
                 
-                img_mmap = np.load(img_path, mmap_mode='r')
                 cat = pd.read_parquet(cat_path)
                 
-                # Store image mmap + metadata
+                # Store PATH and metadata (FIX 1)
                 self.mosaics.append({
-                    'image': img_mmap,
+                    'img_path': img_path,
                     'exp_time': cat['exp_time'].iloc[0] if 'exp_time' in cat.columns else 54.0,
                     'zp': cat['zp'].iloc[0] if 'zp' in cat.columns else 26.5,
                     'sky_mag': cat['sky_mag'].iloc[0] if 'sky_mag' in cat.columns else 22.0
                 })
                 
                 # Extract essential star data into a compact array
-                # x, y, flux, mag, shape(81)
                 stars = np.zeros((len(cat), 4 + self.S**2), dtype=np.float32)
                 stars[:, 0] = cat['x'].values
                 stars[:, 1] = cat['y'].values
@@ -340,9 +338,12 @@ class GaussianMosaicDataset(Dataset):
         m_idx = np.random.randint(0, len(self.mosaics))
         mosaic = self.mosaics[m_idx]
         
-        full_h, full_w = mosaic['image'].shape
+        # Lazy-load mmap purely inside worker (FIX 1 cont.)
+        img_mmap = np.load(mosaic['img_path'], mmap_mode='r')
+        
+        full_h, full_w = img_mmap.shape
         py, px = np.random.randint(0, full_h - self.img_size), np.random.randint(0, full_w - self.img_size)
-        clean_physics = mosaic['image'][py:py+self.img_size, px:px+self.img_size].copy()
+        clean_physics = img_mmap[py:py+self.img_size, px:px+self.img_size].copy()
         
         # Metadata-driven sky injection
         exp_time, zp, sky_mag = mosaic['exp_time'], mosaic['zp'], mosaic['sky_mag']
@@ -357,7 +358,7 @@ class GaussianMosaicDataset(Dataset):
         normalized_image = self.transform.image_to_network(img_noisy, chunk_median)
         image_tensor = torch.from_numpy(normalized_image).unsqueeze(0).float()
 
-        # Fast JIT Target Grid Construction (Vectorized star filtering)
+        # Fast JIT Target Grid Construction
         s_start, s_end = self.star_offsets[m_idx], self.star_offsets[m_idx+1]
         m_stars = self.all_stars[s_start:s_end]
         
@@ -368,7 +369,6 @@ class GaussianMosaicDataset(Dataset):
         if len(local_stars) == 0:
             grid_stars = torch.zeros((self.grid_size, self.grid_size, self.K, 5 + self.S**2), dtype=torch.float32)
         else:
-            # Sort by flux (descending) once
             sort_idx = np.argsort(local_stars[:, 2])[::-1]
             local_stars = local_stars[sort_idx]
             
@@ -379,6 +379,10 @@ class GaussianMosaicDataset(Dataset):
             cxs = (lx // self.cell_size).astype(int)
             cys = (ly // self.cell_size).astype(int)
             
+            # Vectorize heavy math (FIX 2)
+            snrs = fluxes / np.sqrt(fluxes + sky_level + 25.0)
+            comps = 1.0 / (1.0 + np.exp(-2.0 * (snrs - 5.0)))
+            
             grid_stars_np = np.zeros((self.grid_size, self.grid_size, self.K, 5 + self.S**2), dtype=np.float32)
             counts = np.zeros((self.grid_size, self.grid_size), dtype=np.int32)
             
@@ -388,15 +392,11 @@ class GaussianMosaicDataset(Dataset):
                 
                 slot = counts[cy, cx]
                 if slot < self.K:
-                    flux = float(fluxes[i])
-                    snr = flux / np.sqrt(flux + sky_level + 25.0)
-                    comp = 1.0 / (1.0 + np.exp(-2.0 * (snr - 5.0)))
-                    
                     grid_stars_np[cy, cx, slot, 0] = 1.0
                     grid_stars_np[cy, cx, slot, 1] = float(lx[i] % self.cell_size)
                     grid_stars_np[cy, cx, slot, 2] = float(ly[i] % self.cell_size)
-                    grid_stars_np[cy, cx, slot, 3] = flux
-                    grid_stars_np[cy, cx, slot, 4] = float(comp)
+                    grid_stars_np[cy, cx, slot, 3] = float(fluxes[i])
+                    grid_stars_np[cy, cx, slot, 4] = float(comps[i])
                     grid_stars_np[cy, cx, slot, 5:] = local_stars[i, 4:]
                     
                     counts[cy, cx] += 1
