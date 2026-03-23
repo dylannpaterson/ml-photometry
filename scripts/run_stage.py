@@ -104,6 +104,32 @@ def run_train(stage_idx, config, device):
             cell_size=cell_size,
             global_stretch_scale=stretch_scale
         )
+    elif stage_idx == 1:
+        # NEW: Stage 1 Multi-Telescope Foundation Dataset (Macro-Sparse)
+        from src.data.stage1_dataset import Stage1MacroSparseDataset
+        mosaic_dir = "data/stage1_mosaics"
+        
+        if force_gen or not os.path.exists(mosaic_dir) or not os.listdir(mosaic_dir):
+            print("🛠️ Generating Stage 1 High-Fidelity Mosaics...")
+            os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/generate_stage1_mosaics.py")
+
+        print("🛠️ Using Stage 1 Macro-Sparse Pipeline (Cached Physics, Live Noise)...")
+        train_dataset = Stage1MacroSparseDataset(
+            mosaic_dir,
+            num_samples=data_cfg["num_train_samples"],
+            image_size=data_cfg["image_size"],
+            cell_size=cell_size,
+            K=K,
+            global_stretch_scale=stretch_scale
+        )
+        val_dataset = Stage1MacroSparseDataset(
+            mosaic_dir,
+            num_samples=data_cfg["num_val_samples"],
+            image_size=data_cfg["image_size"],
+            cell_size=cell_size,
+            K=K,
+            global_stretch_scale=stretch_scale
+        )
     else:
         data_dir = stage_cfg["data_dir"]
         train_dir = os.path.join(data_dir, "train")
