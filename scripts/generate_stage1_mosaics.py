@@ -16,41 +16,51 @@ OUTPUT_DIR = "data/stage1_mosaics"
 # Native scales and detector limits
 ARCHETYPE_PARAMS = {
     'roman': {
-        'scale': 0.11, 
-        'jitter': 0.015,
-        'charge_diffusion': 0.035, # Emulate NIR detector smear
-        'full_well': 100000, 
-        'sky': 30.0
+        'scale': 0.11, 'jitter': 0.015, 'charge_diffusion': 0.035,
+        'full_well': 100000, 'sky_mag_arcsec2': 22.0,
+        'zp': 26.5, # Realistic Roman WFI wide-band ZP
+        'exp_time_range': (20.0, 100.0) # Simulate snapshots vs deep stares
     },
     'hubble': {
-        'scale': 0.128, 
-        'jitter': 0.008, 
-        'charge_diffusion': 0.020,
-        'full_well': 80000,  
-        'sky': 20.0
+        'scale': 0.128, 'jitter': 0.008, 'charge_diffusion': 0.020,
+        'full_well': 80000, 'sky_mag_arcsec2': 21.0,
+        'zp': 25.5,
+        'exp_time_range': (100.0, 1000.0)
     },
     'ideal_space': {
-        'scale': 0.10, 
-        'jitter': 0.002, 
-        'charge_diffusion': 0.0,
-        'full_well': 1000000, 
-        'sky': 5.0
+        'scale': 0.10, 'jitter': 0.002, 'charge_diffusion': 0.0,
+        'full_well': 1000000, 'sky_mag_arcsec2': 24.0,
+        'zp': 27.0,
+        'exp_time_range': (50.0, 500.0)
     },
     'ground': {
-        'scale': 0.34, 
-        'jitter': 0.050, 
-        'charge_diffusion': 0.0,
-        'full_well': 200000, 
-        'sky': 150.0 
+        'scale': 0.34, 'jitter': 0.050, 'charge_diffusion': 0.0,
+        'full_well': 200000, 'sky_mag_arcsec2': 16.0, # Bright ground sky
+        'zp': 25.0, # e.g., VISTA 4m telescope
+        'exp_time_range': (5.0, 30.0) # Short IR ground exposures to avoid sky saturation
     }
 }
 
-# --- 1. The Fast Bulge LF Sampler ---
-def sample_bulge_fluxes(n_stars, f_min=10, f_max=10**6.5):
-    """Realistic LF sampling with faint tail extension."""
-    u = np.random.uniform(0, 1, n_stars)
-    fluxes = 10 ** (np.interp(u, [0.0, 0.90, 1.0], [np.log10(f_min), 4.0, np.log10(f_max)])) 
-    return np.sort(fluxes)[::-1] 
+# --- 1. The Dynamic Bulge LF Sampler ---
+def sample_bulge_magnitudes(n_stars, rc_mag, rc_sigma, rc_fraction, m_min=10.0, m_max=26.0):
+    """Samples apparent magnitudes (m). Smaller m = brighter star."""
+    n_rc = int(n_stars * rc_fraction)
+    n_bg = n_stars - n_rc
+
+    # 1. Background (Power law in linear space becomes linear in magnitude space)
+    # Most stars are faint (high magnitude)
+    u = np.random.uniform(0, 1, n_bg)
+    # Background slope randomization
+    m_bg = np.interp(u, [0.0, 0.95, 1.0], [m_max, 18.0, m_min])
+
+    # 2. Red Clump (Gaussian in magnitude space)
+    m_rc = np.random.normal(loc=rc_mag, scale=rc_sigma, size=n_rc)
+
+    # 3. Combine and clip
+    m_all = np.concatenate([m_bg, m_rc])
+    m_all = np.clip(m_all, m_min, m_max)
+
+    return m_all # Return raw magnitudes
 
 # --- 2. The Multi-Telescope Optical Archetypes ---
 def generate_archetype_psf(archetype, lam, params):
@@ -110,7 +120,16 @@ def render_single_mosaic(idx):
     log_min, log_max = np.log10(MIN_STARS), np.log10(MAX_STARS)
     n_detectable = int(10 ** np.random.uniform(log_min, log_max))
     
-    print(f"[{idx+1}/{NUM_MOSAICS}] {archetype.upper()} | {n_detectable:,} stars + Stellar Sea...")
+    # NEW: Draw the specific exposure parameters for this mosaic
+    exp_time = np.random.uniform(*params['exp_time_range'])
+    zp = params['zp']
+    
+    # NEW: The Red Clump is now defined by its Apparent Magnitude (e.g., ~14.5 to 16.5 depending on dust)
+    rc_mag = np.random.uniform(14.5, 16.5)
+    rc_sigma = np.random.uniform(0.2, 0.5)
+    rc_fraction = np.random.uniform(0.05, 0.20)
+    
+    print(f"[{idx+1}/{NUM_MOSAICS}] {archetype.upper()} | t={exp_time:.1f}s | RC_Mag={rc_mag:.1f} | {n_detectable:,} stars")
     start_time = time.time()
 
     # 2. Initialize the clean, empty image
@@ -134,11 +153,27 @@ def render_single_mosaic(idx):
     shape_vector = shape_stamp.array.flatten().tolist()
     
     # 6. Generate Star Catalog (Detectable)
-    fluxes = sample_bulge_fluxes(n_detectable)
+    # 1. Sample purely in Astrophysics (Magnitudes)
+    mags = sample_bulge_magnitudes(n_detectable, rc_mag, rc_sigma, rc_fraction)
+    
+    # 2. Convert to Instrument Physics (Flux Counts)
+    fluxes = exp_time * (10 ** (-0.4 * (mags - zp)))
+    
+    # Sort brightest to faintest (highest flux to lowest flux)
+    sort_idx = np.argsort(fluxes)[::-1]
+    fluxes = fluxes[sort_idx]
+    mags = mags[sort_idx]
+    
     x_coords = np.random.uniform(0, IMAGE_SIZE - 1, n_detectable)
     y_coords = np.random.uniform(0, IMAGE_SIZE - 1, n_detectable)
     
-    catalog_data = {'x': x_coords, 'y': y_coords, 'flux': fluxes, 'shape': [shape_vector] * n_detectable}
+    catalog_data = {
+        'x': x_coords, 'y': y_coords, 'flux': fluxes, 
+        'mag': mags, 'shape': [shape_vector] * n_detectable,
+        'exp_time': [exp_time] * n_detectable,
+        'zp': [zp] * n_detectable,
+        'sky_mag': [params['sky_mag_arcsec2']] * n_detectable
+    }
 
     # 7. Hybrid Rendering
     monster_cutoff = int(n_detectable * 0.02)
@@ -166,12 +201,15 @@ def render_single_mosaic(idx):
     
     # 7c. The "Stellar Sea" (Unresolved mottled background)
     n_unresolved = 2000000
+    # NEW: Sample unresolved sea magnitudes and convert to fluxes
+    unresolved_mags = sample_bulge_magnitudes(n_unresolved, rc_mag, rc_sigma, rc_fraction, m_min=26.0, m_max=32.0)
+    unresolved_fluxes = exp_time * (10 ** (-0.4 * (unresolved_mags - zp)))
+    
     ux = np.random.uniform(0, IMAGE_SIZE-1, n_unresolved)
     uy = np.random.uniform(0, IMAGE_SIZE-1, n_unresolved)
-    uf = sample_bulge_fluxes(n_unresolved, f_min=0.1, f_max=5.0)
     ux0, uy0 = np.floor(ux).astype(int), np.floor(uy).astype(int)
     umask = (ux0 >= 0) & (ux0 < IMAGE_SIZE-1) & (uy0 >= 0) & (uy0 < IMAGE_SIZE-1)
-    np.add.at(crowd_map, (uy0[umask], ux0[umask]), uf[umask])
+    np.add.at(crowd_map, (uy0[umask], ux0[umask]), unresolved_fluxes[umask])
 
     # Fast global FFT convolution
     image.array[:] += fftconvolve(crowd_map, psf_kernel, mode='same')

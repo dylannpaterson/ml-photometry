@@ -8,10 +8,10 @@ from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, GLOBAL_ST
 
 # Architecture Reference from generate_stage1_mosaics.py
 ARCHETYPE_PARAMS = {
-    'roman':       {'scale': 0.11,  'jitter': 0.015, 'full_well': 100000, 'sky': 30.0,  'read_noise': 5.0},
-    'hubble':      {'scale': 0.128, 'jitter': 0.008, 'full_well': 80000,  'sky': 20.0,  'read_noise': 3.0},
-    'ideal_space': {'scale': 0.10,  'jitter': 0.002, 'full_well': 1000000,'sky': 5.0,   'read_noise': 1.0},
-    'ground':      {'scale': 0.34,  'jitter': 0.050, 'full_well': 200000, 'sky': 150.0, 'read_noise': 15.0}
+    'roman':       {'scale': 0.11,  'jitter': 0.015, 'full_well': 100000, 'read_noise': 5.0},
+    'hubble':      {'scale': 0.128, 'jitter': 0.008, 'full_well': 80000,  'read_noise': 3.0},
+    'ideal_space': {'scale': 0.10,  'jitter': 0.002, 'full_well': 1000000,'read_noise': 1.0},
+    'ground':      {'scale': 0.34,  'jitter': 0.050, 'full_well': 200000, 'read_noise': 15.0}
 }
 
 class Stage1MacroSparseDataset(Dataset):
@@ -40,14 +40,34 @@ class Stage1MacroSparseDataset(Dataset):
         self.mosaics = []
         for img_f, cat_f in zip(self.image_files, self.catalog_files):
             # Infer archetype from filename (e.g., mosaic_00_roman.npy)
-            archetype = img_f.split("_")[-1].replace(".npy", "")
+            # Find the archetype part
+            for arch in ARCHETYPE_PARAMS.keys():
+                if arch in img_f:
+                    archetype = arch
+                    break
+            else:
+                archetype = 'roman' # Fallback
+                
             img_mmap = np.load(os.path.join(data_dir, img_f), mmap_mode='r')
             catalog = pd.read_parquet(os.path.join(data_dir, cat_f))
+            
+            # Extract metadata from the catalog if available
+            if 'exp_time' in catalog.columns:
+                exp_time = catalog['exp_time'].iloc[0]
+                zp = catalog['zp'].iloc[0]
+                sky_mag = catalog['sky_mag'].iloc[0]
+                scale = ARCHETYPE_PARAMS[archetype]['scale']
+                # sky_counts_per_pixel = (exp_time * 10**(-0.4*(sky_mag - zp))) * scale^2
+                sky_level = (10 ** (-0.4 * (sky_mag - zp))) * (scale**2) * exp_time
+            else:
+                sky_level = 30.0 # Legacy fallback
+                
             self.mosaics.append({
                 'image': img_mmap, 
                 'catalog': catalog, 
                 'params': ARCHETYPE_PARAMS[archetype],
-                'archetype': archetype
+                'archetype': archetype,
+                'sky_level': sky_level
             })
 
     def __len__(self):
@@ -69,7 +89,7 @@ class Stage1MacroSparseDataset(Dataset):
         # --- NOISE PIPELINE (Live Injection) ---
         
         # 3. Add Sky Background
-        sky_level = params['sky'] * np.random.uniform(0.8, 1.2) # Randomized sky
+        sky_level = mosaic['sky_level'] * np.random.uniform(0.8, 1.2) # Randomized sky
         img_with_sky = clean_physics + sky_level
         
         # 4. Apply Poisson Noise (Photon Noise)
@@ -101,11 +121,11 @@ class Stage1MacroSparseDataset(Dataset):
         local_stars['ly'] = local_stars['y'] - py
         
         # 9. Build Target Grid
+        # NEW: Shape size is now determined by model constants
+        # In this dataset, we use 81 (9x9) which matches SHAPE_SIZE=9 in constants
         grid_stars = torch.zeros((self.grid_size, self.grid_size, self.K, 5 + 81), dtype=torch.float32)
         
         # Assign to slots (Brightest-to-Faint)
-        # We assume catalog is already sorted bright-to-faint globally, 
-        # but we need to ensure per-cell sorting for Stage 1 consistency.
         cell_assignments = {}
         for _, star in local_stars.iterrows():
             cx, cy = int(star['lx'] // self.cell_size), int(star['ly'] // self.cell_size)
@@ -122,8 +142,6 @@ class Stage1MacroSparseDataset(Dataset):
                 star = sorted_stars[slot]
                 
                 # Dynamic Completeness Calculation (Penalized SNR)
-                # For simplicity in Stage 1 pre-training, we use a high-snr proxy
-                # In real missions, we would factor in the local mottled background
                 snr = star['flux'] / np.sqrt(star['flux'] + sky_level + params['read_noise']**2)
                 completeness = 1.0 / (1.0 + np.exp(-2.0 * (snr - 5.0)))
                 
@@ -136,9 +154,6 @@ class Stage1MacroSparseDataset(Dataset):
                 grid_stars[cy, cx, slot, 5:] = torch.from_numpy(star['shape'])
 
         # 10. Background Target
-        # For Stage 1, we target the dynamic sky level + the unresolved sea
-        # The unresolved sea light is already in the 'clean_physics' map (minus detectable stars)
-        # But for training stability, we just target the sky baseline.
         bg_target_linear = sky_level - chunk_median
         bg_grid_stretched = self.transform.target_bg_to_network(np.full((self.grid_size, self.grid_size), bg_target_linear))
         
