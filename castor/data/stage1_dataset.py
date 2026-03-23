@@ -147,10 +147,10 @@ class Stage1MacroSparseDataset(Dataset):
                 
                 # [p, dx, dy, flux, c, shape...]
                 grid_stars[cy, cx, slot, 0] = 1.0 # p
-                grid_stars[cy, cx, slot, 1] = star['lx'] % self.cell_size # dx
-                grid_stars[cy, cx, slot, 2] = star['ly'] % self.cell_size # dy
-                grid_stars[cy, cx, slot, 3] = star['flux']
-                grid_stars[cy, cx, slot, 4] = completeness
+                grid_stars[cy, cx, slot, 1] = float(star['lx'] % self.cell_size) # dx
+                grid_stars[cy, cx, slot, 2] = float(star['ly'] % self.cell_size) # dy
+                grid_stars[cy, cx, slot, 3] = float(star['flux'])
+                grid_stars[cy, cx, slot, 4] = float(completeness)
                 grid_stars[cy, cx, slot, 5:] = torch.from_numpy(star['shape'].copy())
 
         # 10. Background Target

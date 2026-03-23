@@ -256,6 +256,9 @@ class GaussianPretrainingProvider(Dataset):
         }
 
 class GaussianMosaicDataset(Dataset):
+    # Class-level cache to share index between train and val
+    _STAR_INDEX_CACHE = {}
+
     def __init__(self, data_dir, num_samples=25000, image_size=256, cell_size=DEFAULT_CELL_SIZE, global_stretch_scale=GLOBAL_STRETCH_SCALE):
         self.data_dir = data_dir
         self.num_samples = num_samples
@@ -269,52 +272,66 @@ class GaussianMosaicDataset(Dataset):
         if not self.image_files:
             raise FileNotFoundError(f"No mosaics found in {data_dir}.")
             
-        print(f"🚀 Optimizing Stage 0: Indexing {len(self.image_files)} mosaics for High-Speed training...")
-        
-        self.mosaics = []
-        all_stars = []
-        star_offsets = [0]
-        
-        for i, img_f in enumerate(self.image_files):
-            base = img_f.replace("_img.npy", "")
-            cat_f = [f for f in os.listdir(data_dir) if f.startswith(base) and f.endswith(".parquet")]
-            if not cat_f: continue
+        # Check if we already have this index cached
+        cache_key = os.path.abspath(data_dir)
+        if cache_key in self._STAR_INDEX_CACHE:
+            print(f"🚀 Reusing cached Stage 0 Star Index for {data_dir}...")
+            cached_data = self._STAR_INDEX_CACHE[cache_key]
+            self.mosaics = cached_data['mosaics']
+            self.all_stars = cached_data['all_stars']
+            self.star_offsets = cached_data['star_offsets']
+        else:
+            print(f"🚀 Optimizing Stage 0: Indexing {len(self.image_files)} mosaics for High-Speed training...")
             
-            img_path = os.path.join(data_dir, img_f)
-            cat_path = os.path.join(data_dir, cat_f[0])
+            self.mosaics = []
+            all_stars = []
+            star_offsets = [0]
             
-            img_mmap = np.load(img_path, mmap_mode='r')
-            cat = pd.read_parquet(cat_path)
+            for i, img_f in enumerate(self.image_files):
+                base = img_f.replace("_img.npy", "")
+                cat_f = [f for f in os.listdir(data_dir) if f.startswith(base) and f.endswith(".parquet")]
+                if not cat_f: continue
+                
+                img_path = os.path.join(data_dir, img_f)
+                cat_path = os.path.join(data_dir, cat_f[0])
+                
+                img_mmap = np.load(img_path, mmap_mode='r')
+                cat = pd.read_parquet(cat_path)
+                
+                # Store image mmap + metadata
+                self.mosaics.append({
+                    'image': img_mmap,
+                    'exp_time': cat['exp_time'].iloc[0] if 'exp_time' in cat.columns else 54.0,
+                    'zp': cat['zp'].iloc[0] if 'zp' in cat.columns else 26.5,
+                    'sky_mag': cat['sky_mag'].iloc[0] if 'sky_mag' in cat.columns else 22.0
+                })
+                
+                # Extract essential star data into a compact array
+                # x, y, flux, mag, shape(81)
+                stars = np.zeros((len(cat), 4 + self.S**2), dtype=np.float32)
+                stars[:, 0] = cat['x'].values
+                stars[:, 1] = cat['y'].values
+                stars[:, 2] = cat['flux'].values
+                stars[:, 3] = cat['mag'].values
+                
+                # Flatten shapes
+                shapes = np.stack(cat['shape'].values)
+                stars[:, 4:] = shapes
+                
+                all_stars.append(stars)
+                star_offsets.append(star_offsets[-1] + len(stars))
+                
+            # Concatenate into one massive array
+            self.all_stars = np.concatenate(all_stars, axis=0)
+            self.star_offsets = np.array(star_offsets)
+            print(f"✅ Indexed {len(self.all_stars)} stars into compact memory ({(self.all_stars.nbytes / 1e6):.1f} MB)")
             
-            # Store image mmap + metadata
-            self.mosaics.append({
-                'image': img_mmap,
-                'exp_time': cat['exp_time'].iloc[0] if 'exp_time' in cat.columns else 54.0,
-                'zp': cat['zp'].iloc[0] if 'zp' in cat.columns else 26.5,
-                'sky_mag': cat['sky_mag'].iloc[0] if 'sky_mag' in cat.columns else 22.0
-            })
-            
-            # Extract essential star data into a compact array
-            # x, y, flux, mag, shape(81)
-            # We keep it as a flat array for memory efficiency
-            # shape: [N, 4 + 81] = [N, 85]
-            stars = np.zeros((len(cat), 4 + self.S**2), dtype=np.float32)
-            stars[:, 0] = cat['x'].values
-            stars[:, 1] = cat['y'].values
-            stars[:, 2] = cat['flux'].values
-            stars[:, 3] = cat['mag'].values
-            
-            # Flatten shapes
-            shapes = np.stack(cat['shape'].values) # [N, 81]
-            stars[:, 4:] = shapes
-            
-            all_stars.append(stars)
-            star_offsets.append(star_offsets[-1] + len(stars))
-            
-        # Concatenate into one massive array
-        self.all_stars = np.concatenate(all_stars, axis=0)
-        self.star_offsets = np.array(star_offsets)
-        print(f"✅ Indexed {len(self.all_stars)} stars into compact memory ({(self.all_stars.nbytes / 1e6):.1f} MB)")
+            # Save to class-level cache
+            self._STAR_INDEX_CACHE[cache_key] = {
+                'mosaics': self.mosaics,
+                'all_stars': self.all_stars,
+                'star_offsets': self.star_offsets
+            }
 
     def __len__(self):
         return self.num_samples
@@ -350,7 +367,6 @@ class GaussianMosaicDataset(Dataset):
         local_stars = m_stars[mask]
         lx = local_stars[:, 0] - px
         ly = local_stars[:, 1] - py
-        fluxes = local_stars[:, 2]
         
         grid_stars = torch.zeros((self.grid_size, self.grid_size, self.K, 5 + self.S**2), dtype=torch.float32)
         
@@ -371,15 +387,15 @@ class GaussianMosaicDataset(Dataset):
             for slot in range(min(self.K, len(sorted_indices))):
                 idx = sorted_indices[slot]
                 star = local_stars[idx]
-                flux = star[2]
+                flux = float(star[2])
                 snr = flux / np.sqrt(flux + sky_level + 25.0)
                 comp = 1.0 / (1.0 + np.exp(-2.0 * (snr - 5.0)))
                 
                 grid_stars[cy, cx, slot, 0] = 1.0
-                grid_stars[cy, cx, slot, 1] = lx[idx] % self.cell_size
-                grid_stars[cy, cx, slot, 2] = ly[idx] % self.cell_size
+                grid_stars[cy, cx, slot, 1] = float(lx[idx] % self.cell_size)
+                grid_stars[cy, cx, slot, 2] = float(ly[idx] % self.cell_size)
                 grid_stars[cy, cx, slot, 3] = flux
-                grid_stars[cy, cx, slot, 4] = comp
+                grid_stars[cy, cx, slot, 4] = float(comp)
                 grid_stars[cy, cx, slot, 5:] = torch.from_numpy(star[4:].copy())
 
         bg_target_linear = sky_level - chunk_median
