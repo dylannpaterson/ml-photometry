@@ -2,9 +2,10 @@ import argparse
 import os
 import torch
 import numpy as np
-from src.data.stage0_gaussian import GaussianPretrainingProvider
-from src.cloud.config_utils import load_config
+from castor.data.stage0_gaussian import GaussianPretrainingProvider
+from castor.cloud.config_utils import load_config
 import shutil
+from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE
 
 def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     """Generates a large mosaic and saves it compactly as dense arrays."""
@@ -86,8 +87,10 @@ def main():
     
     mos_cfg = stage_cfg.get("mosaic_params", {"num_mosaics": 10, "mosaic_size": 4088})
     num_mosaics = mos_cfg["num_mosaics"]
+    if args.num is not None:
+        num_mosaics = args.num
     mosaic_size = mos_cfg["mosaic_size"]
-    cell_size = stage_cfg.get("cell_size", 4)
+    cell_size = stage_cfg.get("cell_size", DEFAULT_CELL_SIZE)
     
     output_dir = os.path.join(stage_cfg["data_dir"], "mosaics")
     if os.path.exists(output_dir):
@@ -98,8 +101,8 @@ def main():
         "min_stars": data_cfg["min_stars"],
         "max_stars": data_cfg["max_stars"],
         "image_size": data_cfg["image_size"],
-        "max_capacity_per_cell": data_cfg["max_capacity_per_cell"],
-        "shape_size": data_cfg.get("shape_size", 9)
+        "max_capacity_per_cell": data_cfg.get("max_capacity_per_cell", MAX_CAPACITY_PER_CELL),
+        "shape_size": data_cfg.get("shape_size", SHAPE_SIZE)
     }
     
     for i in range(num_mosaics):

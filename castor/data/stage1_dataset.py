@@ -3,7 +3,8 @@ import torch
 import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset
-from src.data.transforms import AstroSpaceTransform
+from castor.data.transforms import AstroSpaceTransform
+from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, GLOBAL_STRETCH_SCALE
 
 # Architecture Reference from generate_stage1_mosaics.py
 ARCHETYPE_PARAMS = {
@@ -18,7 +19,7 @@ class Stage1MacroSparseDataset(Dataset):
     Implements the 'Cached Physics, Live Noise' pipeline for Stage 1.
     Loads clean physics mosaics and injects noise/detector effects on the fly.
     """
-    def __init__(self, data_dir, num_samples=50000, image_size=256, cell_size=4, K=3, global_stretch_scale=10.0):
+    def __init__(self, data_dir, num_samples=50000, image_size=256, cell_size=DEFAULT_CELL_SIZE, K=MAX_CAPACITY_PER_CELL, global_stretch_scale=GLOBAL_STRETCH_SCALE):
         self.data_dir = data_dir
         self.num_samples = num_samples
         self.img_size = image_size
@@ -26,6 +27,7 @@ class Stage1MacroSparseDataset(Dataset):
         self.grid_size = image_size // cell_size
         self.K = K
         self.transform = AstroSpaceTransform(stretch_scale=global_stretch_scale)
+
         
         # 1. Discover Mosaics
         self.image_files = sorted([f for f in os.listdir(data_dir) if f.endswith(".npy")])

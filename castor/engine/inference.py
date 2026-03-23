@@ -5,7 +5,8 @@ from matplotlib.colors import LogNorm
 import os
 from scipy.ndimage import zoom
 from astropy.io import fits
-from src.data.transforms import AstroSpaceTransform
+from castor.data.transforms import AstroSpaceTransform
+from castor.constants import GLOBAL_STRETCH_SCALE
 
 def upsample_background(bg_map, target_size):
     """
@@ -33,7 +34,7 @@ class InferenceEngine:
         self.device = device
         self.config = config
         self.img_size = config["data_params"]["image_size"]
-        self.stretch_scale = config["data_params"].get("GLOBAL_STRETCH_SCALE", 10.0)
+        self.stretch_scale = config["data_params"].get("GLOBAL_STRETCH_SCALE", GLOBAL_STRETCH_SCALE)
         self.transform = AstroSpaceTransform(stretch_scale=self.stretch_scale)
 
     def predict(self, image_tensor, threshold=0.5):
@@ -62,7 +63,7 @@ class InferenceEngine:
         return predicted_stars, predicted_shapes, bg_map
 
     def visualize(self, image_tensor, true_catalogue, predicted_stars, predicted_shapes, bg_map, gt_bg_map, threshold, chunk_median=0.0, output_path="inference_comparison.png"):
-        from src.engine.evaluator import match_stars
+        from castor.engine.evaluator import match_stars
         from mpl_toolkits.axes_grid1 import make_axes_locatable
         
         img_stretched = image_tensor.squeeze().numpy()
@@ -186,8 +187,19 @@ class InferenceEngine:
             ax8.set_aspect('equal')
             ax8.grid(True, alpha=0.3)
 
-        # NEW: Completeness (SNR Proxy) Histogram for Missed Stars
-        ax9 = fig.add_subplot(gs[3:, 1])
+            # NEW: Flux Distribution Histogram
+            ax_hist = fig.add_subplot(gs[3, 1])
+            bins = np.linspace(mmin, mmax, 30)
+            ax_hist.hist(true_mags, bins=bins, alpha=0.3, label='True', color='gray')
+            ax_hist.hist(pred_mags, bins=bins, alpha=0.5, label='Predicted', color='C0', histtype='step', linewidth=2)
+            ax_hist.set_xlabel("log10(Flux)")
+            ax_hist.set_ylabel("Count")
+            ax_hist.set_title("Flux Distribution Comparison")
+            ax_hist.legend()
+            ax_hist.grid(True, alpha=0.2)
+
+        # Completeness (SNR Proxy) Histogram for Missed Stars
+        ax9 = fig.add_subplot(gs[4, 1])
         missed_comps = [true_catalogue[i][3] for i in range(len(true_catalogue)) if i not in matched_true_indices]
         matched_comps = [true_catalogue[i][3] for i in matched_true_indices]
         

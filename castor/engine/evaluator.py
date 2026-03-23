@@ -1,7 +1,8 @@
 import torch
 import numpy as np
 from scipy.spatial import cKDTree
-from src.data.transforms import AstroSpaceTransform
+from castor.data.transforms import AstroSpaceTransform
+from castor.constants import MAX_CAPACITY_PER_CELL, GLOBAL_STRETCH_SCALE
 
 def match_stars(true_stars, pred_stars, distance_threshold=2.0, flux_threshold_dex=0.5):
     """
@@ -74,8 +75,8 @@ class Evaluator:
         self.device = device
         self.config = config
         self.stage_idx = stage_idx
-        self.K = config["data_params"]["max_capacity_per_cell"]
-        self.stretch_scale = config["data_params"].get("GLOBAL_STRETCH_SCALE", 10.0)
+        self.K = config["data_params"].get("max_capacity_per_cell", MAX_CAPACITY_PER_CELL)
+        self.stretch_scale = config["data_params"].get("GLOBAL_STRETCH_SCALE", GLOBAL_STRETCH_SCALE)
         self.transform = AstroSpaceTransform(stretch_scale=self.stretch_scale)
 
     def run_evaluation(self, num_chunks=100, threshold=0.5):
@@ -94,7 +95,7 @@ class Evaluator:
 
         # Stage-specific data generation
         if self.stage_idx == 0:
-            from src.data.stage0_gaussian import GaussianPretrainingProvider
+            from castor.data.stage0_gaussian import GaussianPretrainingProvider
             data_cfg = self.config["data_params"]
             provider = GaussianPretrainingProvider(
                 min_stars=data_cfg["min_stars"],

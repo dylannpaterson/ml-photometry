@@ -4,7 +4,8 @@ from torch.utils.data import DataLoader
 import os
 import time
 import re
-from src.models.dense_grid import compute_grid_loss
+from castor.models.dense_grid import compute_grid_loss
+from castor.constants import GLOBAL_STRETCH_SCALE
 
 def find_latest_checkpoint(checkpoint_dir="checkpoints", prefix="stage0"):
     if not os.path.exists(checkpoint_dir): return None, 0
@@ -31,7 +32,7 @@ class Trainer:
         
         # Extract loss parameters from config
         self.loss_params = config["data_params"].get("loss_params", {}).copy()
-        self.loss_params["stretch_scale"] = config["data_params"].get("GLOBAL_STRETCH_SCALE", 10.0)
+        self.loss_params["stretch_scale"] = GLOBAL_STRETCH_SCALE
 
     def resume(self, checkpoint_path=None):
         if checkpoint_path is None:

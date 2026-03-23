@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 import numpy as np
+from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE
 
 class CoordConv(nn.Module):
     """Adds normalized (x, y) coordinate channels to the input."""
@@ -63,7 +64,7 @@ class DiffractionAwareFilter(nn.Module):
         return torch.cat([x, self.conv(x)], dim=1)
 
 class DenseGridModel(nn.Module):
-    def __init__(self, K=3, shape_size=9, cell_size=4):
+    def __init__(self, K=MAX_CAPACITY_PER_CELL, shape_size=SHAPE_SIZE, cell_size=DEFAULT_CELL_SIZE):
         super(DenseGridModel, self).__init__()
         self.K = K
         self.S2 = shape_size * shape_size
@@ -150,7 +151,7 @@ class DenseGridModel(nn.Module):
             "background": bg
         }
 
-def compute_grid_loss(preds, targets, lambda_prob=5.0, lambda_pos=50.0, lambda_flux=5.0, lambda_comp=1.0, lambda_shape=1.0, lambda_bg=0.1, focal_alpha=0.75, focal_gamma=2.0, stretch_scale=10.0):
+def compute_grid_loss(preds, targets, lambda_prob=5.0, lambda_pos=50.0, lambda_flux=5.0, lambda_comp=1.0, lambda_shape=1.0, lambda_bg=0.1, focal_alpha=0.75, focal_gamma=2.0, stretch_scale=GLOBAL_STRETCH_SCALE):
     """
     Standard Generative Loss without TV regularization (optimized for speed).
     Maintains positional weighting and faint-star boost.

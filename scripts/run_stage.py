@@ -3,15 +3,16 @@ import torch
 import numpy as np
 import os
 import sys
-from src.cloud.config_utils import load_config
-from src.models.dense_grid import DenseGridModel
-from src.data.dataset import PregeneratedDataset
-from src.engine.trainer import Trainer
-from src.engine.evaluator import Evaluator
+from castor.cloud.config_utils import load_config
+from castor.models.dense_grid import DenseGridModel
+from castor.data.dataset import PregeneratedDataset
+from castor.engine.trainer import Trainer
+from castor.engine.evaluator import Evaluator
 # Removed top-level InferenceEngine import
-from src.engine.analyzer import ThresholdAnalyzer
-from src.data.stage0_gaussian import GaussianPretrainingProvider
+from castor.engine.analyzer import ThresholdAnalyzer
+from castor.data.stage0_gaussian import GaussianPretrainingProvider
 from torch.utils.data import DataLoader
+from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE
 
 def get_stage_config(config, stage_idx):
     """Extracts configuration for a specific curriculum stage."""
@@ -34,10 +35,10 @@ def load_stage_model(stage_idx, device, config, checkpoint_path=None):
     stage_key = f"stage{stage_idx}"
     stage_cfg = config["curriculum"].get(stage_key, {})
     
-    K = data_cfg["max_capacity_per_cell"]
-    S = data_cfg["shape_size"]
-    # Get cell_size from stage config, default to 4
-    cell_size = stage_cfg.get("cell_size", 4)
+    K = data_cfg.get("max_capacity_per_cell", MAX_CAPACITY_PER_CELL)
+    S = data_cfg.get("shape_size", SHAPE_SIZE)
+    # Get cell_size from stage config, default to DEFAULT_CELL_SIZE
+    cell_size = stage_cfg.get("cell_size", DEFAULT_CELL_SIZE)
     
     model = DenseGridModel(K=K, shape_size=S, cell_size=cell_size).to(device)
     
@@ -71,10 +72,10 @@ def run_train(stage_idx, config, device):
                     os.remove(os.path.join(checkpoint_dir, f))
 
     # Data Setup
-    K = data_cfg["max_capacity_per_cell"]
-    S = data_cfg["shape_size"]
-    cell_size = stage_cfg.get("cell_size", 4)
-    stretch_scale = data_cfg.get("GLOBAL_STRETCH_SCALE", 10.0)
+    K = data_cfg.get("max_capacity_per_cell", MAX_CAPACITY_PER_CELL)
+    S = data_cfg.get("shape_size", SHAPE_SIZE)
+    cell_size = stage_cfg.get("cell_size", DEFAULT_CELL_SIZE)
+    stretch_scale = data_cfg.get("GLOBAL_STRETCH_SCALE", GLOBAL_STRETCH_SCALE)
 
     if stage_idx == 0:
         mosaic_dir = os.path.join(stage_cfg["data_dir"], "mosaics")
@@ -87,7 +88,7 @@ def run_train(stage_idx, config, device):
             # Use the correct config file path
             os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/generate_mosaics.py --num {num_mos} --stage {stage_idx} --config {cfg_path}")
 
-        from src.data.stage0_gaussian import GaussianMosaicDataset
+        from castor.data.stage0_gaussian import GaussianMosaicDataset
         print("🛠️ Using Mosaic Sampling for high-speed training & validation...")
         train_dataset = GaussianMosaicDataset(
             mosaic_dir,
@@ -106,7 +107,7 @@ def run_train(stage_idx, config, device):
         )
     elif stage_idx == 1:
         # NEW: Stage 1 Multi-Telescope Foundation Dataset (Macro-Sparse)
-        from src.data.stage1_dataset import Stage1MacroSparseDataset
+        from castor.data.stage1_dataset import Stage1MacroSparseDataset
         mosaic_dir = "data/stage1_mosaics"
         
         if force_gen or not os.path.exists(mosaic_dir) or not os.listdir(mosaic_dir):
@@ -187,8 +188,8 @@ def run_eval(stage_idx, config, device, checkpoint=None):
         print(f"⚠️ Specialized evaluator for stage {stage_idx} not yet implemented.")
 
 def run_infer(stage_idx, config, device, checkpoint=None):
-    from src.engine.evaluator import match_stars
-    from src.engine.inference import InferenceEngine
+    from castor.engine.evaluator import match_stars
+    from castor.engine.inference import InferenceEngine
     print(f"--- 🛰️ Curriculum Stage {stage_idx}: Inference ---")
     model = load_stage_model(stage_idx, device, config, checkpoint)
     if not model: return

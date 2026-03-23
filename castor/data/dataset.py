@@ -1,10 +1,11 @@
 import os
 import torch
 from torch.utils.data import Dataset
+from castor.constants import MAX_CAPACITY_PER_CELL, SHAPE_SIZE
 
 class PregeneratedDataset(Dataset):
     """Dataset that loads sparse samples and re-densifies them on the fly."""
-    def __init__(self, data_dir, K=3, shape_size=9):
+    def __init__(self, data_dir, K=MAX_CAPACITY_PER_CELL, shape_size=SHAPE_SIZE):
         self.data_dir = data_dir
         self.K = K
         self.S2 = shape_size * shape_size

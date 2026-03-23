@@ -1,8 +1,8 @@
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from src.engine.evaluator import match_stars
-from src.data.transforms import AstroSpaceTransform
+from castor.engine.evaluator import match_stars
+from castor.data.transforms import AstroSpaceTransform
 
 class ThresholdAnalyzer:
     def __init__(self, model, device, dataset):

@@ -4,10 +4,11 @@ from torch.utils.data import Dataset
 import matplotlib.pyplot as plt
 import os
 from scipy.ndimage import gaussian_filter
-from src.data.transforms import AstroSpaceTransform
+from castor.data.transforms import AstroSpaceTransform
+from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE
 
 class GaussianPretrainingProvider(Dataset):
-    def __init__(self, num_samples=1000, min_stars=100, max_stars=1500, image_size=256, max_capacity_per_cell=3, shape_size=7, use_fixed_seed=False, global_stretch_scale=10.0, min_snr=5.0):
+    def __init__(self, num_samples=1000, min_stars=100, max_stars=1500, image_size=256, max_capacity_per_cell=MAX_CAPACITY_PER_CELL, shape_size=SHAPE_SIZE, use_fixed_seed=False, global_stretch_scale=GLOBAL_STRETCH_SCALE, min_snr=5.0):
         """
         Generates realistic synthetic data for the Roman Bulge Time Domain Survey.
         Vectorized for speed.
@@ -23,8 +24,8 @@ class GaussianPretrainingProvider(Dataset):
         self.min_snr = min_snr
         self.transform = AstroSpaceTransform(stretch_scale=global_stretch_scale)
 
-        # Grid parameters: 4x4 cells for 256x256 image = 64x64 grid
-        self.cell_size = 4
+        # Grid parameters: DEFAULT_CELL_SIZE x DEFAULT_CELL_SIZE cells
+        self.cell_size = DEFAULT_CELL_SIZE
         self.grid_size = self.img_size // self.cell_size
         
         # Pre-allocate coordinate grids for vectorization
