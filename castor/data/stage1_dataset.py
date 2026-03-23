@@ -151,7 +151,7 @@ class Stage1MacroSparseDataset(Dataset):
                 grid_stars[cy, cx, slot, 2] = star['ly'] % self.cell_size # dy
                 grid_stars[cy, cx, slot, 3] = star['flux']
                 grid_stars[cy, cx, slot, 4] = completeness
-                grid_stars[cy, cx, slot, 5:] = torch.from_numpy(star['shape'])
+                grid_stars[cy, cx, slot, 5:] = torch.from_numpy(star['shape'].copy())
 
         # 10. Background Target
         bg_target_linear = sky_level - chunk_median

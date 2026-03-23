@@ -333,7 +333,7 @@ class GaussianMosaicDataset(Dataset):
                 grid_stars[cy, cx, slot, 2] = star['ly'] % self.cell_size
                 grid_stars[cy, cx, slot, 3] = star['flux']
                 grid_stars[cy, cx, slot, 4] = comp
-                grid_stars[cy, cx, slot, 5:] = torch.from_numpy(star['shape'])
+                grid_stars[cy, cx, slot, 5:] = torch.from_numpy(star['shape'].copy())
 
         bg_target_linear = sky_level - chunk_median
         bg_grid_stretched = self.transform.target_bg_to_network(np.full((self.grid_size, self.grid_size), bg_target_linear))
