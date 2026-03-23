@@ -15,7 +15,7 @@ except ImportError:
     galsim = None
 
 # --- 1. The Dynamic Bulge LF Sampler (RC Prior) ---
-def sample_bulge_magnitudes(n_stars, rc_mag, rc_sigma, rc_fraction, m_min=10.0, m_max=26.0):
+def sample_bulge_magnitudes(n_stars, rc_mag, rc_sigma, rc_fraction, m_min=12.0, m_max=26.0):
     """Samples apparent magnitudes (m). Smaller m = brighter star."""
     n_rc = int(n_stars * rc_fraction)
     n_bg = n_stars - n_rc
@@ -133,7 +133,7 @@ class GaussianPretrainingProvider(Dataset):
             rc_loc, rc_scale, rc_fraction = rc_params
 
         if exp_params is None:
-            exp_time = np.random.uniform(20.0, 100.0)
+            exp_time = np.random.uniform(40.0, 80.0)
             zp = 26.5
             sky_mag = 22.0
         else:
