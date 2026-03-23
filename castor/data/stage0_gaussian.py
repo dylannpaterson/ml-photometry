@@ -365,38 +365,43 @@ class GaussianMosaicDataset(Dataset):
                (m_stars[:, 1] >= py) & (m_stars[:, 1] < py + self.img_size)
         
         local_stars = m_stars[mask]
-        lx = local_stars[:, 0] - px
-        ly = local_stars[:, 1] - py
-        
-        grid_stars = torch.zeros((self.grid_size, self.grid_size, self.K, 5 + self.S**2), dtype=torch.float32)
-        
-        # We still need to group by cell, but now it's much faster
-        cxs = (lx // self.cell_size).astype(int)
-        cys = (ly // self.cell_size).astype(int)
-        
-        cell_assignments = {}
-        for i in range(len(local_stars)):
-            cx, cy = cxs[i], cys[i]
-            if cx < 0 or cx >= self.grid_size or cy < 0 or cy >= self.grid_size: continue
-            if (cy, cx) not in cell_assignments: cell_assignments[(cy, cx)] = []
-            cell_assignments[(cy, cx)].append(i)
+        if len(local_stars) == 0:
+            grid_stars = torch.zeros((self.grid_size, self.grid_size, self.K, 5 + self.S**2), dtype=torch.float32)
+        else:
+            # Sort by flux (descending) once
+            sort_idx = np.argsort(local_stars[:, 2])[::-1]
+            local_stars = local_stars[sort_idx]
             
-        for (cy, cx), star_indices in cell_assignments.items():
-            # Sort by flux (star[:, 2])
-            sorted_indices = sorted(star_indices, key=lambda i: local_stars[i, 2], reverse=True)
-            for slot in range(min(self.K, len(sorted_indices))):
-                idx = sorted_indices[slot]
-                star = local_stars[idx]
-                flux = float(star[2])
-                snr = flux / np.sqrt(flux + sky_level + 25.0)
-                comp = 1.0 / (1.0 + np.exp(-2.0 * (snr - 5.0)))
+            lx = local_stars[:, 0] - px
+            ly = local_stars[:, 1] - py
+            fluxes = local_stars[:, 2]
+            
+            cxs = (lx // self.cell_size).astype(int)
+            cys = (ly // self.cell_size).astype(int)
+            
+            grid_stars_np = np.zeros((self.grid_size, self.grid_size, self.K, 5 + self.S**2), dtype=np.float32)
+            counts = np.zeros((self.grid_size, self.grid_size), dtype=np.int32)
+            
+            for i in range(len(local_stars)):
+                cx, cy = cxs[i], cys[i]
+                if cx < 0 or cx >= self.grid_size or cy < 0 or cy >= self.grid_size: continue
                 
-                grid_stars[cy, cx, slot, 0] = 1.0
-                grid_stars[cy, cx, slot, 1] = float(lx[idx] % self.cell_size)
-                grid_stars[cy, cx, slot, 2] = float(ly[idx] % self.cell_size)
-                grid_stars[cy, cx, slot, 3] = flux
-                grid_stars[cy, cx, slot, 4] = float(comp)
-                grid_stars[cy, cx, slot, 5:] = torch.from_numpy(star[4:].copy())
+                slot = counts[cy, cx]
+                if slot < self.K:
+                    flux = float(fluxes[i])
+                    snr = flux / np.sqrt(flux + sky_level + 25.0)
+                    comp = 1.0 / (1.0 + np.exp(-2.0 * (snr - 5.0)))
+                    
+                    grid_stars_np[cy, cx, slot, 0] = 1.0
+                    grid_stars_np[cy, cx, slot, 1] = float(lx[i] % self.cell_size)
+                    grid_stars_np[cy, cx, slot, 2] = float(ly[i] % self.cell_size)
+                    grid_stars_np[cy, cx, slot, 3] = flux
+                    grid_stars_np[cy, cx, slot, 4] = float(comp)
+                    grid_stars_np[cy, cx, slot, 5:] = local_stars[i, 4:]
+                    
+                    counts[cy, cx] += 1
+            
+            grid_stars = torch.from_numpy(grid_stars_np)
 
         bg_target_linear = sky_level - chunk_median
         bg_grid_stretched = self.transform.target_bg_to_network(np.full((self.grid_size, self.grid_size), bg_target_linear, dtype=np.float32))
