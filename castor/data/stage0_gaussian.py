@@ -223,9 +223,16 @@ class GaussianPretrainingProvider(Dataset):
         target = torch.cat([torch.from_numpy(base_grid).view(self.grid_size, self.grid_size, -1), 
                             torch.from_numpy(bg_grid).unsqueeze(-1)], dim=-1)
 
-        return {"image": torch.from_numpy(normalized_image).unsqueeze(0), "raw_image": torch.from_numpy(raw_image), 
-                "physics_image": torch.from_numpy(star_signal), "target": target, "chunk_median": float(chunk_median), 
-                "catalog": pd.DataFrame(catalog_stars)}
+        return {
+            "image": torch.from_numpy(normalized_image).unsqueeze(0), 
+            "raw_image": torch.from_numpy(raw_image), 
+            "physics_image": torch.from_numpy(star_signal), 
+            "target": target, 
+            "chunk_median": float(chunk_median), 
+            "catalog": pd.DataFrame(catalog_stars),
+            "base_grid": torch.from_numpy(base_grid),
+            "background_map": torch.from_numpy(bg_grid)
+        }
 
 class GaussianMosaicDataset(Dataset):
     def __init__(self, data_dir, num_samples=25000, image_size=256, cell_size=DEFAULT_CELL_SIZE, global_stretch_scale=GLOBAL_STRETCH_SCALE):
