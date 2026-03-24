@@ -12,7 +12,7 @@ curriculum:
     epochs: 100
     batch_size: 256
     learning_rate: 0.0001
-    num_workers: 4
+    num_workers: 3
     resume_from_last_stage: false
     cell_size: 4 # Centralized default: 4
     mosaic_params:
@@ -27,7 +27,7 @@ curriculum:
     epochs: 50
     batch_size: 128
     learning_rate: 0.0001
-    num_workers: 4
+    num_workers: 3
     resume_from_last_stage: true
     mosaic_params:
       num_mosaics: 200

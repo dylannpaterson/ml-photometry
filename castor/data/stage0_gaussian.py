@@ -9,6 +9,7 @@ from scipy.signal import fftconvolve
 from castor.data.transforms import AstroSpaceTransform
 from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE
 from numba import njit
+import gc
 
 try:
     import galsim
@@ -241,8 +242,9 @@ class GaussianMosaicDataset(Dataset):
         self.active_mosaic_idx = -1
         self.active_img = None
         self.active_cat = None
-        self.samples_from_current = 0
-        self.max_samples_per_mosaic = 200 # Rotate every 200 samples
+        self.max_samples_per_mosaic = 384 
+        # STAGGER: Start each worker at a random point in its cycle to prevent thundering herd IO
+        self.samples_from_current = np.random.randint(0, self.max_samples_per_mosaic)
         
         # Load mosaic manifests
         self.mosaics = []
@@ -266,12 +268,16 @@ class GaussianMosaicDataset(Dataset):
             print(f"⚠️ Warning: No optimized mosaics found in {data_dir}. Check generation script.")
 
     def _load_mosaic_to_ram(self, m_idx):
-        """Sequential block read into RAM to bypass choked SSD IOPS."""
+        """Sequential block read into RAM with aggressive GC to prevent OOM spikes."""
+        # 1. Nuke old data and force reclaim
+        self.active_img = None
+        self.active_cat = None
+        gc.collect()
+        
         mosaic = self.mosaics[m_idx]
         self.active_img = np.load(mosaic['img_path'])
         
         cat_raw = np.load(mosaic['cat_path'])
-        # Sort by Y for binary search optimization
         self.active_cat = cat_raw[np.argsort(cat_raw['y'])]
         
         self.active_mosaic_idx = m_idx
@@ -282,7 +288,6 @@ class GaussianMosaicDataset(Dataset):
     def __getitem__(self, idx):
         # 1. Manage RAM Cache
         if self.active_mosaic_idx == -1 or self.samples_from_current >= self.max_samples_per_mosaic:
-            # Important: Use fresh random for workers
             new_idx = np.random.randint(0, len(self.mosaics))
             self._load_mosaic_to_ram(new_idx)
             
