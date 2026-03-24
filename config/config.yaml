@@ -44,13 +44,9 @@ curriculum:
     resume_from_last_stage: true
 
 data_params:
-  # Increased samples to cover the 500 unique parameter states
-  num_train_samples: 100000 
-  num_val_samples: 5000
-  
-  # Star density per 256x256 crop
-  min_stars: 200
-  max_stars: 5000
+  # Massive unified population to hit VVV background levels
+  min_stars: 1000000
+  max_stars: 8000000
   
   image_size: 256
   
