@@ -6,7 +6,6 @@ import numpy as np
 def _get_jax_renderer():
     """Returns a JIT-compiled JAX renderer."""
     
-    @jax.jit(static_argnums=(4,))
     def render_mosaic_jax(x, y, fluxes, kernel_bank, mosaic_size):
         """
         Render stars into a mosaic using JAX.
@@ -65,7 +64,7 @@ def _get_jax_renderer():
         final_image = jnp.sum(rendered_phases, axis=1).squeeze()
         return final_image
 
-    return render_mosaic_jax
+    return jax.jit(render_mosaic_jax, static_argnums=(4,))
 
 _RENDER_FUNC = None
 
