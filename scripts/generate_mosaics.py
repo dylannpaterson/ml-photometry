@@ -10,6 +10,16 @@ import time
 from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE
 from scipy.signal import fftconvolve
 
+# GPU Acceleration
+try:
+    import jax
+    HAS_GPU = any(d.platform == 'gpu' for d in jax.devices())
+    if HAS_GPU:
+        from castor.data.gpu_renderer import render_gpu
+        print("🚀 JAX GPU Acceleration Enabled")
+except ImportError:
+    HAS_GPU = False
+
 def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     """Generates a large seamless mosaic by generating a global catalog and chunked rendering."""
     start_time = time.time()
@@ -31,42 +41,51 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     x_centers = np.random.uniform(0, mosaic_size, len(mags))
     y_centers = np.random.uniform(0, mosaic_size, len(mags))
     
-    # 2. Render the physics image in 4x4 chunks (with buffer to handle PSF overlap)
-    full_image = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
-    n_side = mosaic_size // training_size
-    buffer = 20 # Pixels
-    
     provider = GaussianPretrainingProvider(image_size=training_size)
     
-    for iy in range(n_side):
-        for ix in range(n_side):
-            y0, y1 = iy * training_size, (iy + 1) * training_size
-            x0, x1 = ix * training_size, (ix + 1) * training_size
-            
-            mask = (x_centers > x0 - buffer) & (x_centers < x1 + buffer) & \
-                   (y_centers > y0 - buffer) & (y_centers < y1 + buffer)
-            
-            cx, cy, cf = x_centers[mask] - x0, y_centers[mask] - y0, fluxes[mask]
-            grid_h, grid_w = training_size + 2*buffer, training_size + 2*buffer
-            chunk_signal = np.zeros((grid_h, grid_w), dtype=np.float32)
-            
-            px = np.clip(np.floor((cx + buffer - np.floor(cx + buffer)) * provider.n_sub).astype(int), 0, provider.n_sub - 1)
-            py = np.clip(np.floor((cy + buffer - np.floor(cy + buffer)) * provider.n_sub).astype(int), 0, provider.n_sub - 1)
-            ix0, iy0 = np.floor(cx + buffer).astype(int), np.floor(cy + buffer).astype(int)
-            
-            for i in range(provider.n_sub):
-                for j in range(provider.n_sub):
-                    p_mask = (px == i) & (py == j)
-                    if p_mask.any():
-                        phase_map, _, _ = np.histogram2d(
-                            iy0[p_mask], ix0[p_mask], 
-                            bins=[grid_h, grid_w], 
-                            range=[[0, grid_h], [0, grid_w]], 
-                            weights=cf[p_mask]
-                        )
-                        chunk_signal += fftconvolve(phase_map, provider.kernel_bank[(i, j)], mode='same').astype(np.float32)
-            
-            full_image[y0:y1, x0:x1] = chunk_signal[buffer:-buffer, buffer:-buffer]
+    if HAS_GPU:
+        # --- GPU PATH: Render entire mosaic at once ---
+        kb_array = np.zeros((16, provider.kernel_size, provider.kernel_size), dtype=np.float32)
+        for i in range(4):
+            for j in range(4):
+                kb_array[j * 4 + i] = provider.kernel_bank[(i, j)]
+        
+        full_image = render_gpu(x_centers, y_centers, fluxes, kb_array, mosaic_size)
+    else:
+        # --- CPU PATH: Render the physics image in 4x4 chunks (with buffer to handle PSF overlap) ---
+        full_image = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
+        n_side = mosaic_size // training_size
+        buffer = 20 # Pixels
+        
+        for iy in range(n_side):
+            for ix in range(n_side):
+                y0, y1 = iy * training_size, (iy + 1) * training_size
+                x0, x1 = ix * training_size, (ix + 1) * training_size
+                
+                mask = (x_centers > x0 - buffer) & (x_centers < x1 + buffer) & \
+                       (y_centers > y0 - buffer) & (y_centers < y1 + buffer)
+                
+                cx, cy, cf = x_centers[mask] - x0, y_centers[mask] - y0, fluxes[mask]
+                grid_h, grid_w = training_size + 2*buffer, training_size + 2*buffer
+                chunk_signal = np.zeros((grid_h, grid_w), dtype=np.float32)
+                
+                px = np.clip(np.floor((cx + buffer - np.floor(cx + buffer)) * provider.n_sub).astype(int), 0, provider.n_sub - 1)
+                py = np.clip(np.floor((cy + buffer - np.floor(cy + buffer)) * provider.n_sub).astype(int), 0, provider.n_sub - 1)
+                ix0, iy0 = np.floor(cx + buffer).astype(int), np.floor(cy + buffer).astype(int)
+                
+                for i in range(provider.n_sub):
+                    for j in range(provider.n_sub):
+                        p_mask = (px == i) & (py == j)
+                        if p_mask.any():
+                            phase_map, _, _ = np.histogram2d(
+                                iy0[p_mask], ix0[p_mask], 
+                                bins=[grid_h, grid_w], 
+                                range=[[0, grid_h], [0, grid_w]], 
+                                weights=cf[p_mask]
+                            )
+                            chunk_signal += fftconvolve(phase_map, provider.kernel_bank[(i, j)], mode='same').astype(np.float32)
+                
+                full_image[y0:y1, x0:x1] = chunk_signal[buffer:-buffer, buffer:-buffer]
 
     # 3. Filter and Save Catalog
     valid_mask = mags < 27.0
