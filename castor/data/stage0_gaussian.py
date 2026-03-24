@@ -245,8 +245,9 @@ class GaussianMosaicDataset(Dataset):
         image_tensor = torch.from_numpy(self.transform.image_to_network(img_noisy, chunk_median)).unsqueeze(0).float()
 
         # 3. Load stars for THIS mosaic only (Lazy Loading)
-        cat = pd.read_parquet(mosaic['cat_path'])
-        m_stars_x, m_stars_y = cat['x'].values, cat['y'].values
+        # Optimization: Read only spatial and flux columns first
+        cat_coords = pd.read_parquet(mosaic['cat_path'], columns=['x', 'y', 'flux'])
+        m_stars_x, m_stars_y = cat_coords['x'].values, cat_coords['y'].values
         
         mask = (m_stars_x >= px) & (m_stars_x < px + self.img_size) & \
                (m_stars_y >= py) & (m_stars_y < py + self.img_size)
@@ -254,29 +255,53 @@ class GaussianMosaicDataset(Dataset):
         if not mask.any():
             return {"image": image_tensor, "target": torch.zeros((self.grid_size, self.grid_size, self.K*5 + 1)), "chunk_median": float(chunk_median)}
         
-        local_cat = cat[mask]
-        lx, ly, fluxes = local_cat['x'].values - px, local_cat['y'].values - py, local_cat['flux'].values
+        # Load full data for ONLY the masked stars
+        # Since parquet doesn't support easy row-filtering without reading chunks, 
+        # we read the 'shape' column only for the whole file if we must, 
+        # but 'shape' is the heavy one.
+        
+        local_fluxes = cat_coords.loc[mask, 'flux'].values
+        local_x = cat_coords.loc[mask, 'x'].values - px
+        local_y = cat_coords.loc[mask, 'y'].values - py
         
         # Sub-Pixel Accurate Local Confusion SNR (Vectorized)
-        total_local_light = map_coordinates(star_signal, [ly, lx], order=1, mode='nearest')
-        local_background = np.maximum(0, total_local_light - (fluxes * self.psf_peak))
-        snrs = fluxes / np.sqrt(fluxes + self.n_pix * (sky_level + local_background + 25.0))
+        total_local_light = map_coordinates(star_signal, [local_y, local_x], order=1, mode='nearest')
+        local_background = np.maximum(0, total_local_light - (local_fluxes * self.psf_peak))
+        snrs = local_fluxes / np.sqrt(local_fluxes + self.n_pix * (sky_level + local_background + 25.0))
         
+        # Filter by SNR before loading heavy shapes
+        snr_mask = snrs >= self.min_snr
+        if not snr_mask.any():
+             return {"image": image_tensor, "target": torch.zeros((self.grid_size, self.grid_size, self.K*5 + 1)), "chunk_median": float(chunk_median)}
+
+        # Now load shapes for only the stars that passed SNR
+        # Get the indices of the stars that passed both spatial and SNR filters
+        final_indices = np.where(mask)[0][snr_mask]
+        
+        # Read shapes only for these indices
+        # Parquet doesn't support random row access well, but we can read the whole column 
+        # if it's not too big, or use a more efficient format. 
+        # For now, let's just read the 'shape' column for the whole file but immediately mask it.
+        full_shapes = pd.read_parquet(mosaic['cat_path'], columns=['shape'])
+        local_shapes = np.stack(full_shapes.iloc[final_indices]['shape'].values)
+        
+        final_fluxes = local_fluxes[snr_mask]
+        final_lx = local_x[snr_mask]
+        final_ly = local_y[snr_mask]
+        final_snrs = snrs[snr_mask]
+
         grid_stars = np.zeros((self.grid_size, self.grid_size, self.K, 5 + self.S**2), dtype=np.float32)
         counts = np.zeros((self.grid_size, self.grid_size), dtype=np.int32)
-        sort_idx = np.argsort(fluxes)[::-1]
-        
-        shapes_stack = np.stack(local_cat['shape'].values)
+        sort_idx = np.argsort(final_fluxes)[::-1]
         
         for i in sort_idx:
-            if snrs[i] >= self.min_snr:
-                cx, cy = int(lx[i] // self.cell_size), int(ly[i] // self.cell_size)
-                if 0 <= cx < self.grid_size and 0 <= cy < self.grid_size and counts[cy, cx] < self.K:
-                    slot = counts[cy, cx]
-                    comp = 1.0 / (1.0 + np.exp(-2.0 * (snrs[i] - self.min_snr)))
-                    grid_stars[cy, cx, slot, 0:5] = [comp, lx[i] % self.cell_size, ly[i] % self.cell_size, fluxes[i], comp]
-                    grid_stars[cy, cx, slot, 5:] = shapes_stack[i]
-                    counts[cy, cx] += 1
+            cx, cy = int(final_lx[i] // self.cell_size), int(final_ly[i] // self.cell_size)
+            if 0 <= cx < self.grid_size and 0 <= cy < self.grid_size and counts[cy, cx] < self.K:
+                slot = counts[cy, cx]
+                comp = 1.0 / (1.0 + np.exp(-2.0 * (final_snrs[i] - self.min_snr)))
+                grid_stars[cy, cx, slot, 0:5] = [comp, final_lx[i] % self.cell_size, final_ly[i] % self.cell_size, final_fluxes[i], comp]
+                grid_stars[cy, cx, slot, 5:] = local_shapes[i]
+                counts[cy, cx] += 1
         
         bg_grid = np.full((self.grid_size, self.grid_size), self.transform.target_bg_to_network(sky_level - chunk_median), dtype=np.float32)
         target = torch.cat([torch.from_numpy(grid_stars).view(self.grid_size, self.grid_size, -1), torch.from_numpy(bg_grid).unsqueeze(-1)], dim=-1)
