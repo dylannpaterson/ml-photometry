@@ -6,7 +6,7 @@ import numpy as np
 def _get_jax_renderer():
     """Returns a JIT-compiled JAX renderer."""
     
-    @jax.jit
+    @jax.jit(static_argnums=(4,))
     def render_mosaic_jax(x, y, fluxes, kernel_bank, mosaic_size):
         """
         Render stars into a mosaic using JAX.
