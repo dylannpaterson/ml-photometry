@@ -197,7 +197,6 @@ class GaussianPretrainingProvider(Dataset):
                 "catalog": pd.DataFrame(catalog_stars)}
 
 class GaussianMosaicDataset(Dataset):
-    _STAR_INDEX_CACHE = {}
     def __init__(self, data_dir, num_samples=25000, image_size=256, cell_size=DEFAULT_CELL_SIZE, global_stretch_scale=GLOBAL_STRETCH_SCALE):
         self.data_dir, self.num_samples, self.img_size, self.cell_size = data_dir, num_samples, image_size, cell_size
         self.grid_size = image_size // cell_size
@@ -209,46 +208,54 @@ class GaussianMosaicDataset(Dataset):
         self.min_snr = 5.0
         
         self.image_files = sorted([f for f in os.listdir(data_dir) if f.endswith("_img.npy")])
-        cache_key = os.path.abspath(data_dir)
-        if cache_key in self._STAR_INDEX_CACHE:
-            cached = self._STAR_INDEX_CACHE[cache_key]
-            self.mosaics, self.all_stars, self.star_offsets = cached['mosaics'], cached['all_stars'], cached['star_offsets']
-        else:
-            self.mosaics, all_stars, star_offsets = [], [], [0]
-            for img_f in self.image_files:
-                base = img_f.replace("_img.npy", "")
-                cat_f = [f for f in os.listdir(data_dir) if f.startswith(base) and f.endswith(".parquet")]
-                if not cat_f: continue
-                img_path, cat_path = os.path.join(data_dir, img_f), os.path.join(data_dir, cat_f[0])
-                cat = pd.read_parquet(cat_path)
-                self.mosaics.append({'img_path': img_path, 'exp_time': cat['exp_time'].iloc[0], 'zp': cat['zp'].iloc[0], 'sky_mag': cat['sky_mag'].iloc[0]})
-                cat_stars = np.zeros((len(cat), 4 + self.S**2), dtype=np.float32)
-                cat_stars[:, 0], cat_stars[:, 1], cat_stars[:, 2], cat_stars[:, 3] = cat['x'].values, cat['y'].values, cat['flux'].values, cat['mag'].values
-                cat_stars[:, 4:] = np.stack(cat['shape'].values)
-                all_stars.append(cat_stars); star_offsets.append(star_offsets[-1] + len(cat_stars))
-            self.all_stars, self.star_offsets = np.concatenate(all_stars, axis=0), np.array(star_offsets)
-            self._STAR_INDEX_CACHE[cache_key] = {'mosaics': self.mosaics, 'all_stars': self.all_stars, 'star_offsets': self.star_offsets}
+        self.mosaics = []
+        for img_f in self.image_files:
+            base = img_f.replace("_img.npy", "")
+            cat_f = [f for f in os.listdir(data_dir) if f.startswith(base) and f.endswith(".parquet")]
+            if not cat_f: continue
+            img_path, cat_path = os.path.join(data_dir, img_f), os.path.join(data_dir, cat_f[0])
+            
+            # Load only metadata from the parquet to get experiment params
+            # We use a trick to read just the first row for metadata
+            meta_df = pd.read_parquet(cat_path, columns=['exp_time', 'zp', 'sky_mag']).iloc[:1]
+            
+            self.mosaics.append({
+                'img_path': img_path, 
+                'cat_path': cat_path,
+                'exp_time': meta_df['exp_time'].iloc[0], 
+                'zp': meta_df['zp'].iloc[0], 
+                'sky_mag': meta_df['sky_mag'].iloc[0]
+            })
 
     def __len__(self): return self.num_samples
 
     def __getitem__(self, idx):
         m_idx = np.random.randint(0, len(self.mosaics))
         mosaic = self.mosaics[m_idx]
+        
+        # 1. Load sub-image using mmap for speed
         img_mmap = np.load(mosaic['img_path'], mmap_mode='r')
         py, px = np.random.randint(0, img_mmap.shape[0] - self.img_size), np.random.randint(0, img_mmap.shape[1] - self.img_size)
         star_signal = img_mmap[py:py+self.img_size, px:px+self.img_size].copy()
         
+        # 2. Add Live Noise
         sky_level = (10 ** (-0.4 * (mosaic['sky_mag'] - mosaic['zp']))) * (0.11**2) * mosaic['exp_time']
         img_noisy = np.random.poisson(np.maximum(star_signal + sky_level, 0)).astype(np.float32) + np.random.normal(0, 5.0, size=star_signal.shape)
         chunk_median = np.median(img_noisy)
         image_tensor = torch.from_numpy(self.transform.image_to_network(img_noisy, chunk_median)).unsqueeze(0).float()
 
-        m_stars = self.all_stars[self.star_offsets[m_idx]:self.star_offsets[m_idx+1]]
-        mask = (m_stars[:, 0] >= px) & (m_stars[:, 0] < px + self.img_size) & (m_stars[:, 1] >= py) & (m_stars[:, 1] < py + self.img_size)
-        local_stars = m_stars[mask]
-        if len(local_stars) == 0: return {"image": image_tensor, "target": torch.zeros((self.grid_size, self.grid_size, self.K*5 + 1)), "chunk_median": float(chunk_median)}
+        # 3. Load stars for THIS mosaic only (Lazy Loading)
+        cat = pd.read_parquet(mosaic['cat_path'])
+        m_stars_x, m_stars_y = cat['x'].values, cat['y'].values
         
-        lx, ly, fluxes = local_stars[:, 0] - px, local_stars[:, 1] - py, local_stars[:, 2]
+        mask = (m_stars_x >= px) & (m_stars_x < px + self.img_size) & \
+               (m_stars_y >= py) & (m_stars_y < py + self.img_size)
+        
+        if not mask.any():
+            return {"image": image_tensor, "target": torch.zeros((self.grid_size, self.grid_size, self.K*5 + 1)), "chunk_median": float(chunk_median)}
+        
+        local_cat = cat[mask]
+        lx, ly, fluxes = local_cat['x'].values - px, local_cat['y'].values - py, local_cat['flux'].values
         
         # Sub-Pixel Accurate Local Confusion SNR (Vectorized)
         total_local_light = map_coordinates(star_signal, [ly, lx], order=1, mode='nearest')
@@ -258,6 +265,9 @@ class GaussianMosaicDataset(Dataset):
         grid_stars = np.zeros((self.grid_size, self.grid_size, self.K, 5 + self.S**2), dtype=np.float32)
         counts = np.zeros((self.grid_size, self.grid_size), dtype=np.int32)
         sort_idx = np.argsort(fluxes)[::-1]
+        
+        shapes_stack = np.stack(local_cat['shape'].values)
+        
         for i in sort_idx:
             if snrs[i] >= self.min_snr:
                 cx, cy = int(lx[i] // self.cell_size), int(ly[i] // self.cell_size)
@@ -265,7 +275,8 @@ class GaussianMosaicDataset(Dataset):
                     slot = counts[cy, cx]
                     comp = 1.0 / (1.0 + np.exp(-2.0 * (snrs[i] - self.min_snr)))
                     grid_stars[cy, cx, slot, 0:5] = [comp, lx[i] % self.cell_size, ly[i] % self.cell_size, fluxes[i], comp]
-                    grid_stars[cy, cx, slot, 5:] = local_stars[i, 4:]; counts[cy, cx] += 1
+                    grid_stars[cy, cx, slot, 5:] = shapes_stack[i]
+                    counts[cy, cx] += 1
         
         bg_grid = np.full((self.grid_size, self.grid_size), self.transform.target_bg_to_network(sky_level - chunk_median), dtype=np.float32)
         target = torch.cat([torch.from_numpy(grid_stars).view(self.grid_size, self.grid_size, -1), torch.from_numpy(bg_grid).unsqueeze(-1)], dim=-1)
