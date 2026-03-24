@@ -44,6 +44,10 @@ curriculum:
     resume_from_last_stage: true
 
 data_params:
+  # Samples to cover the unique parameter states
+  num_train_samples: 100000 
+  num_val_samples: 5000
+  
   # Massive unified population to hit VVV background levels
   min_stars: 1000000
   max_stars: 8000000
