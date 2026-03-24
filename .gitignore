@@ -2,10 +2,12 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.egg-info/
 
 # Checkpoints and Logs
 checkpoints/
 *.log
+training.log_*
 
 # Visualization outputs
 *.png

@@ -35,16 +35,18 @@ Additionally, each $2 \times 2$ cell predicts a shared local background value ($
 
 ## Data Storage Strategy
 
-To handle the massive dimensionality of predicting 81 shape parameters for millions of stars without causing disk I/O bottlenecks, the pipeline uses a **Sparse-on-Disk, Dense-in-RAM** approach:
-- Target grids are stored sparsely (saving only active star shapes and their indices).
-- The PyTorch `Dataset` automatically re-densifies these targets Just-In-Time (JIT) during training, maintaining a footprint of < 100 GB for 25,000 dense chunks.
+To maintain a virtually negligible disk footprint while preserving extremely high I/O throughput, the pipeline uses a **"Cached Physics, Live Noise"** dual-mmap architecture:
+
+*   **Cached Physics, Live Noise:** Base optical physics (clean images) and catalogs are pre-rendered and saved to disk. During training, the PyTorch `Dataset` uses fast memory-mapping (`mmap`) to load random crops.
+*   **JIT Densification:** Target grids are constructed Just-In-Time (JIT) in RAM.
+*   **On-the-fly Noise:** Sky background, Poisson noise, and Gaussian read noise are injected dynamically upon loading, meaning the network never sees the exact same noise realization twice.
 
 ## Usage
 
 The pipeline is structured around curriculum learning stages, starting with synthetic Gaussian profiles (Stage 0) before advancing to realistic `romanisim` data.
 
 ### 1. Data Pre-generation
-Generate synthetic training and validation chunks:
+Generate synthetic training and validation chunks. For Stage 0, this utilizes a dynamic Galactic Bulge Luminosity Function (simulating Main Sequence, RGB, and Red Clump populations) and leverages JAX-accelerated GPU rendering to rapidly generate extremely crowded fields (up to 8 million stars).
 ```bash
 python scripts/pregenerate_data.py 0 --config config/config.yaml
 ```
