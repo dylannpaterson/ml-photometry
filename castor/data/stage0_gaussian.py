@@ -4,7 +4,7 @@ from torch.utils.data import Dataset
 import matplotlib.pyplot as plt
 import os
 import pandas as pd
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, map_coordinates
 from scipy.signal import fftconvolve
 from castor.data.transforms import AstroSpaceTransform
 from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE
@@ -62,7 +62,6 @@ class GaussianPretrainingProvider(Dataset):
         self.kernel_bank = self._precompute_kernel_bank(sigma=self.sigma_fixed)
         self.n_pix = 4 * np.pi * (self.sigma_fixed ** 2)
         self.psf_peak = 1.0 / (2 * np.pi * self.sigma_fixed**2)
-        self.xx, self.yy = np.meshgrid(np.arange(self.img_size), np.arange(self.img_size))
 
     def _precompute_kernel_bank(self, sigma=1.5):
         bank = {}
@@ -97,7 +96,6 @@ class GaussianPretrainingProvider(Dataset):
         if rc_params is None:
             rc_loc = np.random.uniform(14.5, 16.5)
             rc_scale = np.random.uniform(0.2, 0.5)
-            # Increased RC prominence: sits 5x to 15x above the local RGB background
             rc_enhancement = np.random.uniform(5.0, 15.0)
         else: rc_loc, rc_scale, rc_enhancement = rc_params
 
@@ -121,7 +119,7 @@ class GaussianPretrainingProvider(Dataset):
 
         # Rendering
         star_signal = np.zeros((self.img_size, self.img_size), dtype=np.float32)
-        monster_cutoff = int(n_stars * 0.0005)
+        monster_cutoff = min(100, int(n_stars * 0.0005))
         cx, cy, cf = x_centers[monster_cutoff:], y_centers[monster_cutoff:], fluxes[monster_cutoff:]
         x0, y0 = np.floor(cx).astype(int), np.floor(cy).astype(int)
         phase_x = np.clip(np.floor((cx - x0) * self.n_sub).astype(int), 0, self.n_sub - 1)
@@ -129,13 +127,15 @@ class GaussianPretrainingProvider(Dataset):
 
         for i in range(self.n_sub):
             for j in range(self.n_sub):
-                phase_map = np.zeros((self.img_size, self.img_size), dtype=np.float32)
                 mask = (phase_x == i) & (phase_y == j)
                 if mask.any():
-                    v = (x0[mask] >= 0) & (x0[mask] < self.img_size) & (y0[mask] >= 0) & (y0[mask] < self.img_size)
-                    np.add.at(phase_map, (y0[mask][v], x0[mask][v]), cf[mask][v])
-                if phase_map.any():
-                    star_signal += fftconvolve(phase_map, self.kernel_bank[(i, j)], mode='same')
+                    phase_map, _, _ = np.histogram2d(
+                        y0[mask], x0[mask], 
+                        bins=self.img_size, 
+                        range=[[0, self.img_size], [0, self.img_size]], 
+                        weights=cf[mask]
+                    )
+                    star_signal += fftconvolve(phase_map, self.kernel_bank[(i, j)], mode='same').astype(np.float32)
 
         for i in range(monster_cutoff):
             fx, fy, f = x_centers[i], y_centers[i], fluxes[i]
@@ -153,10 +153,9 @@ class GaussianPretrainingProvider(Dataset):
         chunk_median = np.median(raw_image)
         normalized_image = self.transform.image_to_network(raw_image, chunk_median)
 
-        # --- LOCAL Confusion SNR ---
-        ix = np.clip(x_centers.astype(int), 0, self.img_size - 1)
-        iy = np.clip(y_centers.astype(int), 0, self.img_size - 1)
-        total_local_light = star_signal[iy, ix]
+        # --- Sub-Pixel Accurate Local Confusion SNR ---
+        # Sample total light using bilinear interpolation at EXACT centers
+        total_local_light = map_coordinates(star_signal, [y_centers, x_centers], order=1, mode='nearest')
         local_background = np.maximum(0, total_local_light - (fluxes * self.psf_peak))
         noise_variance = fluxes + self.n_pix * (sky_level + local_background + self.read_noise**2)
         snrs = fluxes / np.sqrt(noise_variance)
@@ -169,7 +168,7 @@ class GaussianPretrainingProvider(Dataset):
         psf_flat = np.exp(-(sx**2 + sy**2) / (2 * self.sigma_fixed**2))
         psf_flat = (psf_flat / psf_flat.sum()).astype(np.float32).flatten()
         
-        shapes, indices, catalog_stars = [], [], []
+        shapes, catalog_stars = [], []
         cell_assignments = {}
         for i in range(n_stars):
             if snrs[i] >= self.min_snr:
@@ -185,7 +184,7 @@ class GaussianPretrainingProvider(Dataset):
                 f, tx, ty, snr, m = sorted_stars[slot]
                 comp = 1.0 / (1.0 + np.exp(-2.0 * (snr - self.min_snr)))
                 base_grid[cy, cx, slot] = [comp, tx % self.cell_size, ty % self.cell_size, f, comp]
-                shapes.append(psf_flat); indices.append([cy, cx, slot])
+                shapes.append(psf_flat)
                 catalog_stars.append({'x': tx, 'y': ty, 'flux': f, 'mag': m, 'shape': psf_flat, 'exp_time': exp_time, 'zp': zp, 'sky_mag': sky_mag})
 
         bg_target = self.transform.target_bg_to_network(sky_level - chunk_median)
@@ -204,8 +203,9 @@ class GaussianMosaicDataset(Dataset):
         self.grid_size = image_size // cell_size
         self.transform = AstroSpaceTransform(stretch_scale=global_stretch_scale)
         self.K, self.S = MAX_CAPACITY_PER_CELL, SHAPE_SIZE
-        self.n_pix = 4 * np.pi * (1.5 ** 2)
-        self.psf_peak = 1.0 / (2 * np.pi * 1.5**2)
+        self.sigma_fixed = 1.5
+        self.n_pix = 4 * np.pi * (self.sigma_fixed ** 2)
+        self.psf_peak = 1.0 / (2 * np.pi * self.sigma_fixed**2)
         self.min_snr = 5.0
         
         self.image_files = sorted([f for f in os.listdir(data_dir) if f.endswith("_img.npy")])
@@ -222,10 +222,10 @@ class GaussianMosaicDataset(Dataset):
                 img_path, cat_path = os.path.join(data_dir, img_f), os.path.join(data_dir, cat_f[0])
                 cat = pd.read_parquet(cat_path)
                 self.mosaics.append({'img_path': img_path, 'exp_time': cat['exp_time'].iloc[0], 'zp': cat['zp'].iloc[0], 'sky_mag': cat['sky_mag'].iloc[0]})
-                stars = np.zeros((len(cat), 4 + self.S**2), dtype=np.float32)
-                stars[:, 0], stars[:, 1], stars[:, 2], stars[:, 3] = cat['x'].values, cat['y'].values, cat['flux'].values, cat['mag'].values
-                stars[:, 4:] = np.stack(cat['shape'].values)
-                all_stars.append(stars); star_offsets.append(star_offsets[-1] + len(stars))
+                cat_stars = np.zeros((len(cat), 4 + self.S**2), dtype=np.float32)
+                cat_stars[:, 0], cat_stars[:, 1], cat_stars[:, 2], cat_stars[:, 3] = cat['x'].values, cat['y'].values, cat['flux'].values, cat['mag'].values
+                cat_stars[:, 4:] = np.stack(cat['shape'].values)
+                all_stars.append(cat_stars); star_offsets.append(star_offsets[-1] + len(cat_stars))
             self.all_stars, self.star_offsets = np.concatenate(all_stars, axis=0), np.array(star_offsets)
             self._STAR_INDEX_CACHE[cache_key] = {'mosaics': self.mosaics, 'all_stars': self.all_stars, 'star_offsets': self.star_offsets}
 
@@ -249,8 +249,10 @@ class GaussianMosaicDataset(Dataset):
         if len(local_stars) == 0: return {"image": image_tensor, "target": torch.zeros((self.grid_size, self.grid_size, self.K*5 + 1)), "chunk_median": float(chunk_median)}
         
         lx, ly, fluxes = local_stars[:, 0] - px, local_stars[:, 1] - py, local_stars[:, 2]
-        ix, iy = np.clip(lx.astype(int), 0, self.img_size - 1), np.clip(ly.astype(int), 0, self.img_size - 1)
-        local_background = np.maximum(0, star_signal[iy, ix] - (fluxes * self.psf_peak))
+        
+        # Sub-Pixel Accurate Local Confusion SNR (Vectorized)
+        total_local_light = map_coordinates(star_signal, [ly, lx], order=1, mode='nearest')
+        local_background = np.maximum(0, total_local_light - (fluxes * self.psf_peak))
         snrs = fluxes / np.sqrt(fluxes + self.n_pix * (sky_level + local_background + 25.0))
         
         grid_stars = np.zeros((self.grid_size, self.grid_size, self.K, 5 + self.S**2), dtype=np.float32)
