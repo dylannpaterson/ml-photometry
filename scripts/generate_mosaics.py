@@ -14,6 +14,7 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     area_ratio = (mosaic_size / training_size)**2
     
     # Scale stars for the full mosaic area
+    # Config is 1M-8M per 256x256. Mosaic is 1024x1024 (16x area).
     sca_min_stars = int(params['min_stars'] * area_ratio)
     sca_max_stars = int(params['max_stars'] * area_ratio)
     
@@ -27,31 +28,31 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     provider.cell_size = cell_size
     provider.grid_size = mosaic_size // cell_size
     
-    # NEW: Draw Line-of-Sight Parameters for the Bulge
+    # GBTDS Parameters (consistent with stage0_gaussian.py)
     rc_loc = np.random.uniform(14.5, 16.5)
     rc_scale = np.random.uniform(0.2, 0.5)
-    rc_fraction = np.random.uniform(0.05, 0.20)
+    rc_enhancement = np.random.uniform(2.0, 5.0)
     
-    # Instrument params (Roman wide-band proxy)
-    exp_time = np.random.uniform(20.0, 100.0)
+    exp_time = np.random.uniform(30.0, 60.0)
     zp = 26.5
     sky_mag = 22.0
     
-    print(f"Generating Mosaic {idx} ({mosaic_size}x{mosaic_size}, approx {sca_max_stars} stars)...")
+    print(f"Generating Mosaic {idx} ({mosaic_size}x{mosaic_size}, {sca_min_stars:,}-{sca_max_stars:,} stars base)...")
     print(f"  RC_Mag={rc_loc:.2f}, exp={exp_time:.1f}s")
     
-    # Use the speed-hack rendering
+    # generate_chunk handles Rendering ALL stars and filtering by LOCAL SNR
     sample = provider.generate_chunk(
-        rc_params=(rc_loc, rc_scale, rc_fraction),
+        rc_params=(rc_loc, rc_scale, rc_enhancement),
         exp_params=(exp_time, zp, sky_mag)
     )
     
-    # 1. Save Clean Physics Image (Noiseless Photons)
+    # 1. Save Clean Physics Image (Noiseless Photons - ALL STARS RENDERED)
     image_path = os.path.join(output_dir, f"mosaic_{idx:03d}_img.npy")
     np.save(image_path, sample["physics_image"].numpy().astype(np.float32))
     
-    # 2. Save Rich Parquet Catalog (Astrophysics + Metadata)
+    # 2. Save Rich Parquet Catalog (ONLY SNR >= 5 STARS)
     catalog = sample["catalog"]
+    # Metadata for dataset loading
     catalog['exp_time'] = exp_time
     catalog['zp'] = zp
     catalog['sky_mag'] = sky_mag
@@ -59,7 +60,7 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     cat_path = os.path.join(output_dir, f"mosaic_{idx:03d}_catalog.parquet")
     catalog.to_parquet(cat_path, index=False)
     
-    print(f"✅ Saved Macro-Sparse Mosaic {idx}")
+    print(f"✅ Saved Macro-Sparse Mosaic {idx} ({len(catalog):,} targets)")
 
 def main():
     parser = argparse.ArgumentParser(description="Pregenerate Compact Mosaics")
@@ -74,12 +75,11 @@ def main():
     stage_cfg = config["curriculum"][stage_key]
     data_cfg = config["data_params"]
     
-    # Standardize on the new Medium-Mosaic Strategy
-    num_mosaics = 100 # Default for local
+    num_mosaics = stage_cfg["mosaic_params"].get("num_mosaics", 100)
     if args.num is not None:
         num_mosaics = args.num
         
-    mosaic_size = 1024 # 1/16th area of full SCA
+    mosaic_size = stage_cfg["mosaic_params"].get("mosaic_size", 1024)
     cell_size = stage_cfg.get("cell_size", DEFAULT_CELL_SIZE)
     
     output_dir = os.path.join(stage_cfg["data_dir"], "mosaics")
@@ -90,14 +90,10 @@ def main():
     params = {
         "min_stars": data_cfg["min_stars"],
         "max_stars": data_cfg["max_stars"],
-        "image_size": data_cfg["image_size"], # 256
+        "image_size": data_cfg["image_size"],
         "max_capacity_per_cell": data_cfg["max_capacity_per_cell"],
         "shape_size": data_cfg.get("shape_size", SHAPE_SIZE)
     }
-    
-    # We need to scale the star density correctly for the 1024 canvas
-    # The config min/max is usually for 256x256. 
-    # Area ratio is (1024/256)^2 = 16.
     
     for i in range(num_mosaics):
         generate_mosaic(i, output_dir, params, mosaic_size, cell_size)

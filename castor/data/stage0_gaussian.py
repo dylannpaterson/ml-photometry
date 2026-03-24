@@ -15,38 +15,35 @@ except ImportError:
     galsim = None
 
 # --- 1. The Dynamic Bulge LF Sampler (RC Prior) ---
-def sample_bulge_magnitudes(n_stars, rc_mag, rc_sigma, rc_fraction, m_min=12.0, m_max=26.0, gamma=0.3):
-    """Samples apparent magnitudes (m). Smaller m = brighter star."""
-    n_rc = int(n_stars * rc_fraction)
-    n_bg = n_stars - n_rc
-
-    # 1. True Exponential Background via Inverse Transform Sampling
-    # N(m) proportional to 10^(gamma * m)
-    # gamma ~ 0.3 is a reasonable generic slope for star counts
-    u = np.random.uniform(0, 1, n_bg)
-    
-    # Inverse CDF of the exponential distribution bounded by m_min and m_max
+def sample_bulge_magnitudes(n_total, rc_mag, rc_sigma, rc_enhancement=3.0, m_min=12.0, m_max=32.0, gamma=0.3):
+    """
+    Generates a realistic Bulge LF: A continuous exponential RGB/MS 
+    with a Red Clump bump anchored to the local background density.
+    """
+    # 1. Base Population (RGB + Main Sequence)
+    u = np.random.uniform(0, 1, n_total)
     a = 10**(gamma * m_min)
     b = 10**(gamma * m_max)
-    m_bg = (1.0 / gamma) * np.log10(u * (b - a) + a)
-
-    # 2. Red Clump (Gaussian in magnitude space)
-    m_rc = np.random.normal(loc=rc_mag, scale=rc_sigma, size=n_rc)
-
-    # Combine and clip (just in case)
-    m_all = np.concatenate([m_bg, m_rc])
+    m_base = (1.0 / gamma) * np.log10(u * (b - a) + a)
+    
+    # 2. Size the Red Clump proportionally to the local background
+    local_rgb_count = np.sum((m_base >= rc_mag - 0.5) & (m_base <= rc_mag + 0.5))
+    n_rc = int(local_rgb_count * rc_enhancement)
+    
+    if n_rc > 0:
+        m_rc = np.random.normal(loc=rc_mag, scale=rc_sigma, size=n_rc)
+        m_all = np.concatenate([m_base, m_rc])
+    else:
+        m_all = m_base
+        
     m_all = np.clip(m_all, m_min, m_max)
-
-    return m_all 
+    np.random.shuffle(m_all)
+    return m_all
 
 class GaussianPretrainingProvider(Dataset):
-    def __init__(self, num_samples=1000, min_stars=100, max_stars=1500, image_size=256, 
+    def __init__(self, num_samples=1000, min_stars=1000000, max_stars=8000000, image_size=256, 
                  max_capacity_per_cell=MAX_CAPACITY_PER_CELL, shape_size=SHAPE_SIZE, 
                  use_fixed_seed=False, global_stretch_scale=GLOBAL_STRETCH_SCALE, min_snr=5.0):
-        """
-        Generates realistic synthetic data for the Roman Bulge Time Domain Survey.
-        Uses Phase-Banked FFT Kernels for perfect sub-pixel accuracy.
-        """
         self.num_samples = num_samples
         self.min_stars = min_stars
         self.max_stars = max_stars
@@ -57,35 +54,25 @@ class GaussianPretrainingProvider(Dataset):
         self.use_fixed_seed = use_fixed_seed
         self.min_snr = min_snr
         self.transform = AstroSpaceTransform(stretch_scale=global_stretch_scale)
-
-        # Grid parameters
         self.cell_size = DEFAULT_CELL_SIZE
         self.grid_size = self.img_size // self.cell_size
-        
-        # Phase-Banked FFT Kernel Configuration (4x4 sub-pixel grid)
         self.n_sub = 4
         self.kernel_size = 63
         self.sigma_fixed = 1.5
         self.kernel_bank = self._precompute_kernel_bank(sigma=self.sigma_fixed)
-        
-        # Effective PSF area for SNR calculation
         self.n_pix = 4 * np.pi * (self.sigma_fixed ** 2)
-        
-        # Pre-allocate coordinate grids for vectorization
+        self.psf_peak = 1.0 / (2 * np.pi * self.sigma_fixed**2)
         self.xx, self.yy = np.meshgrid(np.arange(self.img_size), np.arange(self.img_size))
 
     def _precompute_kernel_bank(self, sigma=1.5):
-        """Pre-renders 16 distinct sub-pixel shifted kernels for perfect convolution."""
         bank = {}
         pixel_scale = 0.11
         half = self.kernel_size // 2
         gy, gx = np.meshgrid(np.arange(self.kernel_size), np.arange(self.kernel_size))
-        
         for i in range(self.n_sub):
             for j in range(self.n_sub):
                 dx_shift = (i + 0.5) / self.n_sub
                 dy_shift = (j + 0.5) / self.n_sub
-                
                 if galsim is not None:
                     base_psf = galsim.Gaussian(sigma=sigma * pixel_scale)
                     shifted_psf = base_psf.shift(dx_shift * pixel_scale, dy_shift * pixel_scale)
@@ -102,72 +89,39 @@ class GaussianPretrainingProvider(Dataset):
         return self.num_samples
 
     def __getitem__(self, idx):
-        if self.use_fixed_seed:
-            np.random.seed(idx)
-        sparse_sample = self.generate_chunk()
-        image = sparse_sample["image"]
-        
-        base_grid = sparse_sample["base_grid"]
-        bg_map = sparse_sample["background_map"]
-        shapes = sparse_sample["shapes"]
-        indices = sparse_sample["indices"]
-        
-        S2 = self.S * self.S
-        grid_size = self.grid_size
-        
-        star_targets = torch.zeros((grid_size, grid_size, self.K, 5 + S2), dtype=torch.float32)
-        star_targets[..., :5] = base_grid
-        
-        if len(indices) > 0:
-            for i in range(len(indices)):
-                y, x, k = indices[i]
-                star_targets[y, x, k, 5:5+S2] = shapes[i]
-        
-        flattened_stars = star_targets.view(grid_size, grid_size, -1)
-        target = torch.cat([flattened_stars, bg_map.unsqueeze(-1)], dim=-1)
-        
-        return {
-            "image": image,
-            "target": target,
-            "chunk_median": sparse_sample["chunk_median"]
-        }
+        if self.use_fixed_seed: np.random.seed(idx)
+        sample = self.generate_chunk()
+        return {"image": sample["image"], "target": sample["target"], "chunk_median": sample["chunk_median"]}
 
     def generate_chunk(self, rc_params=None, exp_params=None):
-        """Generates a realistic Roman-like chunk using the Phase-Banked FFT Engine."""
         if rc_params is None:
             rc_loc = np.random.uniform(14.5, 16.5)
             rc_scale = np.random.uniform(0.2, 0.5)
-            rc_fraction = np.random.uniform(0.05, 0.20)
-        else:
-            rc_loc, rc_scale, rc_fraction = rc_params
+            # Increased RC prominence: sits 5x to 15x above the local RGB background
+            rc_enhancement = np.random.uniform(5.0, 15.0)
+        else: rc_loc, rc_scale, rc_enhancement = rc_params
 
         if exp_params is None:
             exp_time = np.random.uniform(30.0, 60.0)
-            zp = 26.5
-            sky_mag = 22.0
-        else:
-            exp_time, zp, sky_mag = exp_params
+            zp, sky_mag = 26.5, 22.0
+        else: exp_time, zp, sky_mag = exp_params
 
         pixel_scale = 0.11 
         sky_level = (10 ** (-0.4 * (sky_mag - zp))) * (pixel_scale**2) * exp_time
         
-        # 1. Unified population rendering (deep exponential LF)
-        n_stars = 100000 
-        mags = sample_bulge_magnitudes(n_stars, rc_loc, rc_scale, rc_fraction, m_min=12.0, m_max=32.0)
+        # Unified massive population
+        n_stars_base = int(np.random.uniform(self.min_stars, self.max_stars))
+        mags = sample_bulge_magnitudes(n_stars_base, rc_loc, rc_scale, rc_enhancement, m_min=12.0, m_max=32.0)
+        n_stars = len(mags)
         fluxes = exp_time * (10 ** (-0.4 * (mags - zp)))
-        
-        # Sort by flux
         sort_idx = np.argsort(fluxes)[::-1]
-        fluxes = fluxes[sort_idx]
-        mags = mags[sort_idx]
-        
+        fluxes, mags = fluxes[sort_idx], mags[sort_idx]
         x_centers = np.random.uniform(0, self.img_size, n_stars)
         y_centers = np.random.uniform(0, self.img_size, n_stars)
 
-        # --- Phase-Banked Two-Tier Rendering ---
+        # Rendering
         star_signal = np.zeros((self.img_size, self.img_size), dtype=np.float32)
-        monster_cutoff = int(n_stars * 0.001)
-        
+        monster_cutoff = int(n_stars * 0.0005)
         cx, cy, cf = x_centers[monster_cutoff:], y_centers[monster_cutoff:], fluxes[monster_cutoff:]
         x0, y0 = np.floor(cx).astype(int), np.floor(cy).astype(int)
         phase_x = np.clip(np.floor((cx - x0) * self.n_sub).astype(int), 0, self.n_sub - 1)
@@ -178,268 +132,139 @@ class GaussianPretrainingProvider(Dataset):
                 phase_map = np.zeros((self.img_size, self.img_size), dtype=np.float32)
                 mask = (phase_x == i) & (phase_y == j)
                 if mask.any():
-                    valid = (x0[mask] >= 0) & (x0[mask] < self.img_size) & (y0[mask] >= 0) & (y0[mask] < self.img_size)
-                    np.add.at(phase_map, (y0[mask][valid], x0[mask][valid]), cf[mask][valid])
-                
+                    v = (x0[mask] >= 0) & (x0[mask] < self.img_size) & (y0[mask] >= 0) & (y0[mask] < self.img_size)
+                    np.add.at(phase_map, (y0[mask][v], x0[mask][v]), cf[mask][v])
                 if phase_map.any():
                     star_signal += fftconvolve(phase_map, self.kernel_bank[(i, j)], mode='same')
 
         for i in range(monster_cutoff):
-            fx, fy, flux = x_centers[i], y_centers[i], fluxes[i]
+            fx, fy, f = x_centers[i], y_centers[i], fluxes[i]
             half = 15
             ix, iy = int(fx), int(fy)
             y0_m, y1_m = max(0, iy-half), min(self.img_size, iy+half+1)
             x0_m, x1_m = max(0, ix-half), min(self.img_size, ix+half+1)
             yy, xx = np.meshgrid(np.arange(y0_m, y1_m), np.arange(x0_m, x1_m), indexing='ij')
             stamp = np.exp(-((xx - fx)**2 + (yy - fy)**2) / (2 * self.sigma_fixed**2))
-            stamp *= (flux / (stamp.sum() + 1e-9))
+            stamp *= (f / (2 * np.pi * self.sigma_fixed**2))
             star_signal[y0_m:y1_m, x0_m:x1_m] += stamp
 
-        gt_background = np.full((self.img_size, self.img_size), sky_level, dtype=np.float32)
-        total_photon_flux = gt_background + star_signal
-        noise_std = np.sqrt(total_photon_flux + self.read_noise**2)
-        raw_image = np.random.normal(loc=total_photon_flux, scale=noise_std).astype(np.float32)
-
+        total_photon_flux = star_signal + sky_level
+        raw_image = np.random.normal(loc=total_photon_flux, scale=np.sqrt(total_photon_flux + self.read_noise**2)).astype(np.float32)
         chunk_median = np.median(raw_image)
         normalized_image = self.transform.image_to_network(raw_image, chunk_median)
 
-        # --- Dynamic Confusion Threshold Calculation (FIX 4) ---
-        instrumental_variance = sky_level + self.read_noise**2
-        snr_boundary = 3.0
-        # Quadratic formula to find flux at SNR=3 against instrument noise
-        a_quad = 1
-        b_quad = -(snr_boundary**2)
-        c_quad = -(snr_boundary**2) * self.n_pix * instrumental_variance
-        flux_boundary = (-b_quad + np.sqrt(b_quad**2 - 4*a_quad*c_quad)) / 2.0
-        
-        faint_mask = fluxes < flux_boundary
-        faint_fluxes = fluxes[faint_mask]
-        area = self.img_size ** 2
-        
-        # Mean flux and confusion variance from the unresolved sea
-        mean_sea_flux = np.sum(faint_fluxes) / area
-        var_conf = np.sum(faint_fluxes**2) / (area * self.n_pix)
-        
-        # Total per-pixel variance including confusion
-        per_pixel_variance = instrumental_variance + mean_sea_flux + var_conf
-        
-        # Vectorized SNR for all stars
-        snr_array = fluxes / np.sqrt(fluxes + self.n_pix * per_pixel_variance)
+        # --- LOCAL Confusion SNR ---
+        ix = np.clip(x_centers.astype(int), 0, self.img_size - 1)
+        iy = np.clip(y_centers.astype(int), 0, self.img_size - 1)
+        total_local_light = star_signal[iy, ix]
+        local_background = np.maximum(0, total_local_light - (fluxes * self.psf_peak))
+        noise_variance = fluxes + self.n_pix * (sky_level + local_background + self.read_noise**2)
+        snrs = fluxes / np.sqrt(noise_variance)
 
-        # --- Target Grid Construction ---
+        # Target Construction
         base_grid = np.zeros((self.grid_size, self.grid_size, self.K, 5), dtype=np.float32)
         half = self.S // 2
         grid_range = np.arange(-half, half + 1)
         sy, sx = np.meshgrid(grid_range, grid_range, indexing='ij')
-        psf_shape = np.exp(-(sx**2 + sy**2) / (2 * self.sigma_fixed**2))
-        psf_shape /= (psf_shape.sum() + 1e-9)
-        psf_shape_flat = psf_shape.astype(np.float32).flatten()
+        psf_flat = np.exp(-(sx**2 + sy**2) / (2 * self.sigma_fixed**2))
+        psf_flat = (psf_flat / psf_flat.sum()).astype(np.float32).flatten()
         
         shapes, indices, catalog_stars = [], [], []
         cell_assignments = {}
         for i in range(n_stars):
-            tx, ty, flux, snr = x_centers[i], y_centers[i], fluxes[i], snr_array[i]
-            cx, cy = int(tx // self.cell_size), int(ty // self.cell_size)
-            if cx < 0 or cx >= self.grid_size or cy < 0 or cy >= self.grid_size: continue
-            
-            if snr >= self.min_snr:
-                if (cy, cx) not in cell_assignments: cell_assignments[(cy, cx)] = []
-                cell_assignments[(cy, cx)].append([flux, tx, ty, snr, mags[i]])
+            if snrs[i] >= self.min_snr:
+                tx, ty = x_centers[i], y_centers[i]
+                cx, cy = int(tx // self.cell_size), int(ty // self.cell_size)
+                if 0 <= cx < self.grid_size and 0 <= cy < self.grid_size:
+                    if (cy, cx) not in cell_assignments: cell_assignments[(cy, cx)] = []
+                    cell_assignments[(cy, cx)].append([fluxes[i], tx, ty, snrs[i], mags[i]])
 
         for (cy, cx), cell_stars in cell_assignments.items():
             sorted_stars = sorted(cell_stars, key=lambda x: x[0], reverse=True)
             for slot in range(min(self.K, len(sorted_stars))):
-                flux, tx, ty, snr, mag = sorted_stars[slot]
-                completeness = 1.0 / (1.0 + np.exp(-2.0 * (snr - self.min_snr)))
-                base_grid[cy, cx, slot] = [completeness, tx % self.cell_size, ty % self.cell_size, flux, completeness]
-                shapes.append(psf_shape_flat)
-                indices.append([cy, cx, slot])
-                catalog_stars.append({'x': tx, 'y': ty, 'flux': flux, 'mag': mag, 'shape': psf_shape_flat,
-                                      'exp_time': exp_time, 'zp': zp, 'sky_mag': sky_mag})
+                f, tx, ty, snr, m = sorted_stars[slot]
+                comp = 1.0 / (1.0 + np.exp(-2.0 * (snr - self.min_snr)))
+                base_grid[cy, cx, slot] = [comp, tx % self.cell_size, ty % self.cell_size, f, comp]
+                shapes.append(psf_flat); indices.append([cy, cx, slot])
+                catalog_stars.append({'x': tx, 'y': ty, 'flux': f, 'mag': m, 'shape': psf_flat, 'exp_time': exp_time, 'zp': zp, 'sky_mag': sky_mag})
 
-        residual_bg_linear = gt_background - chunk_median
-        bg_grid_stretched = self.transform.target_bg_to_network(residual_bg_linear).reshape(self.grid_size, self.cell_size, self.grid_size, self.cell_size).mean(axis=(1, 3))
+        bg_target = self.transform.target_bg_to_network(sky_level - chunk_median)
+        bg_grid = np.full((self.grid_size, self.grid_size), bg_target, dtype=np.float32)
+        target = torch.cat([torch.from_numpy(base_grid).view(self.grid_size, self.grid_size, -1), 
+                            torch.from_numpy(bg_grid).unsqueeze(-1)], dim=-1)
 
-        return {
-            "image": torch.from_numpy(normalized_image).unsqueeze(0),
-            "raw_image": torch.from_numpy(raw_image),
-            "physics_image": torch.from_numpy(star_signal),
-            "base_grid": torch.from_numpy(base_grid),
-            "background_map": torch.from_numpy(bg_grid_stretched),
-            "shapes": torch.from_numpy(np.array(shapes)) if shapes else torch.tensor([]),
-            "indices": torch.from_numpy(np.array(indices)) if indices else torch.tensor([]),
-            "chunk_median": float(chunk_median),
-            "catalog": pd.DataFrame(catalog_stars),
-            "exp_time": exp_time, "zp": zp, "sky_mag": sky_mag
-        }
+        return {"image": torch.from_numpy(normalized_image).unsqueeze(0), "raw_image": torch.from_numpy(raw_image), 
+                "physics_image": torch.from_numpy(star_signal), "target": target, "chunk_median": float(chunk_median), 
+                "catalog": pd.DataFrame(catalog_stars)}
 
 class GaussianMosaicDataset(Dataset):
-    # Class-level cache to share index between train and val
     _STAR_INDEX_CACHE = {}
-
     def __init__(self, data_dir, num_samples=25000, image_size=256, cell_size=DEFAULT_CELL_SIZE, global_stretch_scale=GLOBAL_STRETCH_SCALE):
-        self.data_dir = data_dir
-        self.num_samples = num_samples
-        self.img_size = image_size
-        self.cell_size = cell_size
+        self.data_dir, self.num_samples, self.img_size, self.cell_size = data_dir, num_samples, image_size, cell_size
         self.grid_size = image_size // cell_size
         self.transform = AstroSpaceTransform(stretch_scale=global_stretch_scale)
         self.K, self.S = MAX_CAPACITY_PER_CELL, SHAPE_SIZE
-        
-        # Effective PSF area for SNR calculation
-        sigma_fixed = 1.5
-        self.n_pix = 4 * np.pi * (sigma_fixed ** 2)
+        self.n_pix = 4 * np.pi * (1.5 ** 2)
+        self.psf_peak = 1.0 / (2 * np.pi * 1.5**2)
         self.min_snr = 5.0
         
         self.image_files = sorted([f for f in os.listdir(data_dir) if f.endswith("_img.npy")])
-        if not self.image_files:
-            raise FileNotFoundError(f"No mosaics found in {data_dir}.")
-            
         cache_key = os.path.abspath(data_dir)
         if cache_key in self._STAR_INDEX_CACHE:
-            print(f"🚀 Reusing cached Stage 0 Star Index for {data_dir}...")
-            cached_data = self._STAR_INDEX_CACHE[cache_key]
-            self.mosaics = cached_data['mosaics']
-            self.all_stars = cached_data['all_stars']
-            self.star_offsets = cached_data['star_offsets']
+            cached = self._STAR_INDEX_CACHE[cache_key]
+            self.mosaics, self.all_stars, self.star_offsets = cached['mosaics'], cached['all_stars'], cached['star_offsets']
         else:
-            print(f"🚀 Optimizing Stage 0: Indexing {len(self.image_files)} mosaics for High-Speed training...")
-            
-            self.mosaics = []
-            all_stars = []
-            star_offsets = [0]
-            
-            for i, img_f in enumerate(self.image_files):
+            self.mosaics, all_stars, star_offsets = [], [], [0]
+            for img_f in self.image_files:
                 base = img_f.replace("_img.npy", "")
                 cat_f = [f for f in os.listdir(data_dir) if f.startswith(base) and f.endswith(".parquet")]
                 if not cat_f: continue
-                
-                img_path = os.path.join(data_dir, img_f)
-                cat_path = os.path.join(data_dir, cat_f[0])
-                
+                img_path, cat_path = os.path.join(data_dir, img_f), os.path.join(data_dir, cat_f[0])
                 cat = pd.read_parquet(cat_path)
-                
-                self.mosaics.append({
-                    'img_path': img_path,
-                    'exp_time': cat['exp_time'].iloc[0] if 'exp_time' in cat.columns else 54.0,
-                    'zp': cat['zp'].iloc[0] if 'zp' in cat.columns else 26.5,
-                    'sky_mag': cat['sky_mag'].iloc[0] if 'sky_mag' in cat.columns else 22.0
-                })
-                
+                self.mosaics.append({'img_path': img_path, 'exp_time': cat['exp_time'].iloc[0], 'zp': cat['zp'].iloc[0], 'sky_mag': cat['sky_mag'].iloc[0]})
                 stars = np.zeros((len(cat), 4 + self.S**2), dtype=np.float32)
-                stars[:, 0] = cat['x'].values
-                stars[:, 1] = cat['y'].values
-                stars[:, 2] = cat['flux'].values
-                stars[:, 3] = cat['mag'].values
-                
-                shapes = np.stack(cat['shape'].values)
-                stars[:, 4:] = shapes
-                
-                all_stars.append(stars)
-                star_offsets.append(star_offsets[-1] + len(stars))
-                
-            self.all_stars = np.concatenate(all_stars, axis=0)
-            self.star_offsets = np.array(star_offsets)
-            print(f"✅ Indexed {len(self.all_stars)} stars into compact memory ({(self.all_stars.nbytes / 1e6):.1f} MB)")
-            
-            self._STAR_INDEX_CACHE[cache_key] = {
-                'mosaics': self.mosaics,
-                'all_stars': self.all_stars,
-                'star_offsets': self.star_offsets
-            }
+                stars[:, 0], stars[:, 1], stars[:, 2], stars[:, 3] = cat['x'].values, cat['y'].values, cat['flux'].values, cat['mag'].values
+                stars[:, 4:] = np.stack(cat['shape'].values)
+                all_stars.append(stars); star_offsets.append(star_offsets[-1] + len(stars))
+            self.all_stars, self.star_offsets = np.concatenate(all_stars, axis=0), np.array(star_offsets)
+            self._STAR_INDEX_CACHE[cache_key] = {'mosaics': self.mosaics, 'all_stars': self.all_stars, 'star_offsets': self.star_offsets}
 
-    def __len__(self):
-        return self.num_samples
+    def __len__(self): return self.num_samples
 
     def __getitem__(self, idx):
         m_idx = np.random.randint(0, len(self.mosaics))
         mosaic = self.mosaics[m_idx]
-        
         img_mmap = np.load(mosaic['img_path'], mmap_mode='r')
+        py, px = np.random.randint(0, img_mmap.shape[0] - self.img_size), np.random.randint(0, img_mmap.shape[1] - self.img_size)
+        star_signal = img_mmap[py:py+self.img_size, px:px+self.img_size].copy()
         
-        full_h, full_w = img_mmap.shape
-        py, px = np.random.randint(0, full_h - self.img_size), np.random.randint(0, full_w - self.img_size)
-        clean_physics = img_mmap[py:py+self.img_size, px:px+self.img_size].copy()
-        
-        exp_time, zp, sky_mag = mosaic['exp_time'], mosaic['zp'], mosaic['sky_mag']
-        scale = 0.11
-        sky_level = (10 ** (-0.4 * (sky_mag - zp))) * (scale**2) * exp_time
-        
-        img_with_sky = clean_physics + sky_level
-        img_noisy = np.random.poisson(np.maximum(img_with_sky, 0)).astype(np.float32)
-        img_noisy += np.random.normal(0, 5.0, size=img_noisy.shape)
-        
+        sky_level = (10 ** (-0.4 * (mosaic['sky_mag'] - mosaic['zp']))) * (0.11**2) * mosaic['exp_time']
+        img_noisy = np.random.poisson(np.maximum(star_signal + sky_level, 0)).astype(np.float32) + np.random.normal(0, 5.0, size=star_signal.shape)
         chunk_median = np.median(img_noisy)
-        normalized_image = self.transform.image_to_network(img_noisy, chunk_median)
-        image_tensor = torch.from_numpy(normalized_image).unsqueeze(0).float()
+        image_tensor = torch.from_numpy(self.transform.image_to_network(img_noisy, chunk_median)).unsqueeze(0).float()
 
-        s_start, s_end = self.star_offsets[m_idx], self.star_offsets[m_idx+1]
-        m_stars = self.all_stars[s_start:s_end]
-        
-        mask = (m_stars[:, 0] >= px) & (m_stars[:, 0] < px + self.img_size) & \
-               (m_stars[:, 1] >= py) & (m_stars[:, 1] < py + self.img_size)
-        
+        m_stars = self.all_stars[self.star_offsets[m_idx]:self.star_offsets[m_idx+1]]
+        mask = (m_stars[:, 0] >= px) & (m_stars[:, 0] < px + self.img_size) & (m_stars[:, 1] >= py) & (m_stars[:, 1] < py + self.img_size)
         local_stars = m_stars[mask]
-        if len(local_stars) == 0:
-            grid_stars = torch.zeros((self.grid_size, self.grid_size, self.K, 5 + self.S**2), dtype=torch.float32)
-        else:
-            sort_idx = np.argsort(local_stars[:, 2])[::-1]
-            local_stars = local_stars[sort_idx]
-            
-            lx = local_stars[:, 0] - px
-            ly = local_stars[:, 1] - py
-            fluxes = local_stars[:, 2]
-            
-            # --- Dynamic Confusion Threshold Calculation (FIX 4 for Dataset) ---
-            instrumental_variance = sky_level + 25.0 # Read noise squared
-            snr_boundary = 3.0
-            a_quad = 1
-            b_quad = -(snr_boundary**2)
-            c_quad = -(snr_boundary**2) * self.n_pix * instrumental_variance
-            flux_boundary = (-b_quad + np.sqrt(b_quad**2 - 4*a_quad*c_quad)) / 2.0
-            
-            faint_mask = fluxes < flux_boundary
-            faint_fluxes = fluxes[faint_mask]
-            area = self.img_size ** 2
-            
-            mean_sea_flux = np.sum(faint_fluxes) / area
-            var_conf = np.sum(faint_fluxes**2) / (area * self.n_pix)
-            
-            per_pixel_variance = instrumental_variance + mean_sea_flux + var_conf
-            snrs = fluxes / np.sqrt(fluxes + self.n_pix * per_pixel_variance)
-            comps = 1.0 / (1.0 + np.exp(-2.0 * (snrs - self.min_snr)))
-            
-            valid_mask = snrs >= self.min_snr
-            local_stars = local_stars[valid_mask]
-            lx = lx[valid_mask]
-            ly = ly[valid_mask]
-            fluxes = fluxes[valid_mask]
-            comps = comps[valid_mask]
-            
-            cxs = (lx // self.cell_size).astype(int)
-            cys = (ly // self.cell_size).astype(int)
-            
-            grid_stars_np = np.zeros((self.grid_size, self.grid_size, self.K, 5 + self.S**2), dtype=np.float32)
-            counts = np.zeros((self.grid_size, self.grid_size), dtype=np.int32)
-            
-            for i in range(len(local_stars)):
-                cx, cy = cxs[i], cys[i]
-                if cx < 0 or cx >= self.grid_size or cy < 0 or cy >= self.grid_size: continue
-                
-                slot = counts[cy, cx]
-                if slot < self.K:
-                    grid_stars_np[cy, cx, slot, 0] = float(comps[i])
-                    grid_stars_np[cy, cx, slot, 1] = float(lx[i] % self.cell_size)
-                    grid_stars_np[cy, cx, slot, 2] = float(ly[i] % self.cell_size)
-                    grid_stars_np[cy, cx, slot, 3] = float(fluxes[i])
-                    grid_stars_np[cy, cx, slot, 4] = float(comps[i])
-                    grid_stars_np[cy, cx, slot, 5:] = local_stars[i, 4:]
-                    counts[cy, cx] += 1
-            
-            grid_stars = torch.from_numpy(grid_stars_np)
-
-        bg_target_linear = sky_level - chunk_median
-        bg_grid_stretched = self.transform.target_bg_to_network(np.full((self.grid_size, self.grid_size), bg_target_linear, dtype=np.float32))
-        target = torch.cat([grid_stars.view(self.grid_size, self.grid_size, -1), torch.from_numpy(bg_grid_stretched).unsqueeze(-1).float()], dim=-1)
+        if len(local_stars) == 0: return {"image": image_tensor, "target": torch.zeros((self.grid_size, self.grid_size, self.K*5 + 1)), "chunk_median": float(chunk_median)}
         
+        lx, ly, fluxes = local_stars[:, 0] - px, local_stars[:, 1] - py, local_stars[:, 2]
+        ix, iy = np.clip(lx.astype(int), 0, self.img_size - 1), np.clip(ly.astype(int), 0, self.img_size - 1)
+        local_background = np.maximum(0, star_signal[iy, ix] - (fluxes * self.psf_peak))
+        snrs = fluxes / np.sqrt(fluxes + self.n_pix * (sky_level + local_background + 25.0))
+        
+        grid_stars = np.zeros((self.grid_size, self.grid_size, self.K, 5 + self.S**2), dtype=np.float32)
+        counts = np.zeros((self.grid_size, self.grid_size), dtype=np.int32)
+        sort_idx = np.argsort(fluxes)[::-1]
+        for i in sort_idx:
+            if snrs[i] >= self.min_snr:
+                cx, cy = int(lx[i] // self.cell_size), int(ly[i] // self.cell_size)
+                if 0 <= cx < self.grid_size and 0 <= cy < self.grid_size and counts[cy, cx] < self.K:
+                    slot = counts[cy, cx]
+                    comp = 1.0 / (1.0 + np.exp(-2.0 * (snrs[i] - self.min_snr)))
+                    grid_stars[cy, cx, slot, 0:5] = [comp, lx[i] % self.cell_size, ly[i] % self.cell_size, fluxes[i], comp]
+                    grid_stars[cy, cx, slot, 5:] = local_stars[i, 4:]; counts[cy, cx] += 1
+        
+        bg_grid = np.full((self.grid_size, self.grid_size), self.transform.target_bg_to_network(sky_level - chunk_median), dtype=np.float32)
+        target = torch.cat([torch.from_numpy(grid_stars).view(self.grid_size, self.grid_size, -1), torch.from_numpy(bg_grid).unsqueeze(-1)], dim=-1)
         return {"image": image_tensor, "target": target, "chunk_median": float(chunk_median)}
