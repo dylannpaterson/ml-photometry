@@ -10,18 +10,27 @@ import time
 from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE
 from scipy.signal import fftconvolve
 
-# GPU Acceleration
+# GPU/JAX Acceleration
 try:
     import jax
-    HAS_GPU = any(d.platform == 'gpu' for d in jax.devices())
-    if HAS_GPU:
-        from castor.data.gpu_renderer import render_generate_and_filter_gpu
+    # We use JAX even on CPU because it's faster and allows the same 'Bake and Drop' logic
+    HAS_JAX = True
+    from castor.data.gpu_renderer import render_generate_and_filter_gpu
+    # Check if actually using GPU for logging
+    if any(d.platform == 'gpu' for d in jax.devices()):
         print("🚀 JAX GPU Acceleration Enabled")
+    else:
+        print("🐢 JAX CPU Acceleration Enabled (No GPU found)")
 except ImportError:
-    HAS_GPU = False
+    HAS_JAX = False
+    print("⚠️ JAX not found, falling back to slow NumPy path")
 
 def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
-    """Generates a large seamless mosaic with pre-computed target grids."""
+    """
+    Generates a large seamless mosaic using the 'Bake and Drop' strategy.
+    Simulates full physics (8M stars) in the pixels, but culls the catalog 
+    to save RAM and speed up training.
+    """
     start_time = time.time()
     training_size = params['image_size'] # 256
     area_ratio = (mosaic_size / training_size)**2 # 16
@@ -33,6 +42,7 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     exp_time = np.random.uniform(30.0, 60.0)
     zp, sky_mag = 26.5, 22.0
     
+    # Full massive population (physics)
     n_stars_total = int(np.random.uniform(params['min_stars'], params['max_stars']) * area_ratio)
     
     print(f"Generating Global Catalog for Mosaic {idx} ({n_stars_total:,} stars)...")
@@ -41,78 +51,79 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     
     provider = GaussianPretrainingProvider(image_size=training_size)
     
-    # Render and Filter (GPU if available)
-    if HAS_GPU:
+    if HAS_JAX:
+        # --- JAX PATH: Render entire mosaic at once with full physics ---
         kb_array = np.zeros((16, provider.kernel_size, provider.kernel_size), dtype=np.float32)
         for i in range(4):
             for j in range(4):
                 kb_array[j * 4 + i] = provider.kernel_bank[(i, j)]
         
-        full_image, x_valid, y_valid, flux_valid, mag_valid = render_generate_and_filter_gpu(
+        # This renders ALL stars into full_image, but returns coordinates for only visible ones (mag < 27.5)
+        full_image, x_v, y_valid, flux_v, mag_v = render_generate_and_filter_gpu(
             fluxes, mags, kb_array, mosaic_size
         )
     else:
+        # --- NumPy CPU PATH (Slow) ---
         x_centers = np.random.uniform(0, mosaic_size, len(mags))
         y_centers = np.random.uniform(0, mosaic_size, len(mags))
         
-        # Original CPU rendering (simplified for brevity here, assuming it matches previous logic)
-        # In a real run, we'd keep the chunked loop.
-        # ... (CPU rendering logic) ...
-        # For now, if we are on L4, we focus on the HAS_GPU path.
-        pass
+        full_image = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
+        # For simplicity in fallback, we loop phases (matching original logic)
+        px = np.clip(np.floor((x_centers - np.floor(x_centers)) * provider.n_sub).astype(int), 0, provider.n_sub - 1)
+        py = np.clip(np.floor((y_centers - np.floor(y_centers)) * provider.n_sub).astype(int), 0, provider.n_sub - 1)
+        ix0, iy0 = np.floor(x_centers).astype(int), np.floor(y_centers).astype(int)
+        
+        for i in range(provider.n_sub):
+            for j in range(provider.n_sub):
+                p_mask = (px == i) & (py == j)
+                if p_mask.any():
+                    phase_map, _, _ = np.histogram2d(
+                        iy0[p_mask], ix0[p_mask], 
+                        bins=[mosaic_size, mosaic_size], 
+                        range=[[0, mosaic_size], [0, mosaic_size]], 
+                        weights=fluxes[p_mask]
+                    )
+                    full_image += fftconvolve(phase_map, provider.kernel_bank[(i, j)], mode='same').astype(np.float32)
+        
+        # Cull for catalog
+        v_mask = mags < 27.5
+        x_v, y_valid, flux_v, mag_v = x_centers[v_mask], y_centers[v_mask], fluxes[v_mask], mags[v_mask]
 
-    # 2. PRE-COMPUTE GLOBAL TARGET GRID
-    # This is the "JIT Painting" killer.
-    # Grid shape: (mosaic_size/cell_size, mosaic_size/cell_size, K, 5 + S^2)
-    grid_n = mosaic_size // cell_size
-    K, S = MAX_CAPACITY_PER_CELL, SHAPE_SIZE
-    # We store: [flux, rel_x, rel_y, mag, unused, psf_shape...]
-    global_grid = np.zeros((grid_n, grid_n, K, 5 + S**2), dtype=np.float32)
-    counts = np.zeros((grid_n, grid_n), dtype=np.int32)
+    # 2. Save Catalog as Structured NumPy for MMAP
+    cat_dtype = [
+        ('x', 'f4'), ('y', 'f4'), ('flux', 'f4'), ('mag', 'f4'),
+        ('shape', 'f4', (SHAPE_SIZE**2,))
+    ]
     
-    # Sort visible stars by flux for assignment
-    sort_idx = np.argsort(flux_valid)[::-1]
-    xv, yv, fv, mv = x_valid[sort_idx], y_valid[sort_idx], flux_valid[sort_idx], mag_valid[sort_idx]
+    n_visible = len(x_v)
+    structured_cat = np.zeros(n_visible, dtype=cat_dtype)
+    structured_cat['x'] = x_v
+    structured_cat['y'] = y_valid
+    structured_cat['flux'] = flux_v
+    structured_cat['mag'] = mag_v
     
-    # Standard PSF for target
-    half = S // 2
+    # Pre-compute target PSF
+    half = SHAPE_SIZE // 2
     grid_range = np.arange(-half, half + 1)
     sy, sx = np.meshgrid(grid_range, grid_range, indexing='ij')
     psf_flat = np.exp(-(sx**2 + sy**2) / (2 * 1.5**2))
     psf_flat = (psf_flat / psf_flat.sum()).astype(np.float32).flatten()
+    structured_cat['shape'] = psf_flat
 
-    print(f"Building Global Target Grid for Mosaic {idx}...")
-    for i in range(len(xv)):
-        cx, cy = int(xv[i] // cell_size), int(yv[i] // cell_size)
-        if 0 <= cx < grid_n and 0 <= cy < grid_n:
-            if counts[cy, cx] < K:
-                slot = counts[cy, cx]
-                # Store physical params. completeness will be calc'd live based on noise.
-                global_grid[cy, cx, slot, 0] = fv[i] # flux (as placeholder for comp)
-                global_grid[cy, cx, slot, 1] = xv[i] % cell_size
-                global_grid[cy, cx, slot, 2] = yv[i] % cell_size
-                global_grid[cy, cx, slot, 3] = fv[i]
-                global_grid[cy, cx, slot, 4] = mv[i] # magnitude
-                global_grid[cy, cx, slot, 5:] = psf_flat
-                counts[cy, cx] += 1
-
-    # 3. Save everything as NumPy for MMAP
+    # 3. Save Files
     image_path = os.path.join(output_dir, f"mosaic_{idx:03d}_img.npy")
-    grid_path = os.path.join(output_dir, f"mosaic_{idx:03d}_grid.npy")
+    cat_path = os.path.join(output_dir, f"mosaic_{idx:03d}_cat.npy")
     meta_path = os.path.join(output_dir, f"mosaic_{idx:03d}_meta.npy")
     
     np.save(image_path, full_image)
-    np.save(grid_path, global_grid)
-    
-    # Save experiment metadata
-    metadata = np.array([exp_time, zp, sky_mag], dtype=np.float32)
-    np.save(meta_path, metadata)
+    np.save(cat_path, structured_cat)
+    np.save(meta_path, np.array([exp_time, zp, sky_mag], dtype=np.float32))
     
     duration = time.time() - start_time
-    print(f"✅ Saved Optimized Mosaic {idx} in {duration:.2f}s")
+    print(f"✅ Saved Optimized Mosaic {idx} in {duration:.2f}s ({n_visible:,} potential targets)")
 
 def main():
-    parser = argparse.ArgumentParser(description="Pregenerate Seamless Compact Mosaics")
+    parser = argparse.ArgumentParser(description="Pregenerate Optimized Compact Mosaics")
     parser.add_argument("--config", default="config/config.yaml")
     parser.add_argument("--stage", type=int, default=0)
     parser.add_argument("--num", type=int, default=None)
@@ -131,7 +142,6 @@ def main():
     cell_size = stage_cfg.get("cell_size", DEFAULT_CELL_SIZE)
     
     output_dir = os.path.join(stage_cfg["data_dir"], "mosaics")
-    # We don't wipe here anymore if we want to be safe, but force_regenerate handles it in run_stage
     os.makedirs(output_dir, exist_ok=True)
     
     params = {

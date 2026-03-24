@@ -212,15 +212,14 @@ class GaussianMosaicDataset(Dataset):
         image_files = sorted([f for f in os.listdir(data_dir) if f.endswith("_img.npy")])
         for img_f in image_files:
             base = img_f.replace("_img.npy", "")
-            grid_f = base + "_grid.npy"
+            cat_f = base + "_cat.npy"
             meta_f = base + "_meta.npy"
             
-            if os.path.exists(os.path.join(data_dir, grid_f)) and os.path.exists(os.path.join(data_dir, meta_f)):
-                # Load metadata (exp_time, zp, sky_mag)
+            if os.path.exists(os.path.join(data_dir, cat_f)) and os.path.exists(os.path.join(data_dir, meta_f)):
                 meta = np.load(os.path.join(data_dir, meta_f))
                 self.mosaics.append({
                     'img_path': os.path.join(data_dir, img_f),
-                    'grid_path': os.path.join(data_dir, grid_f),
+                    'cat_path': os.path.join(data_dir, cat_f),
                     'exp_time': meta[0],
                     'zp': meta[1],
                     'sky_mag': meta[2]
@@ -237,10 +236,10 @@ class GaussianMosaicDataset(Dataset):
         
         # 1. Load sub-image using mmap for speed
         img_mmap = np.load(mosaic['img_path'], mmap_mode='r')
-        # Mosaic coords
         my, mx = img_mmap.shape
         py = np.random.randint(0, my - self.img_size)
         px = np.random.randint(0, mx - self.img_size)
+        # Deep copy the physics crop
         star_signal = img_mmap[py:py+self.img_size, px:px+self.img_size].copy()
         
         # 2. Add Live Noise
@@ -250,58 +249,44 @@ class GaussianMosaicDataset(Dataset):
         chunk_median = np.median(img_noisy)
         image_tensor = torch.from_numpy(self.transform.image_to_network(img_noisy, chunk_median)).unsqueeze(0).float()
 
-        # 3. SLICE PRE-COMPUTED GLOBAL GRID
-        # Grid coords: crop origin / cell_size
-        gy, gx = py // self.cell_size, px // self.cell_size
+        # 3. Load culled catalog using mmap
+        cat_mmap = np.load(mosaic['cat_path'], mmap_mode='r')
         
-        # mmap the global grid
-        grid_mmap = np.load(mosaic['grid_path'], mmap_mode='r')
-        # Slice the 64x64 (for 256 crop) region
-        local_grid = grid_mmap[gy:gy+self.grid_size, gx:gx+self.grid_size].copy()
+        # Fast spatial filter
+        mask = (cat_mmap['x'] >= px) & (cat_mmap['x'] < px + self.img_size) & \
+               (cat_mmap['y'] >= py) & (cat_mmap['y'] < py + self.img_size)
         
-        # 4. DYNAMIC SNR/COMPLETENESS UPDATE
-        # Channel 0: placeholder (flux), Channel 3: actual flux, Channel 4: mag
-        fluxes = local_grid[..., 3]
+        if not mask.any():
+            return {"image": image_tensor, "target": torch.zeros((self.grid_size, self.grid_size, self.K*(5+self.S**2) + 1)), "chunk_median": float(chunk_median)}
         
-        # Approximate local confusion for SNR
-        # For the pre-computed grid, we use the image data directly
-        # Flatten for vectorized map_coordinates if needed, but since it's a grid, 
-        # we can just use the star signal at the center of each cell or approximate.
-        # More accurate: use the sampled star_signal at rel_x, rel_y.
+        local_cat = cat_mmap[mask]
+        lx, ly = local_cat['x'] - px, local_cat['y'] - py
+        fluxes = local_cat['flux']
         
-        # Vectorized completeness update for all K slots
-        for k in range(self.K):
-            slot_flux = local_grid[..., k, 3]
-            slot_mask = slot_flux > 0
-            if not slot_mask.any(): continue
-            
-            # Sub-pixel positions relative to crop
-            # rel_x was xv % cell_size. Global grid stores rel_x relative to cell.
-            # We need rel_x/y relative to CROP for noise sampling if we were being perfect,
-            # but we can just use the cell center or the approximate star signal.
-            
-            # For simplicity and speed, use the background at the cell center
-            # or simply use the global sky_level for the baseline SNR.
-            noise_var = slot_flux + self.n_pix * (sky_level + 25.0)
-            snrs = slot_flux / np.sqrt(np.maximum(1.0, noise_var))
-            
-            # Sigmoid completeness mapping
-            comp = 1.0 / (1.0 + np.exp(-2.0 * (snrs - self.min_snr)))
-            # Zero out if below threshold
-            comp = np.where(snrs >= self.min_snr, comp, 0.0)
-            
-            # Update target channels: [comp, rel_x, rel_y, flux, comp]
-            local_grid[..., k, 0] = comp
-            local_grid[..., k, 4] = comp
-            # rel_x, rel_y (channels 1, 2) and flux (channel 3) are already correct.
-
-        # 5. Background Target
-        bg_val = self.transform.target_bg_to_network(sky_level - chunk_median)
-        bg_grid = np.full((self.grid_size, self.grid_size, 1), bg_val, dtype=np.float32)
+        # 4. Dynamic SNR Update against baked physics
+        # Sample the total signal at star centers
+        total_local_light = map_coordinates(star_signal, [ly, lx], order=1, mode='nearest')
+        local_background = np.maximum(0, total_local_light - (fluxes * self.psf_peak))
+        noise_variance = fluxes + self.n_pix * (sky_level + local_background + 25.0)
+        snrs = fluxes / np.sqrt(np.maximum(1.0, noise_variance))
         
-        # Combine into final target tensor: (grid, grid, K*86 + 1)
-        # local_grid is (64, 64, 3, 86). Flatten last two dims.
-        target_flat = local_grid.reshape(self.grid_size, self.grid_size, -1)
-        target = torch.cat([torch.from_numpy(target_flat), torch.from_numpy(bg_grid)], dim=-1)
+        # 5. Grid Painting (Optimized)
+        grid_stars = np.zeros((self.grid_size, self.grid_size, self.K, 5 + self.S**2), dtype=np.float32)
+        counts = np.zeros((self.grid_size, self.grid_size), dtype=np.int32)
+        sort_idx = np.argsort(fluxes)[::-1]
+        
+        for i in sort_idx:
+            if snrs[i] >= self.min_snr:
+                cx, cy = int(lx[i] // self.cell_size), int(ly[i] // self.cell_size)
+                if 0 <= cx < self.grid_size and 0 <= cy < self.grid_size and counts[cy, cx] < self.K:
+                    slot = counts[cy, cx]
+                    comp = 1.0 / (1.0 + np.exp(-2.0 * (snrs[i] - self.min_snr)))
+                    # Channel [comp, rel_x, rel_y, flux, comp]
+                    grid_stars[cy, cx, slot, 0:5] = [comp, lx[i] % self.cell_size, ly[i] % self.cell_size, fluxes[i], comp]
+                    grid_stars[cy, cx, slot, 5:] = local_cat[i]['shape']
+                    counts[cy, cx] += 1
+        
+        bg_grid = np.full((self.grid_size, self.grid_size, 1), self.transform.target_bg_to_network(sky_level - chunk_median), dtype=np.float32)
+        target = torch.cat([torch.from_numpy(grid_stars).view(self.grid_size, self.grid_size, -1), torch.from_numpy(bg_grid)], dim=-1)
         
         return {"image": image_tensor, "target": target, "chunk_median": float(chunk_median)}
