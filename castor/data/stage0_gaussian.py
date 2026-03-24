@@ -237,6 +237,13 @@ class GaussianMosaicDataset(Dataset):
         self.psf_peak = 1.0 / (2 * np.pi * self.sigma_fixed**2)
         self.min_snr = 5.0
         
+        # Tracking for Worker-Pinned RAM Cache
+        self.active_mosaic_idx = -1
+        self.active_img = None
+        self.active_cat = None
+        self.samples_from_current = 0
+        self.max_samples_per_mosaic = 200 # Rotate every 200 samples
+        
         # Load mosaic manifests
         self.mosaics = []
         image_files = sorted([f for f in os.listdir(data_dir) if f.endswith("_img.npy")])
@@ -258,20 +265,37 @@ class GaussianMosaicDataset(Dataset):
         if not self.mosaics:
             print(f"⚠️ Warning: No optimized mosaics found in {data_dir}. Check generation script.")
 
+    def _load_mosaic_to_ram(self, m_idx):
+        """Sequential block read into RAM to bypass choked SSD IOPS."""
+        mosaic = self.mosaics[m_idx]
+        self.active_img = np.load(mosaic['img_path'])
+        
+        cat_raw = np.load(mosaic['cat_path'])
+        # Sort by Y for binary search optimization
+        self.active_cat = cat_raw[np.argsort(cat_raw['y'])]
+        
+        self.active_mosaic_idx = m_idx
+        self.samples_from_current = 0
+
     def __len__(self): return self.num_samples
 
     def __getitem__(self, idx):
-        m_idx = np.random.randint(0, len(self.mosaics))
-        mosaic = self.mosaics[m_idx]
+        # 1. Manage RAM Cache
+        if self.active_mosaic_idx == -1 or self.samples_from_current >= self.max_samples_per_mosaic:
+            # Important: Use fresh random for workers
+            new_idx = np.random.randint(0, len(self.mosaics))
+            self._load_mosaic_to_ram(new_idx)
+            
+        self.samples_from_current += 1
+        mosaic = self.mosaics[self.active_mosaic_idx]
         
-        # 1. Load sub-image using mmap for speed
-        img_mmap = np.load(mosaic['img_path'], mmap_mode='r')
-        my, mx = img_mmap.shape
+        # 2. Slice from RAM
+        my, mx = self.active_img.shape
         py = np.random.randint(0, my - self.img_size)
         px = np.random.randint(0, mx - self.img_size)
-        star_signal_np = img_mmap[py:py+self.img_size, px:px+self.img_size].copy()
+        star_signal_np = self.active_img[py:py+self.img_size, px:px+self.img_size].copy()
         
-        # 2. Add Live Noise using PyTorch
+        # 3. Add Live Noise using PyTorch
         pixel_scale = 0.11
         sky_level = (10 ** (-0.4 * (mosaic['sky_mag'] - mosaic['zp']))) * (pixel_scale**2) * mosaic['exp_time']
         signal_tensor = torch.from_numpy(star_signal_np + sky_level).clamp(min=0)
@@ -281,19 +305,21 @@ class GaussianMosaicDataset(Dataset):
         chunk_median = np.median(img_noisy_np)
         image_tensor = torch.from_numpy(self.transform.image_to_network(img_noisy_np, chunk_median)).unsqueeze(0).float()
 
-        # 3. Load culled catalog using mmap
-        cat_mmap = np.load(mosaic['cat_path'], mmap_mode='r')
-        mask = (cat_mmap['x'] >= px) & (cat_mmap['x'] < px + self.img_size) & \
-               (cat_mmap['y'] >= py) & (cat_mmap['y'] < py + self.img_size)
+        # 4. Binary Search spatial filter in RAM
+        y_start = np.searchsorted(self.active_cat['y'], py)
+        y_end = np.searchsorted(self.active_cat['y'], py + self.img_size)
         
-        if not mask.any():
+        band_cat = self.active_cat[y_start:y_end]
+        mask_x = (band_cat['x'] >= px) & (band_cat['x'] < px + self.img_size)
+        
+        if not mask_x.any():
             return {"image": image_tensor, "target": torch.zeros((self.grid_size, self.grid_size, self.K*(5+self.S**2) + 1)), "chunk_median": float(chunk_median)}
         
-        local_cat = cat_mmap[mask]
+        local_cat = band_cat[mask_x]
         lx, ly = local_cat['x'] - px, local_cat['y'] - py
         fluxes = local_cat['flux']
         
-        # 4. Optimized SNR Update (Nearest Neighbor)
+        # 5. Optimized SNR Update (Nearest Neighbor)
         ly_idx = np.clip(ly.astype(np.int32), 0, self.img_size - 1)
         lx_idx = np.clip(lx.astype(np.int32), 0, self.img_size - 1)
         total_local_light = star_signal_np[ly_idx, lx_idx]
@@ -302,7 +328,7 @@ class GaussianMosaicDataset(Dataset):
         noise_variance = fluxes + self.n_pix * (sky_level + local_background + 25.0)
         snrs = fluxes / np.sqrt(np.maximum(1.0, noise_variance))
         
-        # 5. Grid Painting (Numba Optimized)
+        # 6. Grid Painting (Numba Optimized)
         sort_idx = np.argsort(fluxes)[::-1]
         grid_stars_np = fast_paint_grid(
             lx, ly, fluxes, snrs, local_cat['shape'], sort_idx, 
