@@ -3,6 +3,7 @@ import jax.numpy as jnp
 from jax import lax
 import numpy as np
 import math
+import time
 
 def _get_jax_renderer_core():
     """Returns the core rendering logic as a JIT-able function."""
@@ -44,7 +45,6 @@ def _get_fused_generator_renderer():
     """Returns a JIT-compiled function that generates coords and renders."""
     render_core = _get_jax_renderer_core()
     
-    @jax.jit(static_argnums=(4,))
     def fused_op(key, fluxes, mags, kernel_bank, mosaic_size):
         n_stars = fluxes.shape[0]
         k1, k2 = jax.random.split(key)
@@ -57,29 +57,24 @@ def _get_fused_generator_renderer():
         image = render_core(x, y, fluxes, kernel_bank, mosaic_size)
         
         # 3. Filter Mask (mags < 27.0)
-        # We also need to handle the padding mask here if we want to return clean data
-        # but for simplicity we return the full arrays and let the host mask.
-        # Dummy stars (flux=0) won't affect the image.
         catalog_mask = mags < 27.0
         
         return image, x, y, catalog_mask
 
-    return fused_op
+    return jax.jit(fused_op, static_argnums=(4,))
 
 _FUSED_OP = None
-_JAX_KEY = jax.random.PRNGKey(int(time.time())) if 'time' in globals() else jax.random.PRNGKey(42)
+_JAX_KEY = jax.random.PRNGKey(int(time.time()))
 
 def render_generate_and_filter_gpu(fluxes, mags, kernel_bank, mosaic_size):
     """
     Fused GPU entry point.
     Generates x, y on GPU, renders, and returns image + filtered catalog arrays.
     """
-    import time
     global _FUSED_OP, _JAX_KEY
     if _FUSED_OP is None:
         _FUSED_OP = _get_fused_generator_renderer()
     
-    # manage key
     _JAX_KEY, subkey = jax.random.split(_JAX_KEY)
     
     # --- PADDING TO PREVENT CONSTANT RECOMPILATION ---
@@ -90,7 +85,7 @@ def render_generate_and_filter_gpu(fluxes, mags, kernel_bank, mosaic_size):
     
     if pad_width > 0:
         fluxes_padded = np.pad(fluxes, (0, pad_width), constant_values=0.0)
-        mags_padded = np.pad(mags, (0, pad_width), constant_values=99.0) # Very dim
+        mags_padded = np.pad(mags, (0, pad_width), constant_values=99.0)
     else:
         fluxes_padded, mags_padded = fluxes, mags
 
@@ -102,30 +97,19 @@ def render_generate_and_filter_gpu(fluxes, mags, kernel_bank, mosaic_size):
     # Run Fused Op
     image_jax, x_jax, y_jax, mask_jax = _FUSED_OP(subkey, fluxes_jax, mags_jax, kernels_jax, mosaic_size)
     
-    # Transfer back ONLY what we need
-    # The image is always transferred.
+    # Transfer back
     image = np.array(image_jax)
     
-    # For the catalog, we apply the mask on GPU to minimize transfer size if possible,
-    # but JAX boolean indexing creates dynamic shapes. 
-    # Instead, we transfer x, y, mask and filter on host. 
-    # (Still better than transferring 80M CPU-generated coords to GPU).
-    
-    # Optimization: Only transfer back the "True" entries if we want to be fancy,
-    # but np.array(x_jax[mask_jax]) would work.
-    
+    # Efficient host-side filtering
     mask = np.array(mask_jax)
-    # Only return the portion that isn't padding AND is valid
-    # But padding stars have mags=99, so mask handles it.
-    
-    valid_x = np.array(x_jax[mask_jax])
-    valid_y = np.array(y_jax[mask_jax])
-    valid_flux = np.array(fluxes_jax[mask_jax])
-    valid_mags = np.array(mags_jax[mask_jax])
+    valid_x = np.array(x_jax)[mask]
+    valid_y = np.array(y_jax)[mask]
+    valid_flux = np.array(fluxes_jax)[mask]
+    valid_mags = np.array(mags_jax)[mask]
     
     return image, valid_x, valid_y, valid_flux, valid_mags
 
-# Keep the old one for compatibility if needed, but updated to use core
+# Keep the old one for compatibility
 def render_gpu(x, y, fluxes, kernel_bank, mosaic_size):
     """Legacy entry point."""
     global _RENDER_CORE
@@ -133,7 +117,6 @@ def render_gpu(x, y, fluxes, kernel_bank, mosaic_size):
         global _RENDER_CORE
         _RENDER_CORE = jax.jit(_get_jax_renderer_core(), static_argnums=(4,))
     
-    # Padding logic same as before...
     current_size = len(x)
     chunk_size = 1_000_000 
     padded_size = int(math.ceil(current_size / chunk_size)) * chunk_size
