@@ -13,7 +13,7 @@ sudo apt-get update && sudo apt-get install -y htop nvtop screen
 echo "Installing Python dependencies and 'castor' package..."
 pip install --upgrade pip
 # This will install all dependencies from pyproject.toml
-pip install .
+pip install . --extra-index-url https://download.pytorch.org/whl/cu124
 
 # 3. Verify GPU Availability (Crucial for Cloud runs)
 echo "Checking for NVIDIA GPU..."

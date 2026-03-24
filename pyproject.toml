@@ -9,8 +9,8 @@ description = "Roman Point Source ML Pipeline Training & Research"
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [
-    "torch",
-    "torchvision",
+    "torch==2.5.1+cu124",
+    "torchvision==0.20.1+cu124",
     "numpy",
     "pyyaml",
     "astropy",
