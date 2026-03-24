@@ -68,7 +68,7 @@ class GaussianPretrainingProvider(Dataset):
         self.sigma_fixed = 1.5
         self.kernel_bank = self._precompute_kernel_bank(sigma=self.sigma_fixed)
         
-        # Effective PSF area for SNR calculation (FIX 1)
+        # Effective PSF area for SNR calculation
         self.n_pix = 4 * np.pi * (self.sigma_fixed ** 2)
         
         # Pre-allocate coordinate grids for vectorization
@@ -151,7 +151,7 @@ class GaussianPretrainingProvider(Dataset):
         pixel_scale = 0.11 
         sky_level = (10 ** (-0.4 * (sky_mag - zp))) * (pixel_scale**2) * exp_time
         
-        # NEW: Unified population rendering (deep exponential LF)
+        # 1. Unified population rendering (deep exponential LF)
         n_stars = 100000 
         mags = sample_bulge_magnitudes(n_stars, rc_loc, rc_scale, rc_fraction, m_min=12.0, m_max=32.0)
         fluxes = exp_time * (10 ** (-0.4 * (mags - zp)))
@@ -203,7 +203,30 @@ class GaussianPretrainingProvider(Dataset):
         chunk_median = np.median(raw_image)
         normalized_image = self.transform.image_to_network(raw_image, chunk_median)
 
-        # --- JIT Target Grid Construction (Filter by Correct Physical SNR) ---
+        # --- Dynamic Confusion Threshold Calculation (FIX 4) ---
+        instrumental_variance = sky_level + self.read_noise**2
+        snr_boundary = 3.0
+        # Quadratic formula to find flux at SNR=3 against instrument noise
+        a_quad = 1
+        b_quad = -(snr_boundary**2)
+        c_quad = -(snr_boundary**2) * self.n_pix * instrumental_variance
+        flux_boundary = (-b_quad + np.sqrt(b_quad**2 - 4*a_quad*c_quad)) / 2.0
+        
+        faint_mask = fluxes < flux_boundary
+        faint_fluxes = fluxes[faint_mask]
+        area = self.img_size ** 2
+        
+        # Mean flux and confusion variance from the unresolved sea
+        mean_sea_flux = np.sum(faint_fluxes) / area
+        var_conf = np.sum(faint_fluxes**2) / (area * self.n_pix)
+        
+        # Total per-pixel variance including confusion
+        per_pixel_variance = instrumental_variance + mean_sea_flux + var_conf
+        
+        # Vectorized SNR for all stars
+        snr_array = fluxes / np.sqrt(fluxes + self.n_pix * per_pixel_variance)
+
+        # --- Target Grid Construction ---
         base_grid = np.zeros((self.grid_size, self.grid_size, self.K, 5), dtype=np.float32)
         half = self.S // 2
         grid_range = np.arange(-half, half + 1)
@@ -212,28 +235,10 @@ class GaussianPretrainingProvider(Dataset):
         psf_shape /= (psf_shape.sum() + 1e-9)
         psf_shape_flat = psf_shape.astype(np.float32).flatten()
         
-        # PSF Peak for subtraction (For sigma=1.5, peak is ~0.07)
-        psf_peak = 1.0 / (2 * np.pi * (self.sigma_fixed**2))
-        
         shapes, indices, catalog_stars = [], [], []
         cell_assignments = {}
-        
-        # 1. Vectorized sampling of the rendered signal at star centers
-        # We use star_signal (clean photons) to find the local confusion level
-        ix = np.clip(x_centers.astype(int), 0, self.img_size - 1)
-        iy = np.clip(y_centers.astype(int), 0, self.img_size - 1)
-        total_local_light = star_signal[iy, ix]
-        
-        # 2. Confusion-Limited SNR Calculation
-        # Local background = (Total signal at point) - (This star's own peak)
-        local_neighbor_light = np.maximum(0, total_local_light - (fluxes * psf_peak))
-        
-        # Effective variance includes the sky, read noise, and all overlapping neighbors
-        noise_variance = fluxes + self.n_pix * (sky_level + self.read_noise**2 + local_neighbor_light)
-        snrs = fluxes / np.sqrt(noise_variance)
-        
         for i in range(n_stars):
-            tx, ty, flux, snr = x_centers[i], y_centers[i], fluxes[i], snrs[i]
+            tx, ty, flux, snr = x_centers[i], y_centers[i], fluxes[i], snr_array[i]
             cx, cy = int(tx // self.cell_size), int(ty // self.cell_size)
             if cx < 0 or cx >= self.grid_size or cy < 0 or cy >= self.grid_size: continue
             
@@ -385,8 +390,23 @@ class GaussianMosaicDataset(Dataset):
             ly = local_stars[:, 1] - py
             fluxes = local_stars[:, 2]
             
-            noise_variance = fluxes + self.n_pix * (sky_level + 25.0)
-            snrs = fluxes / np.sqrt(noise_variance)
+            # --- Dynamic Confusion Threshold Calculation (FIX 4 for Dataset) ---
+            instrumental_variance = sky_level + 25.0 # Read noise squared
+            snr_boundary = 3.0
+            a_quad = 1
+            b_quad = -(snr_boundary**2)
+            c_quad = -(snr_boundary**2) * self.n_pix * instrumental_variance
+            flux_boundary = (-b_quad + np.sqrt(b_quad**2 - 4*a_quad*c_quad)) / 2.0
+            
+            faint_mask = fluxes < flux_boundary
+            faint_fluxes = fluxes[faint_mask]
+            area = self.img_size ** 2
+            
+            mean_sea_flux = np.sum(faint_fluxes) / area
+            var_conf = np.sum(faint_fluxes**2) / (area * self.n_pix)
+            
+            per_pixel_variance = instrumental_variance + mean_sea_flux + var_conf
+            snrs = fluxes / np.sqrt(fluxes + self.n_pix * per_pixel_variance)
             comps = 1.0 / (1.0 + np.exp(-2.0 * (snrs - self.min_snr)))
             
             valid_mask = snrs >= self.min_snr
