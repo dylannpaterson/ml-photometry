@@ -45,7 +45,7 @@ def _get_fused_generator_renderer():
     """Returns a JIT-compiled function that generates coords and renders."""
     render_core = _get_jax_renderer_core()
     
-    def fused_op(key, fluxes, mags, kernel_bank, mosaic_size):
+    def fused_op(key, fluxes, mags, kernel_bank, mosaic_size, mag_limit):
         n_stars = fluxes.shape[0]
         k1, k2 = jax.random.split(key)
         
@@ -56,21 +56,21 @@ def _get_fused_generator_renderer():
         # 2. Render
         image = render_core(x, y, fluxes, kernel_bank, mosaic_size)
         
-        # 3. Filter Mask (mags < 27.0)
-        catalog_mask = mags < 27.0
+        # 3. Filter Mask based on dynamic limit
+        catalog_mask = mags < mag_limit
         
         return image, x, y, catalog_mask
 
     return jax.jit(fused_op, static_argnums=(4,))
 
 _FUSED_OP = None
-_JAX_KEY = jax.random.PRNGKey(int(time.time()))
+_JAX_KEY = jax.random.PRNGKey(int(time.time())) if 'time' in globals() else jax.random.PRNGKey(42)
 
-def render_generate_and_filter_gpu(fluxes, mags, kernel_bank, mosaic_size):
+def render_generate_and_filter_gpu(fluxes, mags, kernel_bank, mosaic_size, mag_limit=27.0):
     """
-    Fused GPU entry point.
-    Generates x, y on GPU, renders, and returns image + filtered catalog arrays.
+    Fused GPU entry point with dynamic magnitude limit.
     """
+    import time
     global _FUSED_OP, _JAX_KEY
     if _FUSED_OP is None:
         _FUSED_OP = _get_fused_generator_renderer()
@@ -95,13 +95,12 @@ def render_generate_and_filter_gpu(fluxes, mags, kernel_bank, mosaic_size):
     kernels_jax = jnp.array(kernel_bank)
     
     # Run Fused Op
-    image_jax, x_jax, y_jax, mask_jax = _FUSED_OP(subkey, fluxes_jax, mags_jax, kernels_jax, mosaic_size)
+    image_jax, x_jax, y_jax, mask_jax = _FUSED_OP(subkey, fluxes_jax, mags_jax, kernels_jax, mosaic_size, mag_limit)
     
     # Transfer back
     image = np.array(image_jax)
-    
-    # Efficient host-side filtering
     mask = np.array(mask_jax)
+    
     valid_x = np.array(x_jax)[mask]
     valid_y = np.array(y_jax)[mask]
     valid_flux = np.array(fluxes_jax)[mask]
@@ -109,7 +108,6 @@ def render_generate_and_filter_gpu(fluxes, mags, kernel_bank, mosaic_size):
     
     return image, valid_x, valid_y, valid_flux, valid_mags
 
-# Keep the old one for compatibility
 def render_gpu(x, y, fluxes, kernel_bank, mosaic_size):
     """Legacy entry point."""
     global _RENDER_CORE
