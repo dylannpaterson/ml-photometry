@@ -112,10 +112,15 @@ class InferenceEngine:
         # Statistics & Matching for Visualization
         matches, unmatched_true, unmatched_pred = match_stars(true_catalogue, predicted_stars, distance_threshold=2.0)
         
-        true_mags, pred_mags = [], []
+        # Pairs for scatter plot
+        matched_true_mags, matched_pred_mags = [], []
         for t_idx, p_idx, _ in matches:
-            true_mags.append(np.log10(true_catalogue[t_idx][2] + 1e-9))
-            pred_mags.append(np.log10(predicted_stars[p_idx][2] + 1e-9))
+            matched_true_mags.append(np.log10(true_catalogue[t_idx][2] + 1e-9))
+            matched_pred_mags.append(np.log10(predicted_stars[p_idx][2] + 1e-9))
+
+        # Full populations for histograms
+        all_true_mags = [np.log10(s[2] + 1e-9) for s in true_catalogue]
+        all_pred_mags = [np.log10(s[2] + 1e-9) for s in predicted_stars]
 
         # 6. Figure Layout
         fig = plt.figure(figsize=(30, 24))
@@ -175,26 +180,32 @@ class InferenceEngine:
         add_colorbar(im5, ax5)
 
         # Row 4-5: PSF & Mag Plots & Missed Stats
-        if true_mags:
+        if matched_true_mags:
             ax8 = fig.add_subplot(gs[3:, 0])
-            ax8.scatter(true_mags, pred_mags, alpha=0.5, s=10)
-            all_mags = true_mags + pred_mags
-            mmin, mmax = min(all_mags), max(all_mags)
+            ax8.scatter(matched_true_mags, matched_pred_mags, alpha=0.5, s=10)
+            all_plot_mags = matched_true_mags + matched_pred_mags
+            mmin, mmax = min(all_plot_mags), max(all_plot_mags)
             ax8.plot([mmin, mmax], [mmin, mmax], 'r--', alpha=0.8)
             ax8.set_xlabel("True log10(Flux)")
             ax8.set_ylabel("Predicted log10(Flux)")
-            ax8.set_title("Magnitude Recovery Accuracy")
+            ax8.set_title("Magnitude Recovery Accuracy (Matched Pairs)")
             ax8.set_aspect('equal')
             ax8.grid(True, alpha=0.3)
 
-            # NEW: Flux Distribution Histogram
+        if all_true_mags:
+            # NEW: Flux Distribution Histogram (ALL stars)
             ax_hist = fig.add_subplot(gs[3, 1])
-            bins = np.linspace(mmin, mmax, 30)
-            ax_hist.hist(true_mags, bins=bins, alpha=0.3, label='True', color='gray')
-            ax_hist.hist(pred_mags, bins=bins, alpha=0.5, label='Predicted', color='C0', histtype='step', linewidth=2)
+            mmin_h, mmax_h = min(all_true_mags), max(all_true_mags)
+            if all_pred_mags:
+                mmin_h = min(mmin_h, min(all_pred_mags))
+                mmax_h = max(mmax_h, max(all_pred_mags))
+            
+            bins = np.linspace(mmin_h, mmax_h, 30)
+            ax_hist.hist(all_true_mags, bins=bins, alpha=0.3, label='True (Full)', color='gray')
+            ax_hist.hist(all_pred_mags, bins=bins, alpha=0.5, label='Predicted (Full)', color='C0', histtype='step', linewidth=2)
             ax_hist.set_xlabel("log10(Flux)")
             ax_hist.set_ylabel("Count")
-            ax_hist.set_title("Flux Distribution Comparison")
+            ax_hist.set_title("Luminosity Function Comparison (All Stars)")
             ax_hist.legend()
             ax_hist.grid(True, alpha=0.2)
 
