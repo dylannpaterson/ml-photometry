@@ -16,7 +16,7 @@ curriculum:
     resume_from_last_stage: false
     cell_size: 4 # Centralized default: 4
     mosaic_params:
-      num_mosaics: 250
+      num_mosaics: 200
       mosaic_size: 1024
 
   # Stage 1: Multi-Telescope Foundation Training (GalSim)
@@ -30,7 +30,7 @@ curriculum:
     num_workers: 4
     resume_from_last_stage: true
     mosaic_params:
-      num_mosaics: 250
+      num_mosaics: 200
       mosaic_size: 1024
 
   # Stage 2: Roman-specific High-Fidelity Fine-tuning (Romanisim)

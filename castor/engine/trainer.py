@@ -89,7 +89,33 @@ class Trainer:
                 'val_loss': val_loss,
             }
             torch.save(checkpoint, os.path.join("checkpoints", f"{self.checkpoint_prefix}_epoch_{epoch+1}.pth"))
+            self._prune_checkpoints()
         torch.save(self.model.state_dict(), os.path.join("checkpoints", f"{self.checkpoint_prefix}_final.pth"))
+
+    def _prune_checkpoints(self, keep_last=10):
+        checkpoint_dir = "checkpoints"
+        if not os.path.exists(checkpoint_dir): return
+        
+        pattern = re.compile(rf"{self.checkpoint_prefix}_epoch_(\d+)\.pth")
+        checkpoints = []
+        for f in os.listdir(checkpoint_dir):
+            match = pattern.match(f)
+            if match:
+                epoch = int(match.group(1))
+                checkpoints.append((epoch, f))
+        
+        # Sort by epoch
+        checkpoints.sort()
+        
+        # Delete old ones
+        if len(checkpoints) > keep_last:
+            for i in range(len(checkpoints) - keep_last):
+                file_to_delete = os.path.join(checkpoint_dir, checkpoints[i][1])
+                try:
+                    os.remove(file_to_delete)
+                    print(f"🗑️ Pruned old checkpoint: {file_to_delete}")
+                except OSError:
+                    pass
 
     def validate(self):
         self.model.eval(); val_loss = 0
