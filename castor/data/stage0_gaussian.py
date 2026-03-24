@@ -8,11 +8,41 @@ from scipy.ndimage import gaussian_filter, map_coordinates
 from scipy.signal import fftconvolve
 from castor.data.transforms import AstroSpaceTransform
 from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE
+from numba import njit
 
 try:
     import galsim
 except ImportError:
     galsim = None
+
+@njit(fastmath=True)
+def fast_paint_grid(lx, ly, fluxes, snrs, shapes, sort_idx, min_snr, grid_size, cell_size, K, S_sq):
+    grid_stars = np.zeros((grid_size, grid_size, K, 5 + S_sq), dtype=np.float32)
+    counts = np.zeros((grid_size, grid_size), dtype=np.int32)
+    
+    for idx in range(len(sort_idx)):
+        i = sort_idx[idx]
+        if snrs[i] >= min_snr:
+            cx = int(lx[i] // cell_size)
+            cy = int(ly[i] // cell_size)
+            
+            if 0 <= cx < grid_size and 0 <= cy < grid_size:
+                slot = counts[cy, cx]
+                if slot < K:
+                    comp = 1.0 / (1.0 + np.exp(-2.0 * (snrs[i] - min_snr)))
+                    grid_stars[cy, cx, slot, 0] = comp
+                    grid_stars[cy, cx, slot, 1] = lx[i] % cell_size
+                    grid_stars[cy, cx, slot, 2] = ly[i] % cell_size
+                    grid_stars[cy, cx, slot, 3] = fluxes[i]
+                    grid_stars[cy, cx, slot, 4] = comp
+                    
+                    # Numba handles this inner assignment instantly
+                    for s in range(S_sq):
+                        grid_stars[cy, cx, slot, 5+s] = shapes[i, s]
+                        
+                    counts[cy, cx] += 1
+                    
+    return grid_stars
 
 # --- 1. The Dynamic Bulge LF Sampler (RC Prior) ---
 def sample_bulge_magnitudes(n_total, rc_mag, rc_sigma, rc_enhancement=3.0, m_min=12.0, m_max=32.0, gamma=0.3):
@@ -239,20 +269,20 @@ class GaussianMosaicDataset(Dataset):
         my, mx = img_mmap.shape
         py = np.random.randint(0, my - self.img_size)
         px = np.random.randint(0, mx - self.img_size)
-        # Deep copy the physics crop
-        star_signal = img_mmap[py:py+self.img_size, px:px+self.img_size].copy()
+        star_signal_np = img_mmap[py:py+self.img_size, px:px+self.img_size].copy()
         
-        # 2. Add Live Noise
+        # 2. Add Live Noise using PyTorch
         pixel_scale = 0.11
         sky_level = (10 ** (-0.4 * (mosaic['sky_mag'] - mosaic['zp']))) * (pixel_scale**2) * mosaic['exp_time']
-        img_noisy = np.random.poisson(np.maximum(star_signal + sky_level, 0)).astype(np.float32) + np.random.normal(0, 5.0, size=star_signal.shape)
-        chunk_median = np.median(img_noisy)
-        image_tensor = torch.from_numpy(self.transform.image_to_network(img_noisy, chunk_median)).unsqueeze(0).float()
+        signal_tensor = torch.from_numpy(star_signal_np + sky_level).clamp(min=0)
+        img_noisy_tensor = torch.poisson(signal_tensor) + torch.randn_like(signal_tensor) * 5.0
+        
+        img_noisy_np = img_noisy_tensor.numpy()
+        chunk_median = np.median(img_noisy_np)
+        image_tensor = torch.from_numpy(self.transform.image_to_network(img_noisy_np, chunk_median)).unsqueeze(0).float()
 
         # 3. Load culled catalog using mmap
         cat_mmap = np.load(mosaic['cat_path'], mmap_mode='r')
-        
-        # Fast spatial filter
         mask = (cat_mmap['x'] >= px) & (cat_mmap['x'] < px + self.img_size) & \
                (cat_mmap['y'] >= py) & (cat_mmap['y'] < py + self.img_size)
         
@@ -263,30 +293,23 @@ class GaussianMosaicDataset(Dataset):
         lx, ly = local_cat['x'] - px, local_cat['y'] - py
         fluxes = local_cat['flux']
         
-        # 4. Dynamic SNR Update against baked physics
-        # Sample the total signal at star centers
-        total_local_light = map_coordinates(star_signal, [ly, lx], order=1, mode='nearest')
+        # 4. Optimized SNR Update (Nearest Neighbor)
+        ly_idx = np.clip(ly.astype(np.int32), 0, self.img_size - 1)
+        lx_idx = np.clip(lx.astype(np.int32), 0, self.img_size - 1)
+        total_local_light = star_signal_np[ly_idx, lx_idx]
+        
         local_background = np.maximum(0, total_local_light - (fluxes * self.psf_peak))
         noise_variance = fluxes + self.n_pix * (sky_level + local_background + 25.0)
         snrs = fluxes / np.sqrt(np.maximum(1.0, noise_variance))
         
-        # 5. Grid Painting (Optimized)
-        grid_stars = np.zeros((self.grid_size, self.grid_size, self.K, 5 + self.S**2), dtype=np.float32)
-        counts = np.zeros((self.grid_size, self.grid_size), dtype=np.int32)
+        # 5. Grid Painting (Numba Optimized)
         sort_idx = np.argsort(fluxes)[::-1]
-        
-        for i in sort_idx:
-            if snrs[i] >= self.min_snr:
-                cx, cy = int(lx[i] // self.cell_size), int(ly[i] // self.cell_size)
-                if 0 <= cx < self.grid_size and 0 <= cy < self.grid_size and counts[cy, cx] < self.K:
-                    slot = counts[cy, cx]
-                    comp = 1.0 / (1.0 + np.exp(-2.0 * (snrs[i] - self.min_snr)))
-                    # Channel [comp, rel_x, rel_y, flux, comp]
-                    grid_stars[cy, cx, slot, 0:5] = [comp, lx[i] % self.cell_size, ly[i] % self.cell_size, fluxes[i], comp]
-                    grid_stars[cy, cx, slot, 5:] = local_cat[i]['shape']
-                    counts[cy, cx] += 1
+        grid_stars_np = fast_paint_grid(
+            lx, ly, fluxes, snrs, local_cat['shape'], sort_idx, 
+            self.min_snr, self.grid_size, self.cell_size, self.K, self.S**2
+        )
         
         bg_grid = np.full((self.grid_size, self.grid_size, 1), self.transform.target_bg_to_network(sky_level - chunk_median), dtype=np.float32)
-        target = torch.cat([torch.from_numpy(grid_stars).view(self.grid_size, self.grid_size, -1), torch.from_numpy(bg_grid)], dim=-1)
+        target = torch.cat([torch.from_numpy(grid_stars_np).view(self.grid_size, self.grid_size, -1), torch.from_numpy(bg_grid)], dim=-1)
         
         return {"image": image_tensor, "target": target, "chunk_median": float(chunk_median)}
