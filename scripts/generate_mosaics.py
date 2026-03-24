@@ -38,21 +38,32 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     print(f"Generating Global Catalog for Mosaic {idx} ({n_stars_total:,} stars)...")
     mags = sample_bulge_magnitudes(n_stars_total, rc_loc, rc_scale, rc_enhancement, m_min=12.0, m_max=32.0)
     fluxes = exp_time * (10 ** (-0.4 * (mags - zp)))
-    x_centers = np.random.uniform(0, mosaic_size, len(mags))
-    y_centers = np.random.uniform(0, mosaic_size, len(mags))
     
     provider = GaussianPretrainingProvider(image_size=training_size)
     
     if HAS_GPU:
-        # --- GPU PATH: Render entire mosaic at once ---
+        # --- GPU PATH: Render entire mosaic at once, generating coords on GPU ---
         kb_array = np.zeros((16, provider.kernel_size, provider.kernel_size), dtype=np.float32)
         for i in range(4):
             for j in range(4):
                 kb_array[j * 4 + i] = provider.kernel_bank[(i, j)]
         
-        full_image = render_gpu(x_centers, y_centers, fluxes, kb_array, mosaic_size)
+        from castor.data.gpu_renderer import render_generate_and_filter_gpu
+        full_image, x_valid, y_valid, flux_valid, mag_valid = render_generate_and_filter_gpu(
+            fluxes, mags, kb_array, mosaic_size
+        )
+        
+        catalog = pd.DataFrame({
+            'x': x_valid,
+            'y': y_valid,
+            'flux': flux_valid,
+            'mag': mag_valid
+        })
     else:
-        # --- CPU PATH: Render the physics image in 4x4 chunks (with buffer to handle PSF overlap) ---
+        # --- CPU PATH: Original chunked rendering ---
+        x_centers = np.random.uniform(0, mosaic_size, len(mags))
+        y_centers = np.random.uniform(0, mosaic_size, len(mags))
+        
         full_image = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
         n_side = mosaic_size // training_size
         buffer = 20 # Pixels
@@ -87,15 +98,16 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
                 
                 full_image[y0:y1, x0:x1] = chunk_signal[buffer:-buffer, buffer:-buffer]
 
-    # 3. Filter and Save Catalog
-    valid_mask = mags < 27.0
-    catalog = pd.DataFrame({
-        'x': x_centers[valid_mask],
-        'y': y_centers[valid_mask],
-        'flux': fluxes[valid_mask],
-        'mag': mags[valid_mask]
-    })
-    
+        # Filter and Save Catalog (CPU Path)
+        valid_mask = mags < 27.0
+        catalog = pd.DataFrame({
+            'x': x_centers[valid_mask],
+            'y': y_centers[valid_mask],
+            'flux': fluxes[valid_mask],
+            'mag': mags[valid_mask]
+        })
+
+    # 3. Add Common Metadata and Save
     half = SHAPE_SIZE // 2
     grid_range = np.arange(-half, half + 1)
     sy, sx = np.meshgrid(grid_range, grid_range, indexing='ij')

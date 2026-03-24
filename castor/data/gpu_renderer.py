@@ -1,39 +1,32 @@
 import jax
 import jax.numpy as jnp
-from jax import vmap, lax
+from jax import lax
 import numpy as np
 import math
 
-def _get_jax_renderer():
-    """Returns a JIT-compiled JAX renderer."""
+def _get_jax_renderer_core():
+    """Returns the core rendering logic as a JIT-able function."""
     
-    def render_mosaic_jax(x, y, fluxes, kernel_bank, mosaic_size):
+    def render_core(x, y, fluxes, kernel_bank, mosaic_size):
         n_sub = 4
-        
-        # 1. Coordinate to grid index and phase
         ix = jnp.floor(x).astype(jnp.int32)
         iy = jnp.floor(y).astype(jnp.int32)
         px = jnp.clip(jnp.floor((x - ix) * n_sub).astype(jnp.int32), 0, n_sub - 1)
         py = jnp.clip(jnp.floor((y - iy) * n_sub).astype(jnp.int32), 0, n_sub - 1)
         
         phase_idx = py * n_sub + px
-        
-        # 2. Scatter stars into phase-specific grids
-        # Mask out out-of-bounds stars AND padded dummy stars
         mask = (ix >= 0) & (ix < mosaic_size) & (iy >= 0) & (iy < mosaic_size)
         
         grids = jnp.zeros((n_sub * n_sub, mosaic_size, mosaic_size))
         grids = grids.at[phase_idx, iy, ix].add(jnp.where(mask, fluxes, 0.0))
         
-        # 3. Batched Convolution
         k_h, k_w = kernel_bank.shape[1], kernel_bank.shape[2]
         pad = k_h // 2
         
         kernels_flipped = kernel_bank[:, ::-1, ::-1]
         kernels_reshaped = kernels_flipped.reshape((n_sub * n_sub, 1, k_h, k_w))
-        grids_reshaped = grids[jnp.newaxis, :, :, :] # (1, 16, H, W)
+        grids_reshaped = grids[jnp.newaxis, :, :, :] 
         
-        # Explicit dimension_numbers guarantee stable memory layout across hardware
         rendered_phases = lax.conv_general_dilated(
             grids_reshaped,
             kernels_reshaped,
@@ -43,39 +36,114 @@ def _get_jax_renderer():
             feature_group_count=n_sub * n_sub
         )
         
-        final_image = jnp.sum(rendered_phases, axis=1).squeeze()
-        return final_image
+        return jnp.sum(rendered_phases, axis=1).squeeze()
+    
+    return render_core
 
-    return jax.jit(render_mosaic_jax, static_argnums=(4,))
+def _get_fused_generator_renderer():
+    """Returns a JIT-compiled function that generates coords and renders."""
+    render_core = _get_jax_renderer_core()
+    
+    @jax.jit(static_argnums=(4,))
+    def fused_op(key, fluxes, mags, kernel_bank, mosaic_size):
+        n_stars = fluxes.shape[0]
+        k1, k2 = jax.random.split(key)
+        
+        # 1. Generate Coordinates directly on GPU
+        x = jax.random.uniform(k1, shape=(n_stars,), minval=0.0, maxval=float(mosaic_size))
+        y = jax.random.uniform(k2, shape=(n_stars,), minval=0.0, maxval=float(mosaic_size))
+        
+        # 2. Render
+        image = render_core(x, y, fluxes, kernel_bank, mosaic_size)
+        
+        # 3. Filter Mask (mags < 27.0)
+        # We also need to handle the padding mask here if we want to return clean data
+        # but for simplicity we return the full arrays and let the host mask.
+        # Dummy stars (flux=0) won't affect the image.
+        catalog_mask = mags < 27.0
+        
+        return image, x, y, catalog_mask
 
-_RENDER_FUNC = None
+    return fused_op
 
-def render_gpu(x, y, fluxes, kernel_bank, mosaic_size):
-    """Entry point for GPU rendering."""
-    global _RENDER_FUNC
-    if _RENDER_FUNC is None:
-        _RENDER_FUNC = _get_jax_renderer()
+_FUSED_OP = None
+_JAX_KEY = jax.random.PRNGKey(int(time.time())) if 'time' in globals() else jax.random.PRNGKey(42)
+
+def render_generate_and_filter_gpu(fluxes, mags, kernel_bank, mosaic_size):
+    """
+    Fused GPU entry point.
+    Generates x, y on GPU, renders, and returns image + filtered catalog arrays.
+    """
+    import time
+    global _FUSED_OP, _JAX_KEY
+    if _FUSED_OP is None:
+        _FUSED_OP = _get_fused_generator_renderer()
+    
+    # manage key
+    _JAX_KEY, subkey = jax.random.split(_JAX_KEY)
     
     # --- PADDING TO PREVENT CONSTANT RECOMPILATION ---
-    # We round up the array size to the nearest million. 
-    # JAX will only compile once for each unique padded size.
+    current_size = len(fluxes)
+    chunk_size = 1_000_000 
+    padded_size = int(math.ceil(current_size / chunk_size)) * chunk_size
+    pad_width = padded_size - current_size
+    
+    if pad_width > 0:
+        fluxes_padded = np.pad(fluxes, (0, pad_width), constant_values=0.0)
+        mags_padded = np.pad(mags, (0, pad_width), constant_values=99.0) # Very dim
+    else:
+        fluxes_padded, mags_padded = fluxes, mags
+
+    # Convert to JAX arrays
+    fluxes_jax = jnp.array(fluxes_padded)
+    mags_jax = jnp.array(mags_padded)
+    kernels_jax = jnp.array(kernel_bank)
+    
+    # Run Fused Op
+    image_jax, x_jax, y_jax, mask_jax = _FUSED_OP(subkey, fluxes_jax, mags_jax, kernels_jax, mosaic_size)
+    
+    # Transfer back ONLY what we need
+    # The image is always transferred.
+    image = np.array(image_jax)
+    
+    # For the catalog, we apply the mask on GPU to minimize transfer size if possible,
+    # but JAX boolean indexing creates dynamic shapes. 
+    # Instead, we transfer x, y, mask and filter on host. 
+    # (Still better than transferring 80M CPU-generated coords to GPU).
+    
+    # Optimization: Only transfer back the "True" entries if we want to be fancy,
+    # but np.array(x_jax[mask_jax]) would work.
+    
+    mask = np.array(mask_jax)
+    # Only return the portion that isn't padding AND is valid
+    # But padding stars have mags=99, so mask handles it.
+    
+    valid_x = np.array(x_jax[mask_jax])
+    valid_y = np.array(y_jax[mask_jax])
+    valid_flux = np.array(fluxes_jax[mask_jax])
+    valid_mags = np.array(mags_jax[mask_jax])
+    
+    return image, valid_x, valid_y, valid_flux, valid_mags
+
+# Keep the old one for compatibility if needed, but updated to use core
+def render_gpu(x, y, fluxes, kernel_bank, mosaic_size):
+    """Legacy entry point."""
+    global _RENDER_CORE
+    if '_RENDER_CORE' not in globals():
+        global _RENDER_CORE
+        _RENDER_CORE = jax.jit(_get_jax_renderer_core(), static_argnums=(4,))
+    
+    # Padding logic same as before...
     current_size = len(x)
     chunk_size = 1_000_000 
     padded_size = int(math.ceil(current_size / chunk_size)) * chunk_size
     pad_width = padded_size - current_size
     
     if pad_width > 0:
-        # Pad with dummy negative coordinates and zero flux so they are safely masked
         x_padded = np.pad(x, (0, pad_width), constant_values=-1.0)
         y_padded = np.pad(y, (0, pad_width), constant_values=-1.0)
         fluxes_padded = np.pad(fluxes, (0, pad_width), constant_values=0.0)
     else:
         x_padded, y_padded, fluxes_padded = x, y, fluxes
 
-    # Convert to JAX arrays
-    x_jax = jnp.array(x_padded)
-    y_jax = jnp.array(y_padded)
-    fluxes_jax = jnp.array(fluxes_padded)
-    kernels_jax = jnp.array(kernel_bank)
-    
-    return np.array(_RENDER_FUNC(x_jax, y_jax, fluxes_jax, kernels_jax, mosaic_size))
+    return np.array(_RENDER_CORE(jnp.array(x_padded), jnp.array(y_padded), jnp.array(fluxes_padded), jnp.array(kernel_bank), mosaic_size))
