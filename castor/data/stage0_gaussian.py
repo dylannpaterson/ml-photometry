@@ -203,7 +203,7 @@ class GaussianPretrainingProvider(Dataset):
         chunk_median = np.median(raw_image)
         normalized_image = self.transform.image_to_network(raw_image, chunk_median)
 
-        # --- Target Grid Construction ---
+        # --- JIT Target Grid Construction (Filter by Correct Physical SNR) ---
         base_grid = np.zeros((self.grid_size, self.grid_size, self.K, 5), dtype=np.float32)
         half = self.S // 2
         grid_range = np.arange(-half, half + 1)
@@ -212,15 +212,30 @@ class GaussianPretrainingProvider(Dataset):
         psf_shape /= (psf_shape.sum() + 1e-9)
         psf_shape_flat = psf_shape.astype(np.float32).flatten()
         
+        # PSF Peak for subtraction (For sigma=1.5, peak is ~0.07)
+        psf_peak = 1.0 / (2 * np.pi * (self.sigma_fixed**2))
+        
         shapes, indices, catalog_stars = [], [], []
         cell_assignments = {}
+        
+        # 1. Vectorized sampling of the rendered signal at star centers
+        # We use star_signal (clean photons) to find the local confusion level
+        ix = np.clip(x_centers.astype(int), 0, self.img_size - 1)
+        iy = np.clip(y_centers.astype(int), 0, self.img_size - 1)
+        total_local_light = star_signal[iy, ix]
+        
+        # 2. Confusion-Limited SNR Calculation
+        # Local background = (Total signal at point) - (This star's own peak)
+        local_neighbor_light = np.maximum(0, total_local_light - (fluxes * psf_peak))
+        
+        # Effective variance includes the sky, read noise, and all overlapping neighbors
+        noise_variance = fluxes + self.n_pix * (sky_level + self.read_noise**2 + local_neighbor_light)
+        snrs = fluxes / np.sqrt(noise_variance)
+        
         for i in range(n_stars):
-            tx, ty, flux = x_centers[i], y_centers[i], fluxes[i]
+            tx, ty, flux, snr = x_centers[i], y_centers[i], fluxes[i], snrs[i]
             cx, cy = int(tx // self.cell_size), int(ty // self.cell_size)
             if cx < 0 or cx >= self.grid_size or cy < 0 or cy >= self.grid_size: continue
-            
-            noise_variance = flux + self.n_pix * (sky_level + self.read_noise**2)
-            snr = flux / np.sqrt(noise_variance)
             
             if snr >= self.min_snr:
                 if (cy, cx) not in cell_assignments: cell_assignments[(cy, cx)] = []
