@@ -98,6 +98,8 @@ EOF
         export PYTHONPATH=\$PYTHONPATH:.
         export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
         export LD_LIBRARY_PATH=\$LD_LIBRARY_PATH:/usr/local/cuda-12.8/extras/CUPTI/lib64:/usr/local/cuda-12.8/lib64
+        export XLA_FLAGS="--xla_gpu_slow_operation_alarm_timeout_ms=999999"
+        export TF_CPP_MIN_LOG_LEVEL=2
 
         # 2. Launch Training for this specific stage
         echo "Launching Training for Stage $STAGE..."
