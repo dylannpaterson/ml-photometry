@@ -15,19 +15,25 @@ except ImportError:
     galsim = None
 
 # --- 1. The Dynamic Bulge LF Sampler (RC Prior) ---
-def sample_bulge_magnitudes(n_stars, rc_mag, rc_sigma, rc_fraction, m_min=12.0, m_max=26.0):
+def sample_bulge_magnitudes(n_stars, rc_mag, rc_sigma, rc_fraction, m_min=12.0, m_max=26.0, gamma=0.3):
     """Samples apparent magnitudes (m). Smaller m = brighter star."""
     n_rc = int(n_stars * rc_fraction)
     n_bg = n_stars - n_rc
 
-    # Background (Power law in linear space becomes linear in magnitude space)
+    # 1. True Exponential Background via Inverse Transform Sampling
+    # N(m) proportional to 10^(gamma * m)
+    # gamma ~ 0.3 is a reasonable generic slope for star counts
     u = np.random.uniform(0, 1, n_bg)
-    m_bg = np.interp(u, [0.0, 0.95, 1.0], [m_max, 18.0, m_min])
+    
+    # Inverse CDF of the exponential distribution bounded by m_min and m_max
+    a = 10**(gamma * m_min)
+    b = 10**(gamma * m_max)
+    m_bg = (1.0 / gamma) * np.log10(u * (b - a) + a)
 
-    # Red Clump (Gaussian in magnitude space)
+    # 2. Red Clump (Gaussian in magnitude space)
     m_rc = np.random.normal(loc=rc_mag, scale=rc_sigma, size=n_rc)
 
-    # Combine and clip
+    # Combine and clip (just in case)
     m_all = np.concatenate([m_bg, m_rc])
     m_all = np.clip(m_all, m_min, m_max)
 
