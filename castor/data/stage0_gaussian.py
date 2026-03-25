@@ -9,7 +9,7 @@ from scipy.signal import fftconvolve
 from scipy.interpolate import UnivariateSpline
 from castor.data.transforms import AstroSpaceTransform
 from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE
-from numba import njit, float32, int32
+from numba import njit
 import gc
 
 try:
@@ -17,7 +17,7 @@ try:
 except ImportError:
     galsim = None
 
-@njit("float32[:,:,:,:](float32[:], float32[:], float32[:], float32[:], float32[:], float32[:,:], int32[:], float32, int32, int32, int32, int32)", boundscheck=False)
+@njit(boundscheck=False)
 def fast_paint_grid(lx, ly, fluxes, snrs, comps, shapes, sort_idx, min_snr, grid_size, cell_size, K, S_sq):
     grid_stars = np.zeros((grid_size, grid_size, K, 5 + S_sq), dtype=np.float32)
     counts = np.zeros((grid_size, grid_size), dtype=np.int32)
