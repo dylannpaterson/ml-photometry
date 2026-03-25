@@ -1,6 +1,6 @@
 run_config:
   resume_from_checkpoint: false
-  force_regenerate_data: true
+  force_regenerate_data: false
 
 
 curriculum:
@@ -10,9 +10,9 @@ curriculum:
     name: "Roman Bulge Stage 0 (Full)"
     data_dir: "data/bulge_stage0_full"
     epochs: 100
-    batch_size: 256
+    batch_size: 128
     learning_rate: 0.0001
-    num_workers: 3
+    num_workers: 2
     resume_from_last_stage: false
     cell_size: 4 # Centralized default: 4
     mosaic_params:

@@ -156,7 +156,7 @@ def run_train(stage_idx, config, device):
         num_workers=num_workers,
         pin_memory=use_optimizations,
         persistent_workers=use_optimizations,
-        prefetch_factor=3 if use_optimizations else None
+        prefetch_factor=2 if use_optimizations else None
     )
     val_loader = DataLoader(
         val_dataset, 
@@ -165,7 +165,7 @@ def run_train(stage_idx, config, device):
         num_workers=num_workers,
         pin_memory=use_optimizations,
         persistent_workers=use_optimizations,
-        prefetch_factor=3 if use_optimizations else None
+        prefetch_factor=2 if use_optimizations else None
     )
 
     # Model Setup
