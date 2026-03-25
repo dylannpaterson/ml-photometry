@@ -17,7 +17,7 @@ try:
 except ImportError:
     galsim = None
 
-@njit(fastmath=True)
+@njit(boundscheck=False, wraparound=False)
 def fast_paint_grid(lx, ly, fluxes, snrs, comps, shapes, sort_idx, min_snr, grid_size, cell_size, K, S_sq):
     grid_stars = np.zeros((grid_size, grid_size, K, 5 + S_sq), dtype=np.float32)
     counts = np.zeros((grid_size, grid_size), dtype=np.int32)
@@ -196,19 +196,34 @@ class GaussianPretrainingProvider(Dataset):
 
         # --- NEW: Probabilistic Completeness (Per-Chunk Empirical) ---
         survived = snrs >= self.min_snr
-        m_min, m_max = mags.min(), mags.max()
-        bins = np.linspace(m_min, m_max, 25)
-        counts_total, _ = np.histogram(mags, bins=bins)
-        counts_survived, _ = np.histogram(mags[survived], bins=bins)
-        bin_comp = counts_survived / (counts_total + 1e-9)
-        bin_centers = (bins[:-1] + bins[1:]) / 2
         
-        # Smooth Spline Interpolation
-        try:
-            spl = UnivariateSpline(bin_centers, bin_comp, k=3, s=0.01)
-            comps = np.clip(spl(mags), 0.0, 1.0).astype(np.float32)
-        except:
-            comps = np.interp(mags, bin_centers, bin_comp, left=1.0, right=0.0).astype(np.float32)
+        # EDGE CASE 1: Not enough stars in this crop to fit a curve, or identical mags
+        if len(mags) < 10 or mags.min() >= mags.max() - 1e-3:
+            comps = survived.astype(np.float32)
+        else:
+            m_min, m_max = mags.min(), mags.max()
+            bins = np.linspace(m_min, m_max, 25)
+            
+            counts_total, _ = np.histogram(mags, bins=bins)
+            counts_survived, _ = np.histogram(mags[survived], bins=bins)
+            
+            # EDGE CASE 2: Mask out empty bins so they don't drag the spline to 0.0
+            valid = counts_total > 0
+            
+            if valid.sum() < 4:
+                # Still not enough valid populated bins to interpolate reliably
+                comps = survived.astype(np.float32)
+            else:
+                bin_comp = counts_survived[valid] / (counts_total[valid] + 1e-9)
+                bin_centers = ((bins[:-1] + bins[1:]) / 2)[valid]
+                
+                # EDGE CASE 3: Use k=1 (linear) to prevent wild cubic spline oscillations
+                try:
+                    spl = UnivariateSpline(bin_centers, bin_comp, k=1, s=0.0)
+                    comps = np.clip(spl(mags), 0.0, 1.0).astype(np.float32)
+                except Exception:
+                    # Bulletproof fallback
+                    comps = np.interp(mags, bin_centers, bin_comp, left=1.0, right=0.0).astype(np.float32)
 
         # Target Construction
         base_grid = np.zeros((self.grid_size, self.grid_size, self.K, 5), dtype=np.float32)
@@ -309,8 +324,8 @@ class GaussianMosaicDataset(Dataset):
         mosaic = self.mosaics[m_idx]
         self.active_img = np.load(mosaic['img_path'])
         
-        cat_raw = np.load(mosaic['cat_path'])
-        self.active_cat = cat_raw[np.argsort(cat_raw['y'])]
+        # CHANGED: The file is already pre-sorted by generate_mosaics.py
+        self.active_cat = np.load(mosaic['cat_path']) 
         
         self.active_mosaic_idx = m_idx
         self.samples_from_current = 0
@@ -368,19 +383,34 @@ class GaussianMosaicDataset(Dataset):
         # --- NEW: Probabilistic Completeness (Per-Chunk Empirical) ---
         survived = snrs >= self.min_snr
         mags = local_cat['mag']
-        m_min, m_max = mags.min(), mags.max()
-        bins = np.linspace(m_min, m_max, 25)
-        counts_total, _ = np.histogram(mags, bins=bins)
-        counts_survived, _ = np.histogram(mags[survived], bins=bins)
-        bin_comp = counts_survived / (counts_total + 1e-9)
-        bin_centers = (bins[:-1] + bins[1:]) / 2
         
-        # Smooth Spline Interpolation
-        try:
-            spl = UnivariateSpline(bin_centers, bin_comp, k=3, s=0.01)
-            comps = np.clip(spl(mags), 0.0, 1.0).astype(np.float32)
-        except:
-            comps = np.interp(mags, bin_centers, bin_comp, left=1.0, right=0.0).astype(np.float32)
+        # EDGE CASE 1: Not enough stars in this crop to fit a curve, or identical mags
+        if len(mags) < 10 or mags.min() >= mags.max() - 1e-3:
+            comps = survived.astype(np.float32)
+        else:
+            m_min, m_max = mags.min(), mags.max()
+            bins = np.linspace(m_min, m_max, 25)
+            
+            counts_total, _ = np.histogram(mags, bins=bins)
+            counts_survived, _ = np.histogram(mags[survived], bins=bins)
+            
+            # EDGE CASE 2: Mask out empty bins so they don't drag the spline to 0.0
+            valid = counts_total > 0
+            
+            if valid.sum() < 4:
+                # Still not enough valid populated bins to interpolate reliably
+                comps = survived.astype(np.float32)
+            else:
+                bin_comp = counts_survived[valid] / (counts_total[valid] + 1e-9)
+                bin_centers = ((bins[:-1] + bins[1:]) / 2)[valid]
+                
+                # EDGE CASE 3: Use k=1 (linear) to prevent wild cubic spline oscillations
+                try:
+                    spl = UnivariateSpline(bin_centers, bin_comp, k=1, s=0.0)
+                    comps = np.clip(spl(mags), 0.0, 1.0).astype(np.float32)
+                except Exception:
+                    # Bulletproof fallback
+                    comps = np.interp(mags, bin_centers, bin_comp, left=1.0, right=0.0).astype(np.float32)
         
         # 6. Grid Painting (Numba Optimized)
         sort_idx = np.argsort(fluxes)[::-1]

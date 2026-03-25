@@ -118,6 +118,11 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     psf_flat = (psf_flat / psf_flat.sum()).astype(np.float32).flatten()
     structured_cat['shape'] = psf_flat
 
+    # NEW: Pre-sort the catalog by Y-coordinate so the dataloader doesn't have to
+    print("Sorting catalog for fast spatial queries...")
+    sort_idx = np.argsort(structured_cat['y'])
+    structured_cat = structured_cat[sort_idx]
+
     # 3. Save Files
     image_path = os.path.join(output_dir, f"mosaic_{idx:03d}_img.npy")
     cat_path = os.path.join(output_dir, f"mosaic_{idx:03d}_cat.npy")
