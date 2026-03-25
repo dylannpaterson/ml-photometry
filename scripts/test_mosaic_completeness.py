@@ -18,9 +18,6 @@ def test_mosaic_completeness_recovery():
         image_size=256
     )
     
-    # 🔥 WARMUP: Compile Numba in main thread
-    print("🔥 Warming up Numba JIT compiler...")
-    _ = dataset[0]
 
     # 2. Sample multiple crops and aggregate stars
     all_local_mags = []
@@ -69,6 +66,7 @@ def test_mosaic_completeness_recovery():
     ax1.set_xlabel('Magnitude')
     ax1.set_ylabel('Count')
     ax1.set_yscale('log')
+    ax2.set_xlim(13.5,28.5)
     ax1.set_title('Mosaic-Level Completeness Recovery (Verification of Global Spline Optimization)')
     ax1.legend()
     ax1.grid(True, which='both', alpha=0.3)
@@ -92,6 +90,7 @@ def test_mosaic_completeness_recovery():
     ax2.set_xlabel('Magnitude')
     ax2.set_ylabel('Completeness (c)')
     ax2.set_ylim(-0.05, 1.05)
+    ax2.set_xlim(13.5,28.5)
     ax2.grid(True, alpha=0.3)
     ax2.legend()
     

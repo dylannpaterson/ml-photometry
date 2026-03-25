@@ -99,9 +99,10 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
         v_mask = mags < mag_limit
         x_v, y_v, flux_v, mag_v = x_centers[v_mask], y_centers[v_mask], fluxes[v_mask], mags[v_mask]
 
-    # 2. Save Catalog as Structured NumPy
+    # 2. Save Catalog as Structured NumPy with PRE-CALCULATED SNR and COMP
     cat_dtype = [
         ('x', 'f4'), ('y', 'f4'), ('flux', 'f4'), ('mag', 'f4'),
+        ('snr', 'f4'), ('comp', 'f4'),
         ('shape', 'f4', (SHAPE_SIZE**2,))
     ]
     
@@ -110,6 +111,46 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     structured_cat['x'], structured_cat['y'] = x_v, y_v
     structured_cat['flux'], structured_cat['mag'] = flux_v, mag_v
     
+    # --- PRE-CALCULATE SNR and COMP (Moved from DataLoader) ---
+    print(f"Pre-calculating SNR and Completeness for {n_visible:,} stars...")
+    pixel_scale = 0.11
+    sigma_fixed = 1.5
+    n_pix = 4 * np.pi * (sigma_fixed ** 2)
+    psf_peak = 1.0 / (2 * np.pi * sigma_fixed**2)
+    min_snr = 5.0 # Project Standard
+    
+    sky_level = (10 ** (-0.4 * (sky_mag - zp))) * (pixel_scale**2) * exp_time
+    
+    # Local background from the rendered mosaic
+    ly_idx = np.clip(y_v.astype(np.int32), 0, mosaic_size - 1)
+    lx_idx = np.clip(x_v.astype(np.int32), 0, mosaic_size - 1)
+    total_local_light = full_image[ly_idx, lx_idx]
+    
+    local_background = np.maximum(0, total_local_light - (flux_v * psf_peak))
+    noise_variance = flux_v + n_pix * (sky_level + local_background + 25.0) # read_noise=5.0
+    snrs = flux_v / np.sqrt(np.maximum(1.0, noise_variance))
+    structured_cat['snr'] = snrs
+    
+    # Global Spline Fitting for Completeness
+    survived = snrs >= min_snr
+    if len(mag_v) < 10 or mag_v.min() >= mag_v.max() - 1e-3:
+        comps = survived.astype(np.float32)
+    else:
+        m_min, m_max = mag_v.min(), mag_v.max()
+        bins = np.linspace(m_min, m_max, 25)
+        counts_total, _ = np.histogram(mag_v, bins=bins)
+        counts_survived, _ = np.histogram(mag_v[survived], bins=bins)
+        
+        valid = counts_total > 0
+        if valid.sum() < 4:
+            comps = survived.astype(np.float32)
+        else:
+            bin_comp = counts_survived[valid] / (counts_total[valid] + 1e-9)
+            bin_centers = ((bins[:-1] + bins[1:]) / 2)[valid]
+            comps = np.interp(mag_v, bin_centers, bin_comp, left=1.0, right=0.0).astype(np.float32)
+    
+    structured_cat['comp'] = comps
+
     # Pre-compute target PSF
     half = SHAPE_SIZE // 2
     grid_range = np.arange(-half, half + 1)

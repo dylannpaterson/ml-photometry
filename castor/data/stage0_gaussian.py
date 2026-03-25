@@ -17,34 +17,37 @@ try:
 except ImportError:
     galsim = None
 
-# @njit(boundscheck=False) # Disabled due to LLVM machine model crash
+@njit(boundscheck=False)
 def fast_paint_grid(lx, ly, fluxes, snrs, comps, shapes, sort_idx, min_snr, grid_size, cell_size, K, S_sq):
     grid_stars = np.zeros((grid_size, grid_size, K, 5 + S_sq), dtype=np.float32)
     counts = np.zeros((grid_size, grid_size), dtype=np.int32)
     
     for idx in range(len(sort_idx)):
         i = sort_idx[idx]
-        if snrs[i] >= min_snr:
-            cx = int(lx[i] // cell_size)
-            cy = int(ly[i] // cell_size)
+        
+        # 1. Early Exit: Skip target labels for faint stars immediately
+        if snrs[i] < min_snr:
+            continue
             
-            if 0 <= cx < grid_size and 0 <= cy < grid_size:
-                slot = counts[cy, cx]
-                if slot < K:
-                    comp = comps[i]
-                    # Slot 0 is strict existence (1.0), Slot 4 is continuous recoverability
-                    grid_stars[cy, cx, slot, 0] = 1.0
-                    grid_stars[cy, cx, slot, 1] = lx[i] % cell_size
-                    grid_stars[cy, cx, slot, 2] = ly[i] % cell_size
-                    grid_stars[cy, cx, slot, 3] = fluxes[i]
-                    grid_stars[cy, cx, slot, 4] = comp
+        cx = int(lx[i] // cell_size)
+        cy = int(ly[i] // cell_size)
+        
+        if 0 <= cx < grid_size and 0 <= cy < grid_size:
+            slot = counts[cy, cx]
+            if slot < K:
+                # Slot 0 is strict existence (1.0), Slot 4 is continuous recoverability
+                grid_stars[cy, cx, slot, 0] = 1.0
+                grid_stars[cy, cx, slot, 1] = lx[i] % cell_size
+                grid_stars[cy, cx, slot, 2] = ly[i] % cell_size
+                grid_stars[cy, cx, slot, 3] = fluxes[i]
+                grid_stars[cy, cx, slot, 4] = comps[i]
+                
+                # Numba handles this inner assignment instantly
+                for s in range(S_sq):
+                    grid_stars[cy, cx, slot, 5+s] = shapes[i, s]
                     
-                    # Numba handles this inner assignment instantly
-                    for s in range(S_sq):
-                        grid_stars[cy, cx, slot, 5+s] = shapes[i, s]
-                        
-                    counts[cy, cx] += 1
-                    
+                counts[cy, cx] += 1
+                
     return grid_stars
 
 # --- 1. The Dynamic Bulge LF Sampler (RC Prior) ---
@@ -185,7 +188,8 @@ class GaussianPretrainingProvider(Dataset):
         total_photon_flux = star_signal + sky_level
         
         # OFF-LOADED TO GPU: We just return the clean signal for the trainer to add noise
-        chunk_median = np.median(total_photon_flux)
+        # Optimization: np.median(A + c) == np.median(A) + c
+        chunk_median = np.median(star_signal) + sky_level
         normalized_image = self.transform.image_to_network(total_photon_flux, chunk_median) # We will redo this in the trainer
 
         # --- Sub-Pixel Accurate Local Confusion SNR ---
@@ -219,40 +223,33 @@ class GaussianPretrainingProvider(Dataset):
                 bin_centers = ((bins[:-1] + bins[1:]) / 2)[valid]
                 comps = np.interp(mags, bin_centers, bin_comp, left=1.0, right=0.0).astype(np.float32)
 
-        # Target Construction
-        base_grid = np.zeros((self.grid_size, self.grid_size, self.K, 5), dtype=np.float32)
+        # Target Construction (Numba Optimized)
         half = self.S // 2
         grid_range = np.arange(-half, half + 1)
         sy, sx = np.meshgrid(grid_range, grid_range, indexing='ij')
         psf_flat = np.exp(-(sx**2 + sy**2) / (2 * self.sigma_fixed**2))
         psf_flat = (psf_flat / psf_flat.sum()).astype(np.float32).flatten()
         
-        shapes, catalog_stars = [], []
-        cell_assignments = {}
-        for i in range(n_stars):
-            if snrs[i] >= self.min_snr:
-                tx, ty = x_centers[i], y_centers[i]
-                cx, cy = int(tx // self.cell_size), int(ty // self.cell_size)
-                if 0 <= cx < self.grid_size and 0 <= cy < self.grid_size:
-                    if (cy, cx) not in cell_assignments: cell_assignments[(cy, cx)] = []
-                    cell_assignments[(cy, cx)].append([fluxes[i], tx, ty, snrs[i], mags[i], comps[i]])
+        # Prepare broadcasted shapes for Numba
+        all_shapes = np.tile(psf_flat, (n_stars, 1))
+        
+        base_grid = fast_paint_grid(
+            x_centers, y_centers, fluxes, snrs, comps, all_shapes, sort_idx, 
+            self.min_snr, self.grid_size, self.cell_size, self.K, self.S**2
+        )
 
-        for (cy, cx), cell_stars in cell_assignments.items():
-            sorted_stars = sorted(cell_stars, key=lambda x: x[0], reverse=True)
-            for slot in range(min(self.K, len(sorted_stars))):
-                f, tx, ty, snr, m, comp = sorted_stars[slot]
-                # Slot 0 is strict existence (1.0), Slot 4 is continuous recoverability
-                base_grid[cy, cx, slot] = [1.0, tx % self.cell_size, ty % self.cell_size, f, comp]
-                shapes.append(psf_flat)
-                catalog_stars.append({
-                    'x': tx, 'y': ty, 'flux': f, 'mag': m, 'snr': snr, 'comp': comp,
-                    'shape': psf_flat, 'exp_time': exp_time, 'zp': zp, 'sky_mag': sky_mag
-                })
+        # Catalog for metadata/metrics (kept for debugging, but optimized)
+        catalog_stars = pd.DataFrame({
+            'x': x_centers[survived], 'y': y_centers[survived], 
+            'flux': fluxes[survived], 'mag': mags[survived], 
+            'snr': snrs[survived], 'comp': comps[survived],
+            'exp_time': exp_time, 'zp': zp, 'sky_mag': sky_mag
+        })
 
         bg_target = self.transform.target_bg_to_network(sky_level - chunk_median)
-        bg_grid = np.full((self.grid_size, self.grid_size), bg_target, dtype=np.float32)
+        bg_grid = np.full((self.grid_size, self.grid_size, 1), bg_target, dtype=np.float32)
         target = torch.cat([torch.from_numpy(base_grid).view(self.grid_size, self.grid_size, -1), 
-                            torch.from_numpy(bg_grid).unsqueeze(-1)], dim=-1)
+                            torch.from_numpy(bg_grid)], dim=-1)
 
         return {
             "image": torch.from_numpy(total_photon_flux).unsqueeze(0), # Send raw physics to GPU 
@@ -260,7 +257,7 @@ class GaussianPretrainingProvider(Dataset):
             "physics_image": torch.from_numpy(star_signal), 
             "target": target, 
             "chunk_median": float(chunk_median), 
-            "catalog": pd.DataFrame(catalog_stars),
+            "catalog": catalog_stars,
             "full_mags": mags,
             "full_snrs": snrs,
             "full_comps": comps,
@@ -324,41 +321,9 @@ class GaussianMosaicDataset(Dataset):
         self.active_img = np.load(mosaic['img_path'])
         self.active_cat = np.load(mosaic['cat_path']) 
         
-        # --- PRE-COMPUTE Global Completeness (Spline) ---
-        fluxes = self.active_cat['flux']
-        mags = self.active_cat['mag']
-        lx, ly = self.active_cat['x'], self.active_cat['y']
-        
-        # Consistent Sky/Noise Calculation
-        pixel_scale = 0.11
-        sky_level = (10 ** (-0.4 * (mosaic['sky_mag'] - mosaic['zp']))) * (pixel_scale**2) * mosaic['exp_time']
-        
-        ly_idx = np.clip(ly.astype(np.int32), 0, self.active_img.shape[0] - 1)
-        lx_idx = np.clip(lx.astype(np.int32), 0, self.active_img.shape[1] - 1)
-        total_local_light = self.active_img[ly_idx, lx_idx]
-        
-        local_background = np.maximum(0, total_local_light - (fluxes * self.psf_peak))
-        noise_variance = fluxes + self.n_pix * (sky_level + local_background + 25.0)
-        self.active_snrs = fluxes / np.sqrt(np.maximum(1.0, noise_variance))
-        
-        survived = self.active_snrs >= self.min_snr
-        
-        # Global Spline Fitting
-        if len(mags) < 10 or mags.min() >= mags.max() - 1e-3:
-            self.active_comps = survived.astype(np.float32)
-        else:
-            m_min, m_max = mags.min(), mags.max()
-            bins = np.linspace(m_min, m_max, 25)
-            counts_total, _ = np.histogram(mags, bins=bins)
-            counts_survived, _ = np.histogram(mags[survived], bins=bins)
-            
-            valid = counts_total > 0
-            if valid.sum() < 4:
-                self.active_comps = survived.astype(np.float32)
-            else:
-                bin_comp = counts_survived[valid] / (counts_total[valid] + 1e-9)
-                bin_centers = ((bins[:-1] + bins[1:]) / 2)[valid]
-                self.active_comps = np.interp(mags, bin_centers, bin_comp, left=1.0, right=0.0).astype(np.float32)
+        # --- USE PRE-CALCULATED Columns (Moved to generator script) ---
+        self.active_snrs = self.active_cat['snr']
+        self.active_comps = self.active_cat['comp']
 
         self.active_mosaic_idx = m_idx
         self.samples_from_current = 0
@@ -387,7 +352,8 @@ class GaussianMosaicDataset(Dataset):
         
         # We need chunk_median for target background normalization
         # Estimate median directly from the clean signal to match what the noisy median will roughly be
-        chunk_median = np.median(star_signal_np + sky_level)
+        # Optimization: np.median(A + c) == np.median(A) + c
+        chunk_median = np.median(star_signal_np) + sky_level
         
         # 4. Binary Search spatial filter in RAM
         y_start = np.searchsorted(self.active_cat['y'], py)
