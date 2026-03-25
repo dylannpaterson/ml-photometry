@@ -53,6 +53,7 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     rc_loc = np.random.uniform(14.5, 16.5)
     rc_scale = np.random.uniform(0.2, 0.5)
     rc_enhancement = np.random.uniform(5.0, 15.0)
+    lf_gamma = np.random.uniform(0.25, 0.35)
     exp_time = np.random.uniform(30.0, 60.0)
     zp, sky_mag = 26.5, 22.0
     
@@ -65,7 +66,7 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     n_stars_total = int(10 ** np.random.uniform(np.log10(min_total), np.log10(max_total)))
     
     print(f"Generating Global Catalog for Mosaic {idx} ({n_stars_total:,} stars)...")
-    mags = sample_bulge_magnitudes(n_stars_total, rc_loc, rc_scale, rc_enhancement, m_min=12.0, m_max=32.0)
+    mags = sample_bulge_magnitudes(n_stars_total, rc_loc, rc_scale, rc_enhancement, m_min=12.0, m_max=32.0, gamma=lf_gamma)
     fluxes = exp_time * (10 ** (-0.4 * (mags - zp)))
     
     provider = GaussianPretrainingProvider(image_size=training_size)

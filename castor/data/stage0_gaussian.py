@@ -6,6 +6,7 @@ import os
 import pandas as pd
 from scipy.ndimage import gaussian_filter, map_coordinates
 from scipy.signal import fftconvolve
+from scipy.interpolate import UnivariateSpline
 from castor.data.transforms import AstroSpaceTransform
 from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE
 from numba import njit
@@ -17,7 +18,7 @@ except ImportError:
     galsim = None
 
 @njit(fastmath=True)
-def fast_paint_grid(lx, ly, fluxes, snrs, shapes, sort_idx, min_snr, grid_size, cell_size, K, S_sq):
+def fast_paint_grid(lx, ly, fluxes, snrs, comps, shapes, sort_idx, min_snr, grid_size, cell_size, K, S_sq):
     grid_stars = np.zeros((grid_size, grid_size, K, 5 + S_sq), dtype=np.float32)
     counts = np.zeros((grid_size, grid_size), dtype=np.int32)
     
@@ -30,8 +31,9 @@ def fast_paint_grid(lx, ly, fluxes, snrs, shapes, sort_idx, min_snr, grid_size, 
             if 0 <= cx < grid_size and 0 <= cy < grid_size:
                 slot = counts[cy, cx]
                 if slot < K:
-                    comp = 1.0 / (1.0 + np.exp(-2.0 * (snrs[i] - min_snr)))
-                    grid_stars[cy, cx, slot, 0] = comp
+                    comp = comps[i]
+                    # Slot 0 is strict existence (1.0), Slot 4 is continuous recoverability
+                    grid_stars[cy, cx, slot, 0] = 1.0
                     grid_stars[cy, cx, slot, 1] = lx[i] % cell_size
                     grid_stars[cy, cx, slot, 2] = ly[i] % cell_size
                     grid_stars[cy, cx, slot, 3] = fluxes[i]
@@ -128,7 +130,8 @@ class GaussianPretrainingProvider(Dataset):
             rc_loc = np.random.uniform(14.5, 16.5)
             rc_scale = np.random.uniform(0.2, 0.5)
             rc_enhancement = np.random.uniform(5.0, 15.0)
-        else: rc_loc, rc_scale, rc_enhancement = rc_params
+            lf_gamma = np.random.uniform(0.25, 0.35)
+        else: rc_loc, rc_scale, rc_enhancement, lf_gamma = rc_params
 
         if exp_params is None:
             exp_time = np.random.uniform(30.0, 60.0)
@@ -140,7 +143,7 @@ class GaussianPretrainingProvider(Dataset):
         
         # Unified massive population
         n_stars_base = int(np.random.uniform(self.min_stars, self.max_stars))
-        mags = sample_bulge_magnitudes(n_stars_base, rc_loc, rc_scale, rc_enhancement, m_min=12.0, m_max=32.0)
+        mags = sample_bulge_magnitudes(n_stars_base, rc_loc, rc_scale, rc_enhancement, m_min=12.0, m_max=32.0, gamma=lf_gamma)
         n_stars = len(mags)
         fluxes = exp_time * (10 ** (-0.4 * (mags - zp)))
         sort_idx = np.argsort(fluxes)[::-1]
@@ -191,6 +194,22 @@ class GaussianPretrainingProvider(Dataset):
         noise_variance = fluxes + self.n_pix * (sky_level + local_background + self.read_noise**2)
         snrs = fluxes / np.sqrt(noise_variance)
 
+        # --- NEW: Probabilistic Completeness (Per-Chunk Empirical) ---
+        survived = snrs >= self.min_snr
+        m_min, m_max = mags.min(), mags.max()
+        bins = np.linspace(m_min, m_max, 25)
+        counts_total, _ = np.histogram(mags, bins=bins)
+        counts_survived, _ = np.histogram(mags[survived], bins=bins)
+        bin_comp = counts_survived / (counts_total + 1e-9)
+        bin_centers = (bins[:-1] + bins[1:]) / 2
+        
+        # Smooth Spline Interpolation
+        try:
+            spl = UnivariateSpline(bin_centers, bin_comp, k=3, s=0.01)
+            comps = np.clip(spl(mags), 0.0, 1.0).astype(np.float32)
+        except:
+            comps = np.interp(mags, bin_centers, bin_comp, left=1.0, right=0.0).astype(np.float32)
+
         # Target Construction
         base_grid = np.zeros((self.grid_size, self.grid_size, self.K, 5), dtype=np.float32)
         half = self.S // 2
@@ -207,16 +226,19 @@ class GaussianPretrainingProvider(Dataset):
                 cx, cy = int(tx // self.cell_size), int(ty // self.cell_size)
                 if 0 <= cx < self.grid_size and 0 <= cy < self.grid_size:
                     if (cy, cx) not in cell_assignments: cell_assignments[(cy, cx)] = []
-                    cell_assignments[(cy, cx)].append([fluxes[i], tx, ty, snrs[i], mags[i]])
+                    cell_assignments[(cy, cx)].append([fluxes[i], tx, ty, snrs[i], mags[i], comps[i]])
 
         for (cy, cx), cell_stars in cell_assignments.items():
             sorted_stars = sorted(cell_stars, key=lambda x: x[0], reverse=True)
             for slot in range(min(self.K, len(sorted_stars))):
-                f, tx, ty, snr, m = sorted_stars[slot]
-                comp = 1.0 / (1.0 + np.exp(-2.0 * (snr - self.min_snr)))
-                base_grid[cy, cx, slot] = [comp, tx % self.cell_size, ty % self.cell_size, f, comp]
+                f, tx, ty, snr, m, comp = sorted_stars[slot]
+                # Slot 0 is strict existence (1.0), Slot 4 is continuous recoverability
+                base_grid[cy, cx, slot] = [1.0, tx % self.cell_size, ty % self.cell_size, f, comp]
                 shapes.append(psf_flat)
-                catalog_stars.append({'x': tx, 'y': ty, 'flux': f, 'mag': m, 'shape': psf_flat, 'exp_time': exp_time, 'zp': zp, 'sky_mag': sky_mag})
+                catalog_stars.append({
+                    'x': tx, 'y': ty, 'flux': f, 'mag': m, 'snr': snr, 'comp': comp,
+                    'shape': psf_flat, 'exp_time': exp_time, 'zp': zp, 'sky_mag': sky_mag
+                })
 
         bg_target = self.transform.target_bg_to_network(sky_level - chunk_median)
         bg_grid = np.full((self.grid_size, self.grid_size), bg_target, dtype=np.float32)
@@ -230,6 +252,9 @@ class GaussianPretrainingProvider(Dataset):
             "target": target, 
             "chunk_median": float(chunk_median), 
             "catalog": pd.DataFrame(catalog_stars),
+            "full_mags": mags,
+            "full_snrs": snrs,
+            "full_comps": comps,
             "base_grid": torch.from_numpy(base_grid),
             "background_map": torch.from_numpy(bg_grid)
         }
@@ -339,11 +364,28 @@ class GaussianMosaicDataset(Dataset):
         local_background = np.maximum(0, total_local_light - (fluxes * self.psf_peak))
         noise_variance = fluxes + self.n_pix * (sky_level + local_background + 25.0)
         snrs = fluxes / np.sqrt(np.maximum(1.0, noise_variance))
+
+        # --- NEW: Probabilistic Completeness (Per-Chunk Empirical) ---
+        survived = snrs >= self.min_snr
+        mags = local_cat['mag']
+        m_min, m_max = mags.min(), mags.max()
+        bins = np.linspace(m_min, m_max, 25)
+        counts_total, _ = np.histogram(mags, bins=bins)
+        counts_survived, _ = np.histogram(mags[survived], bins=bins)
+        bin_comp = counts_survived / (counts_total + 1e-9)
+        bin_centers = (bins[:-1] + bins[1:]) / 2
+        
+        # Smooth Spline Interpolation
+        try:
+            spl = UnivariateSpline(bin_centers, bin_comp, k=3, s=0.01)
+            comps = np.clip(spl(mags), 0.0, 1.0).astype(np.float32)
+        except:
+            comps = np.interp(mags, bin_centers, bin_comp, left=1.0, right=0.0).astype(np.float32)
         
         # 6. Grid Painting (Numba Optimized)
         sort_idx = np.argsort(fluxes)[::-1]
         grid_stars_np = fast_paint_grid(
-            lx, ly, fluxes, snrs, local_cat['shape'], sort_idx, 
+            lx, ly, fluxes, snrs, comps, local_cat['shape'], sort_idx, 
             self.min_snr, self.grid_size, self.cell_size, self.K, self.S**2
         )
         
