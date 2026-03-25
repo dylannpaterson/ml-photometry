@@ -30,6 +30,9 @@ class Trainer:
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=5)
         self.start_epoch = 0
         
+        # Add the AMP GradScaler
+        self.scaler = torch.amp.GradScaler('cuda' if device.type == 'cuda' else 'cpu')
+        
         # Extract loss parameters from config
         self.loss_params = config["data_params"].get("loss_params", {}).copy()
         self.loss_params["stretch_scale"] = GLOBAL_STRETCH_SCALE
@@ -84,17 +87,29 @@ class Trainer:
                 images_final = torch.asinh((images_noisy - batch_medians) / GLOBAL_STRETCH_SCALE)
                 # --------------------------------------------
                 
-                self.optimizer.zero_grad()
-                preds = self.model(images_final)
-                loss, p_loss, po_loss, f_loss, s_loss, b_loss = compute_grid_loss(preds, targets, **self.loss_params)
+                self.optimizer.zero_grad(set_to_none=True)
+                
+                # 1. Forward pass in Mixed Precision
+                with torch.autocast(device_type=self.device.type, dtype=torch.float16):
+                    preds = self.model(images_final)
+                
+                # 2. Force FP32 before numerically sensitive loss calculation
+                preds_fp32 = {k: v.float() for k, v in preds.items()}
+                
+                loss, p_loss, po_loss, f_loss, s_loss, b_loss = compute_grid_loss(preds_fp32, targets, **self.loss_params)
                 
                 if torch.isnan(loss):
                     print(f"⚠️ NaN detected at step {i}")
                     continue
                     
-                loss.backward()
+                # 3. Scaled Backward Pass
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                self.optimizer.step()
+                
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                
                 epoch_loss += loss.item()
                 
                 if i % 100 == 0:
@@ -164,7 +179,10 @@ class Trainer:
                 images_final = torch.asinh((images_noisy - batch_medians) / GLOBAL_STRETCH_SCALE)
                 # --------------------------------------------
                     
-                preds = self.model(images_final)
-                loss, _, _, _, _, _ = compute_grid_loss(preds, targets, **self.loss_params)
+                with torch.autocast(device_type=self.device.type, dtype=torch.float16):
+                    preds = self.model(images_final)
+                
+                preds_fp32 = {k: v.float() for k, v in preds.items()}
+                loss, _, _, _, _, _ = compute_grid_loss(preds_fp32, targets, **self.loss_params)
                 val_loss += loss.item()
         return val_loss / len(self.val_loader)

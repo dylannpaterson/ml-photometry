@@ -239,12 +239,14 @@ def run_infer(stage_idx, config, device, checkpoint=None):
         target_grid = sparse_sample["base_grid"].numpy()
         cell_size, grid_size = provider.cell_size, provider.grid_size
         K = provider.K
+        S_sq = provider.S**2
         for y in range(grid_size):
             for x in range(grid_size):
                 for k in range(K):
                     slot = target_grid[y, x, k]
-                    tp, tdx, tdy, raw_flux, tc = slot
+                    tp = slot[0]
                     if tp == 1.0:
+                        tdx, tdy, raw_flux, tc = slot[1], slot[2], slot[3], slot[4]
                         tgx = (x * cell_size) + tdx
                         tgy = (y * cell_size) + tdy
                         # NEW: Target already contains raw physical photons

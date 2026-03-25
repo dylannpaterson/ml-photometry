@@ -128,7 +128,11 @@ class DenseGridModel(nn.Module):
         star_out = star_out.view(B, self.K, 5 + self.S2, H, W)
         star_out = star_out.permute(0, 3, 4, 1, 2)
         
-        p = torch.sigmoid(star_out[..., 0:1])
+        # --- THE LOGIT BYPASS ---
+        p_logits = star_out[..., 0:1] # Keep raw logits
+        p = torch.sigmoid(p_logits)   # Standard probability for inference
+        # ------------------------
+        
         dx = torch.sigmoid(star_out[..., 1:2]) * self.cell_size
         dy = torch.sigmoid(star_out[..., 2:3]) * self.cell_size
         
@@ -147,6 +151,7 @@ class DenseGridModel(nn.Module):
         
         return {
             "stars": torch.cat([p, dx, dy, flux, c, shape], dim=-1),
+            "p_logits": p_logits, # NEW: Pass raw logits to the loss function
             "raw_log_flux": raw_log_flux, # Logit Bypass
             "background": bg
         }
@@ -174,11 +179,15 @@ def compute_grid_loss(preds, targets, lambda_prob=5.0, lambda_pos=50.0, lambda_f
     obj_mask = star_targets[..., 0] == 1.0
     
     # 2. Probability Loss (p) with Faint Star Boosting
-    p_pred = torch.clamp(star_preds[..., 0], 1e-7, 1.0 - 1e-7)
+    p_pred_probs = torch.clamp(star_preds[..., 0], 1e-7, 1.0 - 1e-7)
+    p_pred_logits = preds["p_logits"].squeeze(-1) # Get the raw logits
     p_target = star_targets[..., 0]
     
-    bce_loss = F.binary_cross_entropy(p_pred, p_target, reduction='none')
-    p_t = p_pred * p_target + (1 - p_pred) * (1 - p_target)
+    # THE FIX: Stable base loss using logits
+    bce_loss = F.binary_cross_entropy_with_logits(p_pred_logits, p_target, reduction='none')
+    
+    # THE FIX: Calculate focal weights using PROBABILITIES to prevent explosion
+    p_t = p_pred_probs * p_target + (1 - p_pred_probs) * (1 - p_target)
     focal_weight = (1 - p_t) ** focal_gamma
     alpha_t = focal_alpha * p_target + (1 - focal_alpha) * (1 - p_target)
     
@@ -189,7 +198,7 @@ def compute_grid_loss(preds, targets, lambda_prob=5.0, lambda_pos=50.0, lambda_f
         stretched_target = torch.arcsinh(raw_flux_target / stretch_scale)
         
         # Boost based on the stretched value, keeping your original logic intact
-        boost_weight = torch.where(obj_mask, 1.0 + (12.0 - stretched_target) / 6.0, torch.tensor(1.0, device=p_pred.device))
+        boost_weight = torch.where(obj_mask, 1.0 + (12.0 - stretched_target) / 6.0, torch.tensor(1.0, device=p_pred_probs.device))
         boost_weight = torch.clamp(boost_weight, 1.0, 5.0)
     
     prob_loss = (alpha_t * focal_weight * bce_loss * boost_weight).mean()

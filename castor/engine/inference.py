@@ -43,6 +43,9 @@ class InferenceEngine:
         with torch.no_grad():
             input_tensor = image_tensor.unsqueeze(0).to(self.device)
             prediction_dict = self.model(input_tensor)
+            
+            # Note: Model now outputs activated probabilities in "stars" 
+            # and raw logits in "p_logits" for loss stability.
             prediction = prediction_dict["stars"].squeeze(0).cpu().numpy()
             bg_map = prediction_dict["background"].squeeze(0).cpu().numpy()
             
@@ -129,11 +132,26 @@ class InferenceEngine:
         def add_colorbar(im, ax):
             divider = make_axes_locatable(ax)
             cax = divider.append_axes("right", size="5%", pad=0.05)
+            # Ensure im has finite limits for colorbar
             fig.colorbar(im, cax=cax)
 
+        def sanitize_for_plot(data, fill_val=0.0):
+            d = data.copy()
+            # Replace Inf/NaN with fill_val
+            mask = ~np.isfinite(d)
+            d[mask] = fill_val
+            # Clip to extreme but finite values to prevent any Matplotlib internal overflows
+            return np.clip(d, -1e15, 1e15)
+
         # Row 1-2: Primary Linear Comparisons
+        img_linear_abs = sanitize_for_plot(img_linear_abs, fill_val=chunk_median)
+        full_reconstruction_linear_abs = sanitize_for_plot(full_reconstruction_linear_abs, fill_val=chunk_median)
+        residual_linear = sanitize_for_plot(residual_linear, fill_val=0.0)
+
         l_vmin, l_vmax = np.percentile(img_linear_abs, [10, 99.9])
-        norm = LogNorm(vmin=max(1.0, l_vmin), vmax=l_vmax)
+        l_vmin = max(1.0, l_vmin)
+        l_vmax = max(l_vmin + 1.0, l_vmax)
+        norm = LogNorm(vmin=l_vmin, vmax=l_vmax, clip=True)
         
         ax1 = fig.add_subplot(gs[0:2, 0])
         ax1.imshow(img_linear_abs, cmap='inferno', origin='lower', norm=norm, aspect='equal')
@@ -154,8 +172,9 @@ class InferenceEngine:
         add_colorbar(im2, ax2)
         
         ax3 = fig.add_subplot(gs[0:2, 2], sharex=ax1, sharey=ax1)
-        # Linear residual typically has wide range, center on 0 with symlog or robust limits
+        # Linear residual typically has wide range, center on 0 with robust limits
         r_limit = np.percentile(np.abs(residual_linear), 99)
+        if r_limit <= 0 or not np.isfinite(r_limit): r_limit = 1.0
         im3 = ax3.imshow(residual_linear, cmap='bwr', origin='lower', vmin=-r_limit, vmax=r_limit, aspect='equal')
         ax3.set_title("Linear Residual (Missed = Black)")
         
@@ -167,8 +186,11 @@ class InferenceEngine:
         add_colorbar(im3, ax3)
 
         # Row 3: Background Comparisons (Linear)
+        full_bg_abs = sanitize_for_plot(full_bg_abs, fill_val=chunk_median)
+        full_gt_bg_abs = sanitize_for_plot(full_gt_bg_abs, fill_val=chunk_median)
         bg_vmin = min(full_bg_abs.min(), full_gt_bg_abs.min())
         bg_vmax = max(full_bg_abs.max(), full_gt_bg_abs.max())
+        if bg_vmax <= bg_vmin: bg_vmax = bg_vmin + 1.0
         
         ax4 = fig.add_subplot(gs[2, 0], sharex=ax1, sharey=ax1)
         ax4.imshow(full_bg_abs, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax, aspect='equal')
@@ -182,32 +204,40 @@ class InferenceEngine:
         # Row 4-5: PSF & Mag Plots & Missed Stats
         if matched_true_mags:
             ax8 = fig.add_subplot(gs[3:, 0])
-            ax8.scatter(matched_true_mags, matched_pred_mags, alpha=0.5, s=10)
-            all_plot_mags = matched_true_mags + matched_pred_mags
-            mmin, mmax = min(all_plot_mags), max(all_plot_mags)
-            ax8.plot([mmin, mmax], [mmin, mmax], 'r--', alpha=0.8)
-            ax8.set_xlabel("True log10(Flux)")
-            ax8.set_ylabel("Predicted log10(Flux)")
-            ax8.set_title("Magnitude Recovery Accuracy (Matched Pairs)")
-            ax8.set_aspect('equal')
-            ax8.grid(True, alpha=0.3)
+            m_true_clean = [m for m in matched_true_mags if np.isfinite(m)]
+            m_pred_clean = [m for m in matched_pred_mags if np.isfinite(m)]
+            if m_true_clean and m_pred_clean:
+                ax8.scatter(matched_true_mags, matched_pred_mags, alpha=0.5, s=10)
+                all_plot_mags = m_true_clean + m_pred_clean
+                mmin, mmax = min(all_plot_mags), max(all_plot_mags)
+                ax8.plot([mmin, mmax], [mmin, mmax], 'r--', alpha=0.8)
+                ax8.set_xlabel("True log10(Flux)")
+                ax8.set_ylabel("Predicted log10(Flux)")
+                ax8.set_title("Magnitude Recovery Accuracy (Matched Pairs)")
+                ax8.set_aspect('equal')
+                ax8.grid(True, alpha=0.3)
 
         if all_true_mags:
             # NEW: Flux Distribution Histogram (ALL stars)
             ax_hist = fig.add_subplot(gs[3, 1])
-            mmin_h, mmax_h = min(all_true_mags), max(all_true_mags)
-            if all_pred_mags:
-                mmin_h = min(mmin_h, min(all_pred_mags))
-                mmax_h = max(mmax_h, max(all_pred_mags))
+            true_m_clean = [m for m in all_true_mags if np.isfinite(m)]
+            pred_m_clean = [m for m in all_pred_mags if np.isfinite(m)]
             
-            bins = np.linspace(mmin_h, mmax_h, 30)
-            ax_hist.hist(all_true_mags, bins=bins, alpha=0.3, label='True (Full)', color='gray')
-            ax_hist.hist(all_pred_mags, bins=bins, alpha=0.5, label='Predicted (Full)', color='C0', histtype='step', linewidth=2)
-            ax_hist.set_xlabel("log10(Flux)")
-            ax_hist.set_ylabel("Count")
-            ax_hist.set_title("Luminosity Function Comparison (All Stars)")
-            ax_hist.legend()
-            ax_hist.grid(True, alpha=0.2)
+            if true_m_clean:
+                mmin_h, mmax_h = min(true_m_clean), max(true_m_clean)
+                if pred_m_clean:
+                    mmin_h = min(mmin_h, min(pred_m_clean))
+                    mmax_h = max(mmax_h, max(pred_m_clean))
+                
+                bins = np.linspace(mmin_h, mmax_h, 30)
+                ax_hist.hist(true_m_clean, bins=bins, alpha=0.3, label='True (Full)', color='gray')
+                if pred_m_clean:
+                    ax_hist.hist(pred_m_clean, bins=bins, alpha=0.5, label='Predicted (Full)', color='C0', histtype='step', linewidth=2)
+                ax_hist.set_xlabel("log10(Flux)")
+                ax_hist.set_ylabel("Count")
+                ax_hist.set_title("Luminosity Function Comparison (All Stars)")
+                ax_hist.legend()
+                ax_hist.grid(True, alpha=0.2)
 
         # Completeness (SNR Proxy) Histogram for Missed Stars
         ax9 = fig.add_subplot(gs[4, 1])
@@ -215,35 +245,41 @@ class InferenceEngine:
         matched_comps = [true_catalogue[i][3] for i in matched_true_indices]
         
         if missed_comps or matched_comps:
-            ax9.hist([matched_comps, missed_comps], bins=20, stacked=True, 
-                    label=['Detected', 'Missed'], color=['g', 'r'], alpha=0.7)
-            ax9.set_xlabel("Target Completeness Score (SNR Proxy)")
-            ax9.set_ylabel("Star Count")
-            ax9.set_title("Detection Success vs. Target Completeness")
-            ax9.legend()
-            ax9.grid(True, alpha=0.2)
+            # Filter non-finite comps just in case
+            mc_clean = [c for c in matched_comps if np.isfinite(c)]
+            misc_clean = [c for c in missed_comps if np.isfinite(c)]
+            if mc_clean or misc_clean:
+                ax9.hist([mc_clean, misc_clean], bins=20, stacked=True, 
+                        label=['Detected', 'Missed'], color=['g', 'r'], alpha=0.7)
+                ax9.set_xlabel("Target Completeness Score (SNR Proxy)")
+                ax9.set_ylabel("Star Count")
+                ax9.set_title("Detection Success vs. Target Completeness")
+                ax9.legend()
+                ax9.grid(True, alpha=0.2)
 
         # PSF Profile Plots
         if predicted_shapes:
             ax_psf_x = fig.add_subplot(gs[3:, 2])
             ax_psf_y = fig.add_subplot(gs[3:, 3])
             
-            num_to_plot = min(100, len(predicted_shapes))
-            for i in range(num_to_plot):
-                shape = predicted_shapes[i]
-                prof_x = np.mean(shape, axis=0)
-                prof_y = np.mean(shape, axis=1)
-                ax_psf_x.plot(prof_x, color='C0', alpha=0.1, linewidth=1)
-                ax_psf_y.plot(prof_y, color='C1', alpha=0.1, linewidth=1)
-            
-            all_shapes = np.stack(predicted_shapes[:100])
-            ax_psf_x.plot(np.mean(all_shapes, axis=(0, 1)), color='black', linewidth=2, label='Mean')
-            ax_psf_y.plot(np.mean(all_shapes, axis=(0, 2)), color='black', linewidth=2, label='Mean')
-            
-            ax_psf_x.set_title("PSF X-Profiles (Y-avg)")
-            ax_psf_y.set_title("PSF Y-Profiles (X-avg)")
-            ax_psf_x.set_xlabel("Pixels"); ax_psf_y.set_xlabel("Pixels")
-            ax_psf_x.grid(True, alpha=0.2); ax_psf_y.grid(True, alpha=0.2)
+            shapes_clean = [s for s in predicted_shapes if np.all(np.isfinite(s))]
+            if shapes_clean:
+                num_to_plot = min(100, len(shapes_clean))
+                for i in range(num_to_plot):
+                    shape = shapes_clean[i]
+                    prof_x = np.mean(shape, axis=0)
+                    prof_y = np.mean(shape, axis=1)
+                    ax_psf_x.plot(prof_x, color='C0', alpha=0.1, linewidth=1)
+                    ax_psf_y.plot(prof_y, color='C1', alpha=0.1, linewidth=1)
+                
+                all_shapes = np.stack(shapes_clean[:100])
+                ax_psf_x.plot(np.mean(all_shapes, axis=(0, 1)), color='black', linewidth=2, label='Mean')
+                ax_psf_y.plot(np.mean(all_shapes, axis=(0, 2)), color='black', linewidth=2, label='Mean')
+                
+                ax_psf_x.set_title("PSF X-Profiles (Y-avg)")
+                ax_psf_y.set_title("PSF Y-Profiles (X-avg)")
+                ax_psf_x.set_xlabel("Pixels"); ax_psf_y.set_xlabel("Pixels")
+                ax_psf_x.grid(True, alpha=0.2); ax_psf_y.grid(True, alpha=0.2)
 
         plt.suptitle(f"Generative Diagnostic (Scale={self.stretch_scale}) | Predicted Stars: {len(predicted_stars)}", fontsize=24)
         plt.savefig(output_path); print(f"Comparison saved to {output_path}")
