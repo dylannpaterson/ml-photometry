@@ -146,8 +146,27 @@ def run_train(stage_idx, config, device):
     
     batch_size = stage_cfg["batch_size"]
     num_workers = stage_cfg.get("num_workers", 0)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    
+    # Enable hardware optimizations if multiple workers are used
+    use_optimizations = num_workers > 0
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=num_workers,
+        pin_memory=use_optimizations,
+        persistent_workers=use_optimizations,
+        prefetch_factor=3 if use_optimizations else None
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=num_workers,
+        pin_memory=use_optimizations,
+        persistent_workers=use_optimizations,
+        prefetch_factor=3 if use_optimizations else None
+    )
 
     # Model Setup
     model = DenseGridModel(K=K, shape_size=S, cell_size=cell_size).to(device)

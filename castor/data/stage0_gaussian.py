@@ -17,7 +17,7 @@ try:
 except ImportError:
     galsim = None
 
-@njit(boundscheck=False, wraparound=False)
+# @njit(boundscheck=False) # Disabled due to LLVM machine model crash
 def fast_paint_grid(lx, ly, fluxes, snrs, comps, shapes, sort_idx, min_snr, grid_size, cell_size, K, S_sq):
     grid_stars = np.zeros((grid_size, grid_size, K, 5 + S_sq), dtype=np.float32)
     counts = np.zeros((grid_size, grid_size), dtype=np.int32)
@@ -183,9 +183,10 @@ class GaussianPretrainingProvider(Dataset):
             star_signal[y0_m:y1_m, x0_m:x1_m] += stamp
 
         total_photon_flux = star_signal + sky_level
-        raw_image = np.random.normal(loc=total_photon_flux, scale=np.sqrt(total_photon_flux + self.read_noise**2)).astype(np.float32)
-        chunk_median = np.median(raw_image)
-        normalized_image = self.transform.image_to_network(raw_image, chunk_median)
+        
+        # OFF-LOADED TO GPU: We just return the clean signal for the trainer to add noise
+        chunk_median = np.median(total_photon_flux)
+        normalized_image = self.transform.image_to_network(total_photon_flux, chunk_median) # We will redo this in the trainer
 
         # --- Sub-Pixel Accurate Local Confusion SNR ---
         # Sample total light using bilinear interpolation at EXACT centers
@@ -216,14 +217,7 @@ class GaussianPretrainingProvider(Dataset):
             else:
                 bin_comp = counts_survived[valid] / (counts_total[valid] + 1e-9)
                 bin_centers = ((bins[:-1] + bins[1:]) / 2)[valid]
-                
-                # EDGE CASE 3: Use k=1 (linear) to prevent wild cubic spline oscillations
-                try:
-                    spl = UnivariateSpline(bin_centers, bin_comp, k=1, s=0.0)
-                    comps = np.clip(spl(mags), 0.0, 1.0).astype(np.float32)
-                except Exception:
-                    # Bulletproof fallback
-                    comps = np.interp(mags, bin_centers, bin_comp, left=1.0, right=0.0).astype(np.float32)
+                comps = np.interp(mags, bin_centers, bin_comp, left=1.0, right=0.0).astype(np.float32)
 
         # Target Construction
         base_grid = np.zeros((self.grid_size, self.grid_size, self.K, 5), dtype=np.float32)
@@ -261,8 +255,8 @@ class GaussianPretrainingProvider(Dataset):
                             torch.from_numpy(bg_grid).unsqueeze(-1)], dim=-1)
 
         return {
-            "image": torch.from_numpy(normalized_image).unsqueeze(0), 
-            "raw_image": torch.from_numpy(raw_image), 
+            "image": torch.from_numpy(total_photon_flux).unsqueeze(0), # Send raw physics to GPU 
+            "raw_image": torch.from_numpy(total_photon_flux), 
             "physics_image": torch.from_numpy(star_signal), 
             "target": target, 
             "chunk_median": float(chunk_median), 
@@ -289,6 +283,9 @@ class GaussianMosaicDataset(Dataset):
         self.active_mosaic_idx = -1
         self.active_img = None
         self.active_cat = None
+        self.active_snrs = None
+        self.active_comps = None
+        
         self.max_samples_per_mosaic = 384 
         # STAGGER: Start each worker at a random point in its cycle to prevent thundering herd IO
         self.samples_from_current = np.random.randint(0, self.max_samples_per_mosaic)
@@ -319,14 +316,50 @@ class GaussianMosaicDataset(Dataset):
         # 1. Nuke old data and force reclaim
         self.active_img = None
         self.active_cat = None
+        self.active_snrs = None
+        self.active_comps = None
         gc.collect()
         
         mosaic = self.mosaics[m_idx]
         self.active_img = np.load(mosaic['img_path'])
-        
-        # CHANGED: The file is already pre-sorted by generate_mosaics.py
         self.active_cat = np.load(mosaic['cat_path']) 
         
+        # --- PRE-COMPUTE Global Completeness (Spline) ---
+        fluxes = self.active_cat['flux']
+        mags = self.active_cat['mag']
+        lx, ly = self.active_cat['x'], self.active_cat['y']
+        
+        # Consistent Sky/Noise Calculation
+        pixel_scale = 0.11
+        sky_level = (10 ** (-0.4 * (mosaic['sky_mag'] - mosaic['zp']))) * (pixel_scale**2) * mosaic['exp_time']
+        
+        ly_idx = np.clip(ly.astype(np.int32), 0, self.active_img.shape[0] - 1)
+        lx_idx = np.clip(lx.astype(np.int32), 0, self.active_img.shape[1] - 1)
+        total_local_light = self.active_img[ly_idx, lx_idx]
+        
+        local_background = np.maximum(0, total_local_light - (fluxes * self.psf_peak))
+        noise_variance = fluxes + self.n_pix * (sky_level + local_background + 25.0)
+        self.active_snrs = fluxes / np.sqrt(np.maximum(1.0, noise_variance))
+        
+        survived = self.active_snrs >= self.min_snr
+        
+        # Global Spline Fitting
+        if len(mags) < 10 or mags.min() >= mags.max() - 1e-3:
+            self.active_comps = survived.astype(np.float32)
+        else:
+            m_min, m_max = mags.min(), mags.max()
+            bins = np.linspace(m_min, m_max, 25)
+            counts_total, _ = np.histogram(mags, bins=bins)
+            counts_survived, _ = np.histogram(mags[survived], bins=bins)
+            
+            valid = counts_total > 0
+            if valid.sum() < 4:
+                self.active_comps = survived.astype(np.float32)
+            else:
+                bin_comp = counts_survived[valid] / (counts_total[valid] + 1e-9)
+                bin_centers = ((bins[:-1] + bins[1:]) / 2)[valid]
+                self.active_comps = np.interp(mags, bin_centers, bin_comp, left=1.0, right=0.0).astype(np.float32)
+
         self.active_mosaic_idx = m_idx
         self.samples_from_current = 0
 
@@ -347,70 +380,34 @@ class GaussianMosaicDataset(Dataset):
         px = np.random.randint(0, mx - self.img_size)
         star_signal_np = self.active_img[py:py+self.img_size, px:px+self.img_size].copy()
         
-        # 3. Add Live Noise using PyTorch
+        # 3. Offload Noise to GPU - Return clean physics signal
         pixel_scale = 0.11
         sky_level = (10 ** (-0.4 * (mosaic['sky_mag'] - mosaic['zp']))) * (pixel_scale**2) * mosaic['exp_time']
-        signal_tensor = torch.from_numpy(star_signal_np + sky_level).clamp(min=0)
-        img_noisy_tensor = torch.poisson(signal_tensor) + torch.randn_like(signal_tensor) * 5.0
+        signal_tensor = torch.from_numpy(star_signal_np + sky_level).clamp(min=0).unsqueeze(0).float()
         
-        img_noisy_np = img_noisy_tensor.numpy()
-        chunk_median = np.median(img_noisy_np)
-        image_tensor = torch.from_numpy(self.transform.image_to_network(img_noisy_np, chunk_median)).unsqueeze(0).float()
-
+        # We need chunk_median for target background normalization
+        # Estimate median directly from the clean signal to match what the noisy median will roughly be
+        chunk_median = np.median(star_signal_np + sky_level)
+        
         # 4. Binary Search spatial filter in RAM
         y_start = np.searchsorted(self.active_cat['y'], py)
         y_end = np.searchsorted(self.active_cat['y'], py + self.img_size)
         
         band_cat = self.active_cat[y_start:y_end]
+        band_snrs = self.active_snrs[y_start:y_end]
+        band_comps = self.active_comps[y_start:y_end]
+        
         mask_x = (band_cat['x'] >= px) & (band_cat['x'] < px + self.img_size)
         
         if not mask_x.any():
-            return {"image": image_tensor, "target": torch.zeros((self.grid_size, self.grid_size, self.K*(5+self.S**2) + 1)), "chunk_median": float(chunk_median)}
+            return {"image": signal_tensor, "target": torch.zeros((self.grid_size, self.grid_size, self.K*(5+self.S**2) + 1)), "chunk_median": float(chunk_median)}
         
         local_cat = band_cat[mask_x]
+        snrs = band_snrs[mask_x]
+        comps = band_comps[mask_x]
+        
         lx, ly = local_cat['x'] - px, local_cat['y'] - py
         fluxes = local_cat['flux']
-        
-        # 5. Optimized SNR Update (Nearest Neighbor)
-        ly_idx = np.clip(ly.astype(np.int32), 0, self.img_size - 1)
-        lx_idx = np.clip(lx.astype(np.int32), 0, self.img_size - 1)
-        total_local_light = star_signal_np[ly_idx, lx_idx]
-        
-        local_background = np.maximum(0, total_local_light - (fluxes * self.psf_peak))
-        noise_variance = fluxes + self.n_pix * (sky_level + local_background + 25.0)
-        snrs = fluxes / np.sqrt(np.maximum(1.0, noise_variance))
-
-        # --- NEW: Probabilistic Completeness (Per-Chunk Empirical) ---
-        survived = snrs >= self.min_snr
-        mags = local_cat['mag']
-        
-        # EDGE CASE 1: Not enough stars in this crop to fit a curve, or identical mags
-        if len(mags) < 10 or mags.min() >= mags.max() - 1e-3:
-            comps = survived.astype(np.float32)
-        else:
-            m_min, m_max = mags.min(), mags.max()
-            bins = np.linspace(m_min, m_max, 25)
-            
-            counts_total, _ = np.histogram(mags, bins=bins)
-            counts_survived, _ = np.histogram(mags[survived], bins=bins)
-            
-            # EDGE CASE 2: Mask out empty bins so they don't drag the spline to 0.0
-            valid = counts_total > 0
-            
-            if valid.sum() < 4:
-                # Still not enough valid populated bins to interpolate reliably
-                comps = survived.astype(np.float32)
-            else:
-                bin_comp = counts_survived[valid] / (counts_total[valid] + 1e-9)
-                bin_centers = ((bins[:-1] + bins[1:]) / 2)[valid]
-                
-                # EDGE CASE 3: Use k=1 (linear) to prevent wild cubic spline oscillations
-                try:
-                    spl = UnivariateSpline(bin_centers, bin_comp, k=1, s=0.0)
-                    comps = np.clip(spl(mags), 0.0, 1.0).astype(np.float32)
-                except Exception:
-                    # Bulletproof fallback
-                    comps = np.interp(mags, bin_centers, bin_comp, left=1.0, right=0.0).astype(np.float32)
         
         # 6. Grid Painting (Numba Optimized)
         sort_idx = np.argsort(fluxes)[::-1]
@@ -422,4 +419,5 @@ class GaussianMosaicDataset(Dataset):
         bg_grid = np.full((self.grid_size, self.grid_size, 1), self.transform.target_bg_to_network(sky_level - chunk_median), dtype=np.float32)
         target = torch.cat([torch.from_numpy(grid_stars_np).view(self.grid_size, self.grid_size, -1), torch.from_numpy(bg_grid)], dim=-1)
         
-        return {"image": image_tensor, "target": target, "chunk_median": float(chunk_median)}
+        return {"image": signal_tensor, "target": target, "chunk_median": float(chunk_median)}
+

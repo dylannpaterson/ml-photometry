@@ -86,27 +86,13 @@ class Stage1MacroSparseDataset(Dataset):
         
         clean_physics = mosaic['image'][py:py+self.img_size, px:px+self.img_size].copy()
         
-        # --- NOISE PIPELINE (Live Injection) ---
-        
-        # 3. Add Sky Background
+        # 3. Offload Noise to GPU - Return clean physics signal
         sky_level = mosaic['sky_level'] * np.random.uniform(0.8, 1.2) # Randomized sky
-        img_with_sky = clean_physics + sky_level
+        signal_np = clean_physics + sky_level
+        signal_tensor = torch.from_numpy(signal_np).clamp(min=0).unsqueeze(0).float()
         
-        # 4. Apply Poisson Noise (Photon Noise)
-        # Poisson is only valid for positive values
-        img_poisson = np.random.poisson(np.maximum(img_with_sky, 0)).astype(np.float32)
-        
-        # 5. Add Gaussian Read Noise
-        read_noise = np.random.normal(0, params['read_noise'], size=img_poisson.shape)
-        img_noisy = img_poisson + read_noise
-        
-        # 6. Detector Saturation (Hardware Clamp)
-        img_saturated = np.clip(img_noisy, 0, params['full_well'])
-        
-        # 7. Normalize Image -> Network Space
-        chunk_median = np.median(img_saturated)
-        normalized_image = self.transform.image_to_network(img_saturated, chunk_median)
-        image_tensor = torch.from_numpy(normalized_image).unsqueeze(0).float()
+        # Estimate median directly from the clean signal
+        chunk_median = np.median(signal_np)
 
         # --- TARGET GENERATION (JIT Painting) ---
         
@@ -161,4 +147,5 @@ class Stage1MacroSparseDataset(Dataset):
         flattened_stars = grid_stars.view(self.grid_size, self.grid_size, -1)
         target = torch.cat([flattened_stars, torch.from_numpy(bg_grid_stretched).unsqueeze(-1).float()], dim=-1)
         
-        return image_tensor, target
+        return signal_tensor, target
+

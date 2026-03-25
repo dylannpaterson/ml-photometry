@@ -48,6 +48,14 @@ class Trainer:
 
     def train(self):
         print(f"Starting Training [{self.checkpoint_prefix}]: {self.epochs} epochs")
+        
+        # Warm up the Numba JIT compiler in the main thread to prevent LLVM crashes in forked workers
+        print("🔥 Warming up Numba JIT compiler...")
+        try:
+            _ = self.train_loader.dataset[0]
+        except Exception as e:
+            print(f"⚠️ Numba warmup failed: {e}")
+
         for epoch in range(self.start_epoch, self.epochs):
             self.model.train(); epoch_loss, start_time = 0, time.time()
             for i, batch in enumerate(self.train_loader):
@@ -58,8 +66,26 @@ class Trainer:
                     images, targets = batch
                     images, targets = images.to(self.device), targets.to(self.device)
                 
+                # --- GPU-ACCELERATED LIVE NOISE INJECTION ---
+                # Ensure values are strictly positive before poisson
+                images_positive = torch.clamp(images, min=0.0) 
+                
+                # 1. Poisson Noise (Photon Noise)
+                images_noisy = torch.poisson(images_positive)
+                
+                # 2. Gaussian Read Noise (e.g., 5.0)
+                images_noisy += torch.randn_like(images_noisy) * 5.0
+                
+                # Normalize via median (Done locally on GPU)
+                batch_medians = images_noisy.view(images_noisy.shape[0], -1).median(dim=1)[0]
+                batch_medians = batch_medians.view(-1, 1, 1, 1)
+                
+                # Apply your stretch scale
+                images_final = torch.asinh((images_noisy - batch_medians) / GLOBAL_STRETCH_SCALE)
+                # --------------------------------------------
+                
                 self.optimizer.zero_grad()
-                preds = self.model(images)
+                preds = self.model(images_final)
                 loss, p_loss, po_loss, f_loss, s_loss, b_loss = compute_grid_loss(preds, targets, **self.loss_params)
                 
                 if torch.isnan(loss):
@@ -127,8 +153,18 @@ class Trainer:
                 else:
                     images, targets = batch
                     images, targets = images.to(self.device), targets.to(self.device)
+                
+                # --- GPU-ACCELERATED LIVE NOISE INJECTION ---
+                images_positive = torch.clamp(images, min=0.0) 
+                images_noisy = torch.poisson(images_positive)
+                images_noisy += torch.randn_like(images_noisy) * 5.0
+                
+                batch_medians = images_noisy.view(images_noisy.shape[0], -1).median(dim=1)[0]
+                batch_medians = batch_medians.view(-1, 1, 1, 1)
+                images_final = torch.asinh((images_noisy - batch_medians) / GLOBAL_STRETCH_SCALE)
+                # --------------------------------------------
                     
-                preds = self.model(images)
+                preds = self.model(images_final)
                 loss, _, _, _, _, _ = compute_grid_loss(preds, targets, **self.loss_params)
                 val_loss += loss.item()
         return val_loss / len(self.val_loader)
