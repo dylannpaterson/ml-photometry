@@ -9,7 +9,7 @@ from scipy.signal import fftconvolve
 from scipy.interpolate import UnivariateSpline
 from castor.data.transforms import AstroSpaceTransform
 from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE
-from numba import njit
+from numba import njit, float32, int32
 import gc
 
 try:
@@ -17,7 +17,7 @@ try:
 except ImportError:
     galsim = None
 
-@njit(boundscheck=False)
+@njit("float32[:,:,:,:](float32[:], float32[:], float32[:], float32[:], float32[:], float32[:,:], int32[:], float32, int32, int32, int32, int32)", boundscheck=False)
 def fast_paint_grid(lx, ly, fluxes, snrs, comps, shapes, sort_idx, min_snr, grid_size, cell_size, K, S_sq):
     grid_stars = np.zeros((grid_size, grid_size, K, 5 + S_sq), dtype=np.float32)
     counts = np.zeros((grid_size, grid_size), dtype=np.int32)
@@ -283,10 +283,6 @@ class GaussianMosaicDataset(Dataset):
         self.active_snrs = None
         self.active_comps = None
         
-        self.max_samples_per_mosaic = 384 
-        # STAGGER: Start each worker at a random point in its cycle to prevent thundering herd IO
-        self.samples_from_current = np.random.randint(0, self.max_samples_per_mosaic)
-        
         # Load mosaic manifests
         self.mosaics = []
         image_files = sorted([f for f in os.listdir(data_dir) if f.endswith("_img.npy")])
@@ -307,6 +303,17 @@ class GaussianMosaicDataset(Dataset):
         
         if not self.mosaics:
             print(f"⚠️ Warning: No optimized mosaics found in {data_dir}. Check generation script.")
+            return
+
+        # 1. Force initial load in the main thread BEFORE workers fork
+        # Leverage Copy-On-Write inheritance for instant startup
+        self.active_mosaic_idx = np.random.randint(0, len(self.mosaics))
+        self._load_mosaic_to_ram(self.active_mosaic_idx)
+
+        self.max_samples_per_mosaic = 384 
+        
+        # 2. NOW apply the stagger. Workers inherit this and perfectly desync.
+        self.samples_from_current = np.random.randint(0, self.max_samples_per_mosaic)
 
     def _load_mosaic_to_ram(self, m_idx):
         """Sequential block read into RAM with aggressive GC to prevent OOM spikes."""
@@ -331,8 +338,8 @@ class GaussianMosaicDataset(Dataset):
     def __len__(self): return self.num_samples
 
     def __getitem__(self, idx):
-        # 1. Manage RAM Cache
-        if self.active_mosaic_idx == -1 or self.samples_from_current >= self.max_samples_per_mosaic:
+        # 1. Manage RAM Cache (Removed -1 check to respect COW inheritance and stagger)
+        if self.samples_from_current >= self.max_samples_per_mosaic:
             new_idx = np.random.randint(0, len(self.mosaics))
             self._load_mosaic_to_ram(new_idx)
             
@@ -365,25 +372,27 @@ class GaussianMosaicDataset(Dataset):
         
         mask_x = (band_cat['x'] >= px) & (band_cat['x'] < px + self.img_size)
         
-        if not mask_x.any():
-            return {"image": signal_tensor, "target": torch.zeros((self.grid_size, self.grid_size, self.K*(5+self.S**2) + 1)), "chunk_median": float(chunk_median)}
+        # Pre-allocate full target buffer to save reallocation/torch.cat overhead
+        target_buffer = np.zeros((self.grid_size, self.grid_size, self.K*(5+self.S**2) + 1), dtype=np.float32)
         
-        local_cat = band_cat[mask_x]
-        snrs = band_snrs[mask_x]
-        comps = band_comps[mask_x]
+        if mask_x.any():
+            local_cat = band_cat[mask_x]
+            snrs = band_snrs[mask_x]
+            comps = band_comps[mask_x]
+            
+            lx, ly = local_cat['x'] - px, local_cat['y'] - py
+            fluxes = local_cat['flux']
+            
+            # 6. Grid Painting (Numba Optimized)
+            sort_idx = np.argsort(fluxes)[::-1]
+            grid_stars_np = fast_paint_grid(
+                lx, ly, fluxes, snrs, comps, local_cat['shape'], sort_idx, 
+                self.min_snr, self.grid_size, self.cell_size, self.K, self.S**2
+            )
+            target_buffer[:, :, :-1] = grid_stars_np.reshape(self.grid_size, self.grid_size, -1)
         
-        lx, ly = local_cat['x'] - px, local_cat['y'] - py
-        fluxes = local_cat['flux']
+        # Add background slot
+        bg_val = self.transform.target_bg_to_network(sky_level - chunk_median)
+        target_buffer[:, :, -1] = bg_val
         
-        # 6. Grid Painting (Numba Optimized)
-        sort_idx = np.argsort(fluxes)[::-1]
-        grid_stars_np = fast_paint_grid(
-            lx, ly, fluxes, snrs, comps, local_cat['shape'], sort_idx, 
-            self.min_snr, self.grid_size, self.cell_size, self.K, self.S**2
-        )
-        
-        bg_grid = np.full((self.grid_size, self.grid_size, 1), self.transform.target_bg_to_network(sky_level - chunk_median), dtype=np.float32)
-        target = torch.cat([torch.from_numpy(grid_stars_np).view(self.grid_size, self.grid_size, -1), torch.from_numpy(bg_grid)], dim=-1)
-        
-        return {"image": signal_tensor, "target": target, "chunk_median": float(chunk_median)}
-
+        return {"image": signal_tensor, "target": torch.from_numpy(target_buffer), "chunk_median": float(chunk_median)}
