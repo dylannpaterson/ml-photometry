@@ -232,7 +232,20 @@ def run_infer(stage_idx, config, device, checkpoint=None):
         sparse_sample = provider.generate_chunk()
         image_tensor = sparse_sample["image"]
         gt_bg_map = sparse_sample["background_map"].numpy()
-        chunk_median = sparse_sample.get("chunk_median", 0.0)
+        
+        # --- THE FIX: Apply Live Noise and Stretch ---
+        stretch_scale = data_cfg.get("GLOBAL_STRETCH_SCALE", 10.0)
+        
+        img_pos = torch.clamp(image_tensor, min=0.0)
+        img_noisy = torch.poisson(img_pos)
+        img_noisy += torch.randn_like(img_noisy) * 5.0  # Read noise
+        
+        # Calculate the median of the NOISY image to center the stretch
+        noisy_median = img_noisy.median().item()
+        
+        # Apply the Arcsinh stretch (Network Space)
+        img_stretched = torch.arcsinh((img_noisy - noisy_median) / stretch_scale)
+        # ---------------------------------------------
         
         # Extract true stars from the target base_grid for visualization
         true_stars = []
@@ -253,7 +266,7 @@ def run_infer(stage_idx, config, device, checkpoint=None):
                         true_stars.append((tgx, tgy, float(raw_flux), tc))
         
         print(f"DEBUG: Found {len(true_stars)} true stars in the chunk.")
-        predicted_stars, predicted_shapes, bg_map = engine.predict(image_tensor)
+        predicted_stars, predicted_shapes, bg_map = engine.predict(img_stretched)
         
         # DEBUG: Print normalization stats
         matches, _, _ = match_stars(true_stars, predicted_stars)
@@ -274,7 +287,7 @@ def run_infer(stage_idx, config, device, checkpoint=None):
         else:
             print("\n--- Normalization Diagnostic: No matches found ---")
             
-        engine.visualize(image_tensor, true_stars, predicted_stars, predicted_shapes, bg_map, gt_bg_map, threshold=0.5, chunk_median=chunk_median)
+        engine.visualize(img_stretched, true_stars, predicted_stars, predicted_shapes, bg_map, gt_bg_map, threshold=0.5, chunk_median=noisy_median)
     else:
         print(f"⚠️ Specialized inference for stage {stage_idx} not yet implemented.")
 
