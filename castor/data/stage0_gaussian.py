@@ -103,7 +103,7 @@ class GaussianPretrainingProvider(Dataset):
         bank = {}
         pixel_scale = 0.11
         half = self.kernel_size // 2
-        gy, gx = np.meshgrid(np.arange(self.kernel_size), np.arange(self.kernel_size))
+        gy, gx = np.meshgrid(np.arange(self.kernel_size), np.arange(self.kernel_size), indexing='ij')
         for i in range(self.n_sub):
             for j in range(self.n_sub):
                 dx_shift = (i + 0.5) / self.n_sub
