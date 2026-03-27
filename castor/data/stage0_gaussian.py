@@ -275,6 +275,9 @@ class GaussianMosaicDataset(Dataset):
         self.psf_peak = 1.0 / (2 * np.pi * self.sigma_fixed**2)
         self.min_snr = 5.0
         
+        # Pre-allocate target shape info
+        self.target_shape = (self.grid_size, self.grid_size, self.K * 6 + 1)
+        
         # Tracking for Worker-Pinned RAM Cache
         self.active_mosaic_idx = -1
         self.active_img = None
@@ -364,12 +367,15 @@ class GaussianMosaicDataset(Dataset):
         my, mx = self.active_img.shape
         py = np.random.randint(0, my - self.img_size)
         px = np.random.randint(0, mx - self.img_size)
-        star_signal_np = self.active_img[py:py+self.img_size, px:px+self.img_size].copy()
+        star_signal_np = self.active_img[py:py+self.img_size, px:px+self.img_size]
         
         # 3. Offload Noise to GPU - Return clean physics signal
         pixel_scale = 0.11
         sky_level = (10 ** (-0.4 * (mosaic['sky_mag'] - mosaic['zp']))) * (pixel_scale**2) * mosaic['exp_time']
-        signal_tensor = torch.from_numpy(star_signal_np + sky_level).clamp(min=0).unsqueeze(0).float()
+        
+        # Optimized Tensor Instantiation
+        signal_tensor = torch.from_numpy(star_signal_np).float()
+        signal_tensor.add_(sky_level).clamp_(min=0.0).unsqueeze_(0)
         
         # We need chunk_median for target background normalization
         # Estimate median directly from the clean signal to match what the noisy median will roughly be
@@ -386,9 +392,9 @@ class GaussianMosaicDataset(Dataset):
         
         mask_x = (band_cat['x'] >= px) & (band_cat['x'] < px + self.img_size)
         
-        # Pre-allocate full target buffer to save reallocation/torch.cat overhead
-        # Size is now K * 6 + 1
-        target_buffer = np.zeros((self.grid_size, self.grid_size, self.K * 6 + 1), dtype=np.float32)
+        # Pre-allocate full target buffer using np.empty + fill(0)
+        target_buffer = np.empty(self.target_shape, dtype=np.float32)
+        target_buffer.fill(0)
         
         if mask_x.any():
             local_cat = band_cat[mask_x]

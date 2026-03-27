@@ -63,12 +63,12 @@ class Trainer:
             self.model.train(); epoch_loss, start_time = 0, time.time()
             for i, batch in enumerate(self.train_loader):
                 if isinstance(batch, dict):
-                    images = batch["image"].to(self.device)
-                    targets = batch["target"].to(self.device)
-                    psf_library = batch["psf_library"].to(self.device)
+                    images = batch["image"].to(self.device, non_blocking=True)
+                    targets = batch["target"].to(self.device, non_blocking=True)
+                    psf_library = batch["psf_library"].to(self.device, non_blocking=True)
                 else:
                     images, targets = batch
-                    images, targets = images.to(self.device), targets.to(self.device)
+                    images, targets = images.to(self.device, non_blocking=True), targets.to(self.device, non_blocking=True)
                     psf_library = None
                 
                 # --- GPU-ACCELERATED LIVE NOISE INJECTION ---
@@ -167,12 +167,12 @@ class Trainer:
         with torch.no_grad():
             for batch in self.val_loader:
                 if isinstance(batch, dict):
-                    images = batch["image"].to(self.device)
-                    targets = batch["target"].to(self.device)
-                    psf_library = batch["psf_library"].to(self.device)
+                    images = batch["image"].to(self.device, non_blocking=True)
+                    targets = batch["target"].to(self.device, non_blocking=True)
+                    psf_library = batch["psf_library"].to(self.device, non_blocking=True)
                 else:
                     images, targets = batch
-                    images, targets = images.to(self.device), targets.to(self.device)
+                    images, targets = images.to(self.device, non_blocking=True), targets.to(self.device, non_blocking=True)
                     psf_library = None
                 
                 # --- GPU-ACCELERATED LIVE NOISE INJECTION ---
