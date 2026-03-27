@@ -56,8 +56,10 @@ def create_hdf5_dataset(data_dir, output_path, total_samples=50000, img_size=256
         images_ds = h5f.create_dataset("images", (total_samples, 1, img_size, img_size), dtype='float32', chunks=(1, 1, img_size, img_size))
         targets_ds = h5f.create_dataset("targets", (total_samples, *target_shape), dtype='float32', chunks=(1, *target_shape))
         
-        psf_ds = None # Initialize psf_ds
-        
+        # Initialize psf_ds, will be created dynamically on first pass
+        psf_ds = None
+        medians_ds = h5f.create_dataset("chunk_medians", (total_samples,), dtype='float32')
+
         samples_per_mosaic = total_samples // len(mosaics)
         current_idx = 0
         
