@@ -428,3 +428,38 @@ class GaussianMosaicDataset(Dataset):
             "chunk_median": float(chunk_median),
             "psf_library": torch.from_numpy(self.active_library)
         }
+
+import h5py
+
+class HDF5MosaicDataset(Dataset):
+    def __init__(self, h5_path):
+        self.h5_path = h5_path
+        self.file = None
+        
+        if not os.path.exists(self.h5_path):
+            raise FileNotFoundError(f"HDF5 file not found: {self.h5_path}")
+
+        # Open briefly just to get the length
+        with h5py.File(self.h5_path, 'r') as f:
+            self.length = len(f['images'])
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        # Lazy-load the file per-worker to prevent multiprocessing crashes
+        if self.file is None:
+            self.file = h5py.File(self.h5_path, 'r')
+            
+        # HDF5 handles fast disk-seeking automatically
+        img = self.file['images'][idx]
+        target = self.file['targets'][idx]
+        psf = self.file['psf_libraries'][idx]
+        median = self.file['chunk_medians'][idx]
+
+        return {
+            "image": torch.from_numpy(img),
+            "target": torch.from_numpy(target),
+            "psf_library": torch.from_numpy(psf),
+            "chunk_median": float(median)
+        }

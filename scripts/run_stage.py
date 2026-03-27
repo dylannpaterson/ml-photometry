@@ -78,33 +78,18 @@ def run_train(stage_idx, config, device):
     stretch_scale = data_cfg.get("GLOBAL_STRETCH_SCALE", GLOBAL_STRETCH_SCALE)
 
     if stage_idx == 0:
-        mosaic_dir = os.path.join(stage_cfg["data_dir"], "mosaics")
-        if force_gen or not os.path.exists(mosaic_dir) or not os.listdir(mosaic_dir):
-            print("🛠️ Generating Mosaics for Stage 0...")
+        from castor.data.stage0_gaussian import HDF5MosaicDataset
+        train_h5 = os.path.join(stage_cfg["data_dir"], "stage0_train.h5")
+        val_h5 = os.path.join(stage_cfg["data_dir"], "stage0_val.h5")
+        
+        if not os.path.exists(train_h5):
+            print(f"🛠️ HDF5 dataset not found. Converting mosaics...")
             cfg_path = config.get("config_path", "config/config.yaml")
-            # Extract num_mosaics from config if available
-            mos_cfg = stage_cfg.get("mosaic_params", {"num_mosaics": 5})
-            num_mos = mos_cfg.get("num_mosaics", 5)
-            # Use the correct config file path
-            os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/generate_mosaics.py --num {num_mos} --stage {stage_idx} --config {cfg_path}")
+            os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/convert_to_hdf5.py --data_dir {stage_cfg['data_dir']} --train_samples {data_cfg['num_train_samples']} --val_samples {data_cfg['num_val_samples']}")
 
-        from castor.data.stage0_gaussian import GaussianMosaicDataset
-        print("🛠️ Using Mosaic Sampling for high-speed training & validation...")
-        train_dataset = GaussianMosaicDataset(
-            mosaic_dir,
-            num_samples=data_cfg["num_train_samples"],
-            image_size=data_cfg["image_size"],
-            cell_size=cell_size,
-            global_stretch_scale=stretch_scale
-        )
-        # Use the same mosaics for validation but with a fixed sample count
-        val_dataset = GaussianMosaicDataset(
-            mosaic_dir,
-            num_samples=data_cfg["num_val_samples"],
-            image_size=data_cfg["image_size"],
-            cell_size=cell_size,
-            global_stretch_scale=stretch_scale
-        )
+        print(f"🛠️ Using HDF5 Dataset: {train_h5}")
+        train_dataset = HDF5MosaicDataset(train_h5)
+        val_dataset = HDF5MosaicDataset(val_h5)
     elif stage_idx == 1:
         # NEW: Stage 1 Multi-Telescope Foundation Dataset (Macro-Sparse)
         from castor.data.stage1_dataset import Stage1MacroSparseDataset

@@ -21,6 +21,7 @@ dependencies = [
     "pyarrow",
     "jax[cuda12]",
     "numba",
+    "h5py",
 ]
 
 [tool.setuptools]
