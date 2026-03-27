@@ -156,7 +156,7 @@ class DenseGridModel(nn.Module):
             "background": bg
         }
 
-def compute_grid_loss(preds, targets, lambda_prob=5.0, lambda_pos=50.0, lambda_flux=5.0, lambda_comp=1.0, lambda_shape=1.0, lambda_bg=0.1, focal_alpha=0.75, focal_gamma=2.0, stretch_scale=GLOBAL_STRETCH_SCALE):
+def compute_grid_loss(preds, targets, psf_library=None, lambda_prob=5.0, lambda_pos=50.0, lambda_flux=5.0, lambda_comp=1.0, lambda_shape=1.0, lambda_bg=0.1, focal_alpha=0.75, focal_gamma=2.0, stretch_scale=GLOBAL_STRETCH_SCALE):
     """
     Standard Generative Loss without TV regularization (optimized for speed).
     Maintains positional weighting and faint-star boost.
@@ -166,15 +166,14 @@ def compute_grid_loss(preds, targets, lambda_prob=5.0, lambda_pos=50.0, lambda_f
     bg_preds = preds["background"]
     
     # 1. Unpack Flattened Target
-    # Shape: [B, H, W, (K * (5 + S2)) + 1]
+    # Shape: [B, H, W, (K * 6) + 1]
     B, H, W, C_target = targets.shape
     bg_targets = targets[..., -1:]
     star_targets_flat = targets[..., :-1]
     
-    # Infer K: C_pred = K * (5 + S2)
-    K = star_preds.shape[-2]
-    S2_plus_5 = star_preds.shape[-1]
-    star_targets = star_targets_flat.view(B, H, W, K, S2_plus_5)
+    # Infer K: C_target = K * 6 + 1
+    K = (C_target - 1) // 6
+    star_targets = star_targets_flat.view(B, H, W, K, 6)
     
     obj_mask = star_targets[..., 0] == 1.0
     
@@ -220,8 +219,23 @@ def compute_grid_loss(preds, targets, lambda_prob=5.0, lambda_pos=50.0, lambda_f
         comp_target = star_targets[..., 4:5][obj_mask]
         comp_loss = F.mse_loss(comp_pred, comp_target, reduction='mean')
         
+        # SHAPE LOSS (GPU Mapping)
         shape_pred = star_preds[..., 5:][obj_mask]
-        shape_target = star_targets[..., 5:][obj_mask]
+        
+        if psf_library is not None:
+            # Get the batch index for every valid object 
+            # (Needed because psf_library shape is [Batch, N_unique, 81])
+            b_idx = torch.where(obj_mask)[0]
+            
+            # Extract the integer PSF index for every valid star
+            psf_indices = star_targets[..., 5][obj_mask].long()
+            
+            # Construct the 81-float targets instantly on the GPU
+            shape_target = psf_library[b_idx, psf_indices]
+        else:
+            # Fallback if no library provided (assumes old format or fixed PSF)
+            shape_target = star_preds[..., 5:][obj_mask].clone() # Dummy
+            
         shape_loss = F.mse_loss(shape_pred, shape_target, reduction='mean')
     else:
         pos_loss = torch.tensor(0.0, device=star_preds.device)

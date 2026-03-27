@@ -40,6 +40,32 @@ def calculate_safe_magnitude_cutoff(exp_time, zp, sky_mag, read_noise=5.0, sigma
     mag_cutoff = zp - 2.5 * np.log10(min_flux / exp_time)
     return mag_cutoff
 
+def generate_elliptical_psf_library(num_psfs=100, grid_size=9, sigma=1.5):
+    """
+    Generates a library of varied elliptical Gaussians to simulate spatially varying PSFs.
+    Each PSF is a flattened grid_size x grid_size array.
+    """
+    library = np.zeros((num_psfs, grid_size * grid_size), dtype=np.float32)
+    half = grid_size // 2
+    y, x = np.meshgrid(np.arange(grid_size) - half, np.arange(grid_size) - half, indexing='ij')
+    
+    for i in range(num_psfs):
+        # vary ellipticity and position angle
+        q = np.random.uniform(0.7, 1.0) # axis ratio
+        theta = np.random.uniform(0, np.pi) # position angle
+        
+        # rotation matrix
+        cos, sin = np.cos(theta), np.sin(theta)
+        xp = x * cos + y * sin
+        yp = -x * sin + y * cos
+        
+        # elliptical gaussian
+        psf = np.exp(-(xp**2 / (2 * sigma**2) + yp**2 / (2 * (sigma * q)**2)))
+        psf /= psf.sum()
+        library[i] = psf.flatten()
+        
+    return library
+
 def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     """
     Generates a large seamless mosaic using the 'Bake and Drop' strategy.
@@ -78,13 +104,6 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
             for j in range(4):
                 kb_array[j * 4 + i] = provider.kernel_bank[(i, j)]
         
-        # We perform the filtering on the host side using the dynamic mag_limit
-        from castor.data.gpu_renderer import render_gpu
-        # Generate coordinates on host for simplicity or modify render_gpu to handle fused generation
-        # To avoid PCIe bottleneck, let's keep the fused logic but pass mag_limit
-        # Actually, render_generate_and_filter_gpu currently has a hardcoded 27.0
-        # I will update it to take the limit.
-        
         from castor.data.gpu_renderer import render_generate_and_filter_gpu
         full_image, x_v, y_v, flux_v, mag_v = render_generate_and_filter_gpu(
             fluxes, mags, kb_array, mosaic_size, mag_limit=mag_limit
@@ -94,8 +113,6 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
         x_centers = np.random.uniform(0, mosaic_size, len(mags))
         y_centers = np.random.uniform(0, mosaic_size, len(mags))
         full_image = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
-        # (CPU rendering loop matches previous implementation)
-        # ...
         v_mask = mags < mag_limit
         x_v, y_v, flux_v, mag_v = x_centers[v_mask], y_centers[v_mask], fluxes[v_mask], mags[v_mask]
 
@@ -103,7 +120,7 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     cat_dtype = [
         ('x', 'f4'), ('y', 'f4'), ('flux', 'f4'), ('mag', 'f4'),
         ('snr', 'f4'), ('comp', 'f4'),
-        ('shape', 'f4', (SHAPE_SIZE**2,))
+        ('psf_index', 'i4') # <--- REPLACED 'shape' WITH INTEGER INDEX
     ]
     
     n_visible = len(x_v)
@@ -151,13 +168,11 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     
     structured_cat['comp'] = comps
 
-    # Pre-compute target PSF
-    half = SHAPE_SIZE // 2
-    grid_range = np.arange(-half, half + 1)
-    sy, sx = np.meshgrid(grid_range, grid_range, indexing='ij')
-    psf_flat = np.exp(-(sx**2 + sy**2) / (2 * 1.5**2))
-    psf_flat = (psf_flat / psf_flat.sum()).astype(np.float32).flatten()
-    structured_cat['shape'] = psf_flat
+    # NEW: Generate library and assign random indices
+    N_LIBRARY_PSFS = 100
+    psf_library = generate_elliptical_psf_library(num_psfs=N_LIBRARY_PSFS, grid_size=SHAPE_SIZE)
+    psf_indices = np.random.randint(0, N_LIBRARY_PSFS, size=n_visible)
+    structured_cat['psf_index'] = psf_indices
 
     # NEW: Pre-sort the catalog by Y-coordinate so the dataloader doesn't have to
     print("Sorting catalog for fast spatial queries...")
@@ -168,10 +183,15 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     image_path = os.path.join(output_dir, f"mosaic_{idx:03d}_img.npy")
     cat_path = os.path.join(output_dir, f"mosaic_{idx:03d}_cat.npy")
     meta_path = os.path.join(output_dir, f"mosaic_{idx:03d}_meta.npy")
+    lib_path = os.path.join(output_dir, f"mosaic_{idx:03d}_psf_lib.npy")
     
     np.save(image_path, full_image)
     np.save(cat_path, structured_cat)
     np.save(meta_path, np.array([exp_time, zp, sky_mag], dtype=np.float32))
+    np.save(lib_path, psf_library)
+    
+    duration = time.time() - start_time
+    print(f"✅ Saved Optimized Mosaic {idx} in {duration:.2f}s (Limit: {mag_limit:.2f} | Targets: {n_visible:,})")
     
     duration = time.time() - start_time
     print(f"✅ Saved Optimized Mosaic {idx} in {duration:.2f}s (Limit: {mag_limit:.2f} | Targets: {n_visible:,})")

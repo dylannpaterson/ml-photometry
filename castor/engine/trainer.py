@@ -65,9 +65,11 @@ class Trainer:
                 if isinstance(batch, dict):
                     images = batch["image"].to(self.device)
                     targets = batch["target"].to(self.device)
+                    psf_library = batch["psf_library"].to(self.device)
                 else:
                     images, targets = batch
                     images, targets = images.to(self.device), targets.to(self.device)
+                    psf_library = None
                 
                 # --- GPU-ACCELERATED LIVE NOISE INJECTION ---
                 # Ensure values are strictly positive before poisson
@@ -96,7 +98,9 @@ class Trainer:
                 # 2. Force FP32 before numerically sensitive loss calculation
                 preds_fp32 = {k: v.float() for k, v in preds.items()}
                 
-                loss, p_loss, po_loss, f_loss, s_loss, b_loss = compute_grid_loss(preds_fp32, targets, **self.loss_params)
+                loss, p_loss, po_loss, f_loss, s_loss, b_loss = compute_grid_loss(
+                    preds_fp32, targets, psf_library=psf_library, **self.loss_params
+                )
                 
                 if torch.isnan(loss):
                     print(f"⚠️ NaN detected at step {i}")
@@ -165,9 +169,11 @@ class Trainer:
                 if isinstance(batch, dict):
                     images = batch["image"].to(self.device)
                     targets = batch["target"].to(self.device)
+                    psf_library = batch["psf_library"].to(self.device)
                 else:
                     images, targets = batch
                     images, targets = images.to(self.device), targets.to(self.device)
+                    psf_library = None
                 
                 # --- GPU-ACCELERATED LIVE NOISE INJECTION ---
                 images_positive = torch.clamp(images, min=0.0) 
@@ -183,6 +189,6 @@ class Trainer:
                     preds = self.model(images_final)
                 
                 preds_fp32 = {k: v.float() for k, v in preds.items()}
-                loss, _, _, _, _, _ = compute_grid_loss(preds_fp32, targets, **self.loss_params)
+                loss, _, _, _, _, _ = compute_grid_loss(preds_fp32, targets, psf_library=psf_library, **self.loss_params)
                 val_loss += loss.item()
         return val_loss / len(self.val_loader)

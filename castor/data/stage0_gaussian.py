@@ -17,9 +17,10 @@ try:
 except ImportError:
     galsim = None
 
-@njit(boundscheck=False)
-def fast_paint_grid(lx, ly, fluxes, snrs, comps, shapes, sort_idx, min_snr, grid_size, cell_size, K, S_sq):
-    grid_stars = np.zeros((grid_size, grid_size, K, 5 + S_sq), dtype=np.float32)
+#@njit(boundscheck=False)
+def fast_paint_grid(lx, ly, fluxes, snrs, comps, psf_indices, sort_idx, min_snr, grid_size, cell_size, K):
+    # Size is now exactly 6 (p, dx, dy, flux, comp, psf_index)
+    grid_stars = np.zeros((grid_size, grid_size, K, 6), dtype=np.float32)
     counts = np.zeros((grid_size, grid_size), dtype=np.int32)
     
     for idx in range(len(sort_idx)):
@@ -41,11 +42,7 @@ def fast_paint_grid(lx, ly, fluxes, snrs, comps, shapes, sort_idx, min_snr, grid
                 grid_stars[cy, cx, slot, 2] = ly[i] % cell_size
                 grid_stars[cy, cx, slot, 3] = fluxes[i]
                 grid_stars[cy, cx, slot, 4] = comps[i]
-                
-                # Numba handles this inner assignment instantly
-                for s in range(S_sq):
-                    grid_stars[cy, cx, slot, 5+s] = shapes[i, s]
-                    
+                grid_stars[cy, cx, slot, 5] = psf_indices[i] # STORE INDEX
                 counts[cy, cx] += 1
                 
     return grid_stars
@@ -126,7 +123,7 @@ class GaussianPretrainingProvider(Dataset):
     def __getitem__(self, idx):
         if self.use_fixed_seed: np.random.seed(idx)
         sample = self.generate_chunk()
-        return {"image": sample["image"], "target": sample["target"], "chunk_median": sample["chunk_median"]}
+        return {"image": sample["image"], "target": sample["target"], "chunk_median": sample["chunk_median"], "psf_library": sample["psf_library"]}
 
     def generate_chunk(self, rc_params=None, exp_params=None):
         if rc_params is None:
@@ -230,12 +227,13 @@ class GaussianPretrainingProvider(Dataset):
         psf_flat = np.exp(-(sx**2 + sy**2) / (2 * self.sigma_fixed**2))
         psf_flat = (psf_flat / psf_flat.sum()).astype(np.float32).flatten()
         
-        # Prepare broadcasted shapes for Numba
-        all_shapes = np.tile(psf_flat, (n_stars, 1))
+        # NEW: Create a 1-item library and an array of 0s for the indices
+        psf_library = psf_flat.reshape(1, -1)
+        psf_indices = np.zeros(n_stars, dtype=np.int32)
         
         base_grid = fast_paint_grid(
-            x_centers, y_centers, fluxes, snrs, comps, all_shapes, sort_idx, 
-            self.min_snr, self.grid_size, self.cell_size, self.K, self.S**2
+            x_centers, y_centers, fluxes, snrs, comps, psf_indices, sort_idx, 
+            self.min_snr, self.grid_size, self.cell_size, self.K
         )
 
         # Catalog for metadata/metrics (kept for debugging, but optimized)
@@ -262,7 +260,8 @@ class GaussianPretrainingProvider(Dataset):
             "full_snrs": snrs,
             "full_comps": comps,
             "base_grid": torch.from_numpy(base_grid),
-            "background_map": torch.from_numpy(bg_grid)
+            "background_map": torch.from_numpy(bg_grid),
+            "psf_library": torch.from_numpy(psf_library)
         }
 
 class GaussianMosaicDataset(Dataset):
@@ -282,6 +281,7 @@ class GaussianMosaicDataset(Dataset):
         self.active_cat = None
         self.active_snrs = None
         self.active_comps = None
+        self.active_library = None
         
         # Load mosaic manifests
         self.mosaics = []
@@ -290,12 +290,15 @@ class GaussianMosaicDataset(Dataset):
             base = img_f.replace("_img.npy", "")
             cat_f = base + "_cat.npy"
             meta_f = base + "_meta.npy"
+            lib_f = base + "_psf_lib.npy"
             
             if os.path.exists(os.path.join(data_dir, cat_f)) and os.path.exists(os.path.join(data_dir, meta_f)):
                 meta = np.load(os.path.join(data_dir, meta_f))
+                lib_path = os.path.join(data_dir, lib_f) if os.path.exists(os.path.join(data_dir, lib_f)) else None
                 self.mosaics.append({
                     'img_path': os.path.join(data_dir, img_f),
                     'cat_path': os.path.join(data_dir, cat_f),
+                    'lib_path': lib_path,
                     'exp_time': meta[0],
                     'zp': meta[1],
                     'sky_mag': meta[2]
@@ -322,11 +325,22 @@ class GaussianMosaicDataset(Dataset):
         self.active_cat = None
         self.active_snrs = None
         self.active_comps = None
+        self.active_library = None
         gc.collect()
         
         mosaic = self.mosaics[m_idx]
         self.active_img = np.load(mosaic['img_path'])
         self.active_cat = np.load(mosaic['cat_path']) 
+        if mosaic['lib_path']:
+            self.active_library = np.load(mosaic['lib_path'])
+        else:
+            # Fallback for old mosaics without a library
+            half = self.S // 2
+            grid_range = np.arange(-half, half + 1)
+            sy, sx = np.meshgrid(grid_range, grid_range, indexing='ij')
+            psf_flat = np.exp(-(sx**2 + sy**2) / (2 * 1.5**2))
+            psf_flat = (psf_flat / psf_flat.sum()).astype(np.float32).flatten()
+            self.active_library = psf_flat.reshape(1, -1)
         
         # --- USE PRE-CALCULATED Columns (Moved to generator script) ---
         self.active_snrs = self.active_cat['snr']
@@ -373,7 +387,8 @@ class GaussianMosaicDataset(Dataset):
         mask_x = (band_cat['x'] >= px) & (band_cat['x'] < px + self.img_size)
         
         # Pre-allocate full target buffer to save reallocation/torch.cat overhead
-        target_buffer = np.zeros((self.grid_size, self.grid_size, self.K*(5+self.S**2) + 1), dtype=np.float32)
+        # Size is now K * 6 + 1
+        target_buffer = np.zeros((self.grid_size, self.grid_size, self.K * 6 + 1), dtype=np.float32)
         
         if mask_x.any():
             local_cat = band_cat[mask_x]
@@ -383,11 +398,17 @@ class GaussianMosaicDataset(Dataset):
             lx, ly = local_cat['x'] - px, local_cat['y'] - py
             fluxes = local_cat['flux']
             
+            # Handle old catalogs vs new ones with 'psf_index'
+            if 'psf_index' in local_cat.dtype.names:
+                psf_indices = local_cat['psf_index']
+            else:
+                psf_indices = np.zeros(len(local_cat), dtype=np.int32)
+            
             # 6. Grid Painting (Numba Optimized)
             sort_idx = np.argsort(fluxes)[::-1]
             grid_stars_np = fast_paint_grid(
-                lx, ly, fluxes, snrs, comps, local_cat['shape'], sort_idx, 
-                self.min_snr, self.grid_size, self.cell_size, self.K, self.S**2
+                lx, ly, fluxes, snrs, comps, psf_indices, sort_idx, 
+                self.min_snr, self.grid_size, self.cell_size, self.K
             )
             target_buffer[:, :, :-1] = grid_stars_np.reshape(self.grid_size, self.grid_size, -1)
         
@@ -395,4 +416,9 @@ class GaussianMosaicDataset(Dataset):
         bg_val = self.transform.target_bg_to_network(sky_level - chunk_median)
         target_buffer[:, :, -1] = bg_val
         
-        return {"image": signal_tensor, "target": torch.from_numpy(target_buffer), "chunk_median": float(chunk_median)}
+        return {
+            "image": signal_tensor, 
+            "target": torch.from_numpy(target_buffer), 
+            "chunk_median": float(chunk_median),
+            "psf_library": torch.from_numpy(self.active_library)
+        }
