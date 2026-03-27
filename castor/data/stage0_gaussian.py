@@ -17,7 +17,7 @@ try:
 except ImportError:
     galsim = None
 
-#@njit(boundscheck=False)
+@njit(boundscheck=False)
 def fast_paint_grid(lx, ly, fluxes, snrs, comps, psf_indices, sort_idx, min_snr, grid_size, cell_size, K):
     # Size is now exactly 6 (p, dx, dy, flux, comp, psf_index)
     grid_stars = np.zeros((grid_size, grid_size, K, 6), dtype=np.float32)
