@@ -55,8 +55,8 @@ def create_hdf5_dataset(data_dir, output_path, total_samples=50000, img_size=256
         # Create chunked datasets for ultra-fast individual reads
         images_ds = h5f.create_dataset("images", (total_samples, 1, img_size, img_size), dtype='float32', chunks=(1, 1, img_size, img_size))
         targets_ds = h5f.create_dataset("targets", (total_samples, *target_shape), dtype='float32', chunks=(1, *target_shape))
-        psf_ds = h5f.create_dataset("psf_libraries", (total_samples, 1, 81), dtype='float32') # Assuming 9x9 flattened
-        medians_ds = h5f.create_dataset("chunk_medians", (total_samples,), dtype='float32')
+        
+        psf_ds = None # Initialize psf_ds
         
         samples_per_mosaic = total_samples // len(mosaics)
         current_idx = 0
@@ -75,6 +75,18 @@ def create_hdf5_dataset(data_dir, output_path, total_samples=50000, img_size=256
                 sy, sx = np.meshgrid(grid_range, grid_range, indexing='ij')
                 psf_flat = np.exp(-(sx**2 + sy**2) / (2 * 1.5**2))
                 psf_lib = (psf_flat / psf_flat.sum()).astype(np.float32).reshape(1, -1)
+            
+            # Dynamically create the psf_libraries dataset on the first pass
+            if psf_ds is None:
+                # psf_lib is expected to be (N_PSFS_IN_LIB, FLATTENED_SHAPE_SIZE) e.g., (100, 81)
+                psf_library_shape = psf_lib.shape 
+                psf_ds = h5f.create_dataset(
+                    "psf_libraries", 
+                    (total_samples, *psf_library_shape), # Unpacks the tuple: (total_samples, 100, 81)
+                    dtype='float32',
+                    chunks=(1, *psf_library_shape) # Chunk by individual sample
+                )
+                print(f"Allocated PSF library dataset with shape: {psf_ds.shape}")
                 
             snrs, comps = cat_data['snr'], cat_data['comp']
             my, mx = img_data.shape
