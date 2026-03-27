@@ -191,7 +191,19 @@ def run_train(stage_idx, config, device):
     elif resume_from_ckpt:
         trainer.resume()
         
-    trainer.train()
+    if os.environ.get("PROFILE") == "1":
+        import cProfile, pstats
+        print("📊 Profiling training run...")
+        profiler = cProfile.Profile()
+        profiler.enable()
+        trainer.train()
+        profiler.disable()
+        stats = pstats.Stats(profiler).sort_stats('tottime')
+        stats.print_stats(50)
+        stats.dump_stats("profile_results.prof")
+        print("✅ Profiling complete. Results saved to profile_results.prof")
+    else:
+        trainer.train()
     print(f"✅ Stage {stage_idx} complete.")
 
 def run_eval(stage_idx, config, device, checkpoint=None):
