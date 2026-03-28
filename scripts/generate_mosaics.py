@@ -95,32 +95,46 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     mags = sample_bulge_magnitudes(n_stars_total, rc_loc, rc_scale, rc_enhancement, m_min=12.0, m_max=32.0, gamma=lf_gamma)
     fluxes = exp_time * (10 ** (-0.4 * (mags - zp)))
     
-    provider = GaussianPretrainingProvider(image_size=training_size)
+    # -------------------------------------------------------------
+    # NEW: Generate the library FIRST so the renderer can use it
+    # -------------------------------------------------------------
+    N_LIBRARY_PSFS = 100
+    shape_size = params['shape_size']
+    psf_library = generate_elliptical_psf_library(num_psfs=N_LIBRARY_PSFS, grid_size=shape_size)
+    
+    # Reshape the flattened library to (N, H, W) for JAX 2D convolutions
+    kb_array = psf_library.reshape(N_LIBRARY_PSFS, shape_size, shape_size)
     
     if HAS_JAX:
-        # --- JAX PATH: Render entire mosaic at once with full physics ---
-        kb_array = np.zeros((16, provider.kernel_size, provider.kernel_size), dtype=np.float32)
-        for i in range(4):
-            for j in range(4):
-                kb_array[j * 4 + i] = provider.kernel_bank[(i, j)]
-        
         from castor.data.gpu_renderer import render_generate_and_filter_gpu
-        full_image, x_v, y_v, flux_v, mag_v = render_generate_and_filter_gpu(
+        # Pass the elliptical library directly to the GPU renderer
+        full_image, x_v, y_v, psf_indices, flux_v, mag_v = render_generate_and_filter_gpu(
             fluxes, mags, kb_array, mosaic_size, mag_limit=mag_limit
         )
     else:
         # --- NumPy CPU PATH (Fallback) ---
         x_centers = np.random.uniform(0, mosaic_size, len(mags))
         y_centers = np.random.uniform(0, mosaic_size, len(mags))
+        all_psf_indices = np.random.randint(0, N_LIBRARY_PSFS, size=len(mags))
+        
         full_image = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
         v_mask = mags < mag_limit
-        x_v, y_v, flux_v, mag_v = x_centers[v_mask], y_centers[v_mask], fluxes[v_mask], mags[v_mask]
+        x_v, y_v = x_centers[v_mask], y_centers[v_mask]
+        flux_v, mag_v = fluxes[v_mask], mags[v_mask]
+        psf_indices = all_psf_indices[v_mask]
+        
+        # Very slow loop for CPU rendering fallback
+        for x, y, f, p_idx in zip(x_v, y_v, flux_v, psf_indices):
+            ix, iy = int(x), int(y)
+            if 0 <= ix < mosaic_size and 0 <= iy < mosaic_size:
+                # Add central pixel (a rough approximation for CPU fallback)
+                full_image[iy, ix] += f 
 
-    # 2. Save Catalog as Structured NumPy with PRE-CALCULATED SNR and COMP
+    # 2. Save Catalog as Structured NumPy
     cat_dtype = [
         ('x', 'f4'), ('y', 'f4'), ('flux', 'f4'), ('mag', 'f4'),
         ('snr', 'f4'), ('comp', 'f4'),
-        ('psf_index', 'i4') # <--- REPLACED 'shape' WITH INTEGER INDEX
+        ('psf_index', 'i4') 
     ]
     
     n_visible = len(x_v)
@@ -128,6 +142,9 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     structured_cat['x'], structured_cat['y'] = x_v, y_v
     structured_cat['flux'], structured_cat['mag'] = flux_v, mag_v
     
+    # Slot the exact indices used by the renderer into the catalog
+    structured_cat['psf_index'] = psf_indices
+
     # --- PRE-CALCULATE SNR and COMP (Moved from DataLoader) ---
     print(f"Pre-calculating SNR and Completeness for {n_visible:,} stars...")
     pixel_scale = 0.11
@@ -167,12 +184,6 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
             comps = np.interp(mag_v, bin_centers, bin_comp, left=1.0, right=0.0).astype(np.float32)
     
     structured_cat['comp'] = comps
-
-    # NEW: Generate library and assign random indices
-    N_LIBRARY_PSFS = 100
-    psf_library = generate_elliptical_psf_library(num_psfs=N_LIBRARY_PSFS, grid_size=SHAPE_SIZE)
-    psf_indices = np.random.randint(0, N_LIBRARY_PSFS, size=n_visible)
-    structured_cat['psf_index'] = psf_indices
 
     # NEW: Pre-sort the catalog by Y-coordinate so the dataloader doesn't have to
     print("Sorting catalog for fast spatial queries...")
