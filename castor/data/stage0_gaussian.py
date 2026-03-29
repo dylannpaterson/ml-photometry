@@ -139,9 +139,6 @@ class GaussianPretrainingProvider(Dataset):
                 bank[(i, j)] = base_psf # For now, use the large smooth kernel
         return bank
 
-    def generate_chunk(self, rc_params=None, exp_params=None):
-        # ... (rest of the method remains similar but uses the new elliptical library)
-
     def __len__(self):
         return self.num_samples
 
@@ -176,10 +173,16 @@ class GaussianPretrainingProvider(Dataset):
         x_centers = np.random.uniform(0, self.img_size, n_stars)
         y_centers = np.random.uniform(0, self.img_size, n_stars)
 
+        # -----------------------------------------------------------------
+        # NEW: Assign a random PSF index from the elliptical library
+        # -----------------------------------------------------------------
+        psf_indices = np.random.randint(0, self.n_library_psfs, size=n_stars)
+
         # Rendering
         star_signal = np.zeros((self.img_size, self.img_size), dtype=np.float32)
         monster_cutoff = min(100, int(n_stars * 0.0005))
         cx, cy, cf = x_centers[monster_cutoff:], y_centers[monster_cutoff:], fluxes[monster_cutoff:]
+        c_psf = psf_indices[monster_cutoff:]
         x0, y0 = np.floor(cx).astype(int), np.floor(cy).astype(int)
         phase_x = np.clip(np.floor((cx - x0) * self.n_sub).astype(int), 0, self.n_sub - 1)
         phase_y = np.clip(np.floor((cy - y0) * self.n_sub).astype(int), 0, self.n_sub - 1)
@@ -188,6 +191,8 @@ class GaussianPretrainingProvider(Dataset):
             for j in range(self.n_sub):
                 mask = (phase_x == i) & (phase_y == j)
                 if mask.any():
+                    # For on-the-fly rendering, we use a single kernel from the bank for speed
+                    # but we track the 'intended' PSF index in the target catalog
                     phase_map, _, _ = np.histogram2d(
                         y0[mask], x0[mask], 
                         bins=self.img_size, 
@@ -197,14 +202,15 @@ class GaussianPretrainingProvider(Dataset):
                     star_signal += fftconvolve(phase_map, self.kernel_bank[(i, j)], mode='same').astype(np.float32)
 
         for i in range(monster_cutoff):
-            fx, fy, f = x_centers[i], y_centers[i], fluxes[i]
-            half = 15
+            fx, fy, f, p_idx = x_centers[i], y_centers[i], fluxes[i], psf_indices[i]
+            half = self.render_kernel_size // 2
             ix, iy = int(fx), int(fy)
             y0_m, y1_m = max(0, iy-half), min(self.img_size, iy+half+1)
             x0_m, x1_m = max(0, ix-half), min(self.img_size, ix+half+1)
-            yy, xx = np.meshgrid(np.arange(y0_m, y1_m), np.arange(x0_m, x1_m), indexing='ij')
-            stamp = np.exp(-((xx - fx)**2 + (yy - fy)**2) / (2 * self.sigma_fixed**2))
-            stamp *= (f / (2 * np.pi * self.sigma_fixed**2))
+            sy0, sy1 = half - (iy - y0_m), half + (y1_m - iy)
+            sx0, sx1 = half - (ix - x0_m), half + (x1_m - ix)
+            
+            stamp = self.large_psf_library[p_idx][sy0:sy1, sx0:sx1] * f
             star_signal[y0_m:y1_m, x0_m:x1_m] += stamp
 
         total_photon_flux = star_signal + sky_level
