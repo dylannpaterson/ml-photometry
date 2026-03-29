@@ -53,8 +53,9 @@ def create_hdf5_dataset(data_dir, output_path, total_samples=50000, img_size=256
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     with h5py.File(output_path, 'w') as h5f:
-        images_ds = h5f.create_dataset("images", (total_samples, 1, img_size, img_size), dtype='float32', chunks=(1, 1, img_size, img_size))
-        targets_ds = h5f.create_dataset("targets", (total_samples, *target_shape), dtype='float32', chunks=(1, *target_shape))
+        # Enable LZF compression for massive target and image tensors
+        images_ds = h5f.create_dataset("images", (total_samples, 1, img_size, img_size), dtype='float32', chunks=(1, 1, img_size, img_size), compression="lzf")
+        targets_ds = h5f.create_dataset("targets", (total_samples, *target_shape), dtype='float32', chunks=(1, *target_shape), compression="lzf")
         
         psf_ds = None
         medians_ds = h5f.create_dataset("chunk_medians", (total_samples,), dtype='float32')
@@ -81,7 +82,8 @@ def create_hdf5_dataset(data_dir, output_path, total_samples=50000, img_size=256
                     "psf_libraries", 
                     (total_samples, *psf_library_shape),
                     dtype='float32',
-                    chunks=(1, *psf_library_shape)
+                    chunks=(1, *psf_library_shape),
+                    compression="lzf"
                 )
                 print(f"Allocated PSF library dataset with shape: {psf_ds.shape}")
                 
