@@ -23,7 +23,6 @@ class ThresholdAnalyzer:
         all_true_catalogues = []
         all_raw_predictions = []
         
-        # Track raw p-scores for object vs background slots
         obj_p_scores = []
         bg_p_scores = []
         
@@ -34,19 +33,16 @@ class ThresholdAnalyzer:
         for _ in range(num_chunks):
             sparse_sample = self.dataset.generate_chunk()
             image_tensor = sparse_sample["image"]
+            # target_grid shape is (grid_size, grid_size, K, -1)
             target_grid = sparse_sample["base_grid"].numpy()
 
-            # --- Apply Live Noise and Stretch (Match Training) ---
+            # --- Apply Live Noise and Stretch ---
             img_pos = torch.clamp(image_tensor, min=0.0)
             img_noisy = torch.poisson(img_pos)
-            img_noisy += torch.randn_like(img_noisy) * 5.0  # Read noise
+            img_noisy += torch.randn_like(img_noisy) * 5.0 
             
-            # Calculate the median of the NOISY image
             noisy_median = img_noisy.median().item()
-            
-            # Apply the Arcsinh stretch (Network Space)
             img_stretched = torch.arcsinh((img_noisy - noisy_median) / self.stretch_scale)
-            # -----------------------------------------------------
 
             with torch.no_grad():
                 input_tensor = img_stretched.to(self.device)
@@ -56,18 +52,16 @@ class ThresholdAnalyzer:
                 prediction_dict = self.model(input_tensor)
                 prediction = prediction_dict["stars"].squeeze(0).cpu().numpy()
             
-            # Extract true stars from grid and categorize p-scores
             true_stars = []
             for y in range(grid_size):
                 for x in range(grid_size):
                     for k in range(K):
                         p_pred = prediction[y, x, k, 0]
                         slot = target_grid[y, x, k]
-                        tp, tdx, tdy, raw_flux_target, tc = slot
+                        tp, tdx, tdy, raw_flux_target, tc = slot[:5]
                         if tp == 1.0:
                             tgx = (x * cell_size) + tdx
                             tgy = (y * cell_size) + tdy
-                            # NEW: target already contains raw physical photons
                             true_stars.append((tgx, tgy, float(raw_flux_target), tc))
                             obj_p_scores.append(p_pred)
                         else:
@@ -90,7 +84,6 @@ class ThresholdAnalyzer:
                             if p > thresh:
                                 gx = (x * cell_size) + dx
                                 gy = (y * cell_size) + dy
-                                # NEW: model output is already raw physical photons
                                 pred_stars.append((gx, gy, float(physical_flux_pred), c, p))
                 
                 matches, unmatched_true, unmatched_pred = match_stars(true_catalogue, pred_stars)
@@ -119,10 +112,9 @@ class ThresholdAnalyzer:
         print(f"{'Median':<15} | {np.median(obj_p):<15.4f} | {np.median(bg_p):<15.4f}")
         print(f"{'90th Percentile':<15} | {np.percentile(obj_p, 90):<15.4f} | {np.percentile(bg_p, 90):<15.4f}")
         
-        # Calculate how many stars would be detected at different thresholds
         print("\n--- Potential Star Recall (by Threshold) ---")
         for t in [0.01, 0.05, 0.1, 0.2, 0.5]:
-            recall_at_t = np.sum(obj_p > t) / len(obj_p)
+            recall_at_t = np.sum(obj_p > t) / len(obj_p) if len(obj_p) > 0 else 0
             fp_at_t = np.sum(bg_p > t)
             print(f"Thresh {t:.2f}: Recall={recall_at_t:.4f}, Est. FPs per chunk={fp_at_t/20.0:.1f}")
         print("-" * 50)

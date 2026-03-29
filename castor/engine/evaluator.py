@@ -3,7 +3,7 @@ import numpy as np
 import os
 from scipy.spatial import cKDTree
 from castor.data.transforms import AstroSpaceTransform
-from castor.constants import MAX_CAPACITY_PER_CELL, GLOBAL_STRETCH_SCALE
+from castor.constants import MAX_CAPACITY_PER_CELL, GLOBAL_STRETCH_SCALE, N_PCA_COMPONENTS
 
 def match_stars(true_stars, pred_stars, distance_threshold=2.0, flux_threshold_dex=0.5):
     """
@@ -60,7 +60,7 @@ def match_stars(true_stars, pred_stars, distance_threshold=2.0, flux_threshold_d
                 min_cost = cost
                 best_p_idx = p_idx
         
-        if best_p_idx != -1:
+    if best_p_idx != -1:
             matches.append((t_idx, best_p_idx, min_cost))
             matched_true.add(t_idx)
             matched_pred.add(best_p_idx)
@@ -131,13 +131,13 @@ class Evaluator:
                     prediction_dict = self.model(input_tensor)
                     prediction = prediction_dict["stars"].squeeze(0).cpu().numpy()
                 
-                # Extract True Stars (Filter by completeness for honest recall)
+                # Extract True Stars
                 true_stars = []
                 grid_h, grid_w = target_grid.shape[:2]
                 K = self.K
                 
-                # Target in HDF5 is (grid_size, grid_size, K*6 + 1)
-                target_reshaped = target_grid[..., :-1].view(grid_h, grid_w, K, 6).numpy()
+                # Target in HDF5 is (grid_size, grid_size, K * (5 + N_PCA) + 1)
+                target_reshaped = target_grid[..., :-1].view(grid_h, grid_w, K, -1).numpy()
                 
                 cell_size = dataset.cell_size
                 for y in range(grid_h):
@@ -147,7 +147,6 @@ class Evaluator:
                             tp, tdx, tdy, raw_flux_target, tc = slot[:5]
                             if tp == 1.0:
                                 star_info = ((x * cell_size) + tdx, (y * cell_size) + tdy, float(raw_flux_target), tc)
-                                # NEW: Only expect the model to find "detectable" stars (c > 0.5)
                                 if tc > 0.5:
                                     true_stars.append(star_info)
                 
@@ -160,14 +159,12 @@ class Evaluator:
                             if p > threshold:
                                 pred_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, float(physical_flux_pred), c, p))
                 
-                # Match using Bright-to-Faint Hybrid strategy
                 matches, unmatched_true, unmatched_pred = match_stars(true_stars, pred_stars, distance_threshold=2.0)
                 
                 all_tp += len(matches)
                 all_fp += len(unmatched_pred)
                 all_fn += len(unmatched_true)
 
-                # Analyze completeness of matched vs missed
                 matched_true_indices = [m[0] for m in matches]
                 for j, star in enumerate(true_stars):
                     comp = star[3]
@@ -176,7 +173,6 @@ class Evaluator:
                     else:
                         missed_completeness.append(comp)
 
-                    # Bin recall by completeness
                     for b in range(len(comp_bins)-1):
                         if comp_bins[b] <= comp <= comp_bins[b+1]:
                             comp_total[b] += 1
@@ -185,7 +181,6 @@ class Evaluator:
                             break
 
                 for t_idx, p_idx, cost in matches:
-                    # For distance RMSE we need to re-calculate distance
                     dist = np.sqrt(np.sum((np.array(true_stars[t_idx][:2]) - np.array(pred_stars[p_idx][:2]))**2))
                     pos_errors.append(dist)
                     

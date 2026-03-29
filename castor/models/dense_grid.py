@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 import numpy as np
-from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE
+from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE, N_PCA_COMPONENTS
 
 class CoordConv(nn.Module):
     """Adds normalized (x, y) coordinate channels to the input."""
@@ -67,7 +67,8 @@ class DenseGridModel(nn.Module):
     def __init__(self, K=MAX_CAPACITY_PER_CELL, shape_size=SHAPE_SIZE, cell_size=DEFAULT_CELL_SIZE):
         super(DenseGridModel, self).__init__()
         self.K = K
-        self.S2 = shape_size * shape_size
+        # CHANGED: Now predict PCA weights instead of independent pixels
+        self.S2 = N_PCA_COMPONENTS 
         self.cell_size = float(cell_size)
         self.num_output_channels = self.K * (5 + self.S2) + 1
 
@@ -143,14 +144,15 @@ class DenseGridModel(nn.Module):
         flux = torch.exp(raw_log_flux)
         
         c = torch.sigmoid(star_out[..., 4:5])
-        shape_logits = star_out[..., 5:]
-        shape = F.softmax(shape_logits, dim=-1)
+        
+        # CHANGED: Shape weights are linear (Eigen-PSF weights)
+        shape_weights = star_out[..., 5:]
         
         # Background residuals can be negative
         bg = bg_out.permute(0, 2, 3, 1)
         
         return {
-            "stars": torch.cat([p, dx, dy, flux, c, shape], dim=-1),
+            "stars": torch.cat([p, dx, dy, flux, c, shape_weights], dim=-1),
             "p_logits": p_logits, # NEW: Pass raw logits to the loss function
             "raw_log_flux": raw_log_flux, # Logit Bypass
             "background": bg
@@ -158,22 +160,21 @@ class DenseGridModel(nn.Module):
 
 def compute_grid_loss(preds, targets, psf_library=None, lambda_prob=5.0, lambda_pos=50.0, lambda_flux=5.0, lambda_comp=1.0, lambda_shape=1.0, lambda_bg=0.1, focal_alpha=0.75, focal_gamma=2.0, stretch_scale=GLOBAL_STRETCH_SCALE):
     """
-    Standard Generative Loss without TV regularization (optimized for speed).
-    Maintains positional weighting and faint-star boost.
-    Supports flattened target tensors and independent flux/completeness weights.
+    Eigen-PSF Loss: Reconstructs high-fidelity 31x31 shapes from predicted weights
+    and calculates MSE in pixel space for maximum photometry accuracy.
     """
     star_preds = preds["stars"]
     bg_preds = preds["background"]
     
-    # 1. Unpack Flattened Target
-    # Shape: [B, H, W, (K * 6) + 1]
+    # 1. Unpack Target Grid
+    # C_target = K * (5 + N_PCA) + 1
     B, H, W, C_target = targets.shape
     bg_targets = targets[..., -1:]
     star_targets_flat = targets[..., :-1]
     
-    # Infer K: C_target = K * 6 + 1
-    K = (C_target - 1) // 6
-    star_targets = star_targets_flat.view(B, H, W, K, 6)
+    K = MAX_CAPACITY_PER_CELL
+    # Each star has 5 base params (p, dx, dy, flux, c) + N_PCA weights
+    star_targets = star_targets_flat.view(B, H, W, K, -1)
     
     obj_mask = star_targets[..., 0] == 1.0
     
@@ -182,21 +183,15 @@ def compute_grid_loss(preds, targets, psf_library=None, lambda_prob=5.0, lambda_
     p_pred_logits = preds["p_logits"].squeeze(-1) # Get the raw logits
     p_target = star_targets[..., 0]
     
-    # THE FIX: Stable base loss using logits
     bce_loss = F.binary_cross_entropy_with_logits(p_pred_logits, p_target, reduction='none')
     
-    # THE FIX: Calculate focal weights using PROBABILITIES to prevent explosion
     p_t = p_pred_probs * p_target + (1 - p_pred_probs) * (1 - p_target)
     focal_weight = (1 - p_t) ** focal_gamma
     alpha_t = focal_alpha * p_target + (1 - focal_alpha) * (1 - p_target)
     
     with torch.no_grad():
         raw_flux_target = star_targets[..., 3]
-        
-        # Recreate the stretch locally just to calculate the curriculum boost weight
         stretched_target = torch.arcsinh(raw_flux_target / stretch_scale)
-        
-        # Boost based on the stretched value, keeping your original logic intact
         boost_weight = torch.where(obj_mask, 1.0 + (12.0 - stretched_target) / 6.0, torch.tensor(1.0, device=p_pred_probs.device))
         boost_weight = torch.clamp(boost_weight, 1.0, 5.0)
     
@@ -208,9 +203,7 @@ def compute_grid_loss(preds, targets, psf_library=None, lambda_prob=5.0, lambda_
         pos_target = star_targets[..., 1:3][obj_mask]
         pos_loss = F.mse_loss(pos_pred, pos_target, reduction='mean')
         
-        # LOGIT BYPASS: Use pre-activation log-flux directly for stability
         log_flux_pred = preds["raw_log_flux"][obj_mask]
-        
         flux_target = star_targets[..., 3:4][obj_mask]
         log_flux_target = torch.log(flux_target + 1e-6)
         flux_loss = F.mse_loss(log_flux_pred, log_flux_target, reduction='mean')
@@ -219,29 +212,44 @@ def compute_grid_loss(preds, targets, psf_library=None, lambda_prob=5.0, lambda_
         comp_target = star_targets[..., 4:5][obj_mask]
         comp_loss = F.mse_loss(comp_pred, comp_target, reduction='mean')
         
-        # SHAPE LOSS (GPU Mapping)
-        shape_pred = star_preds[..., 5:][obj_mask]
+        # --- EIGEN-PSF RECONSTRUCTION LOSS ---
+        # shape_weights shape: [N_obj, N_PCA]
+        weights_pred = star_preds[..., 5:][obj_mask]
+        weights_target = star_targets[..., 5:][obj_mask]
         
         if psf_library is not None:
-            # Get the batch index for every valid object 
-            # (Needed because psf_library shape is [Batch, N_unique, 81])
-            b_idx = torch.where(obj_mask)[0]
+            # psf_library shape: [Batch, N_PCA + 1, 961]
+            # [:, :N_PCA, :] are components, [:, -1, :] is the mean PSF
+            psf_basis = psf_library[0, :-1, :] # [N_PCA, 961]
+            mean_psf = psf_library[0, -1, :]    # [961]
             
-            # Extract the integer PSF index for every valid star
-            psf_indices = star_targets[..., 5][obj_mask].long()
+            # Reconstruct: weights @ basis + mean
+            shape_pred = (weights_pred @ psf_basis) + mean_psf
+            shape_target = (weights_target @ psf_basis) + mean_psf
             
-            # Construct the 81-float targets instantly on the GPU
-            shape_target = psf_library[b_idx, psf_indices]
+            # MSE in pixel space ensures photometric consistency
+            shape_loss = F.mse_loss(shape_pred, shape_target, reduction='mean')
         else:
-            # Fallback if no library provided (assumes old format or fixed PSF)
-            shape_target = star_preds[..., 5:][obj_mask].clone() # Dummy
-            
-        shape_loss = F.mse_loss(shape_pred, shape_target, reduction='mean')
+            # Fallback to direct weight MSE if basis is missing
+            shape_loss = F.mse_loss(weights_pred, weights_target, reduction='mean')
     else:
         pos_loss = torch.tensor(0.0, device=star_preds.device)
         flux_loss = torch.tensor(0.0, device=star_preds.device)
         comp_loss = torch.tensor(0.0, device=star_preds.device)
         shape_loss = torch.tensor(0.0, device=star_preds.device)
+        
+    # 4. Background Loss (Global MSE)
+    bg_loss = F.mse_loss(bg_preds, bg_targets, reduction='mean')
+        
+    total_loss = (lambda_prob * prob_loss + 
+                  lambda_pos * pos_loss + 
+                  lambda_flux * flux_loss +
+                  lambda_comp * comp_loss +
+                  lambda_shape * shape_loss + 
+                  lambda_bg * bg_loss)
+                  
+    return total_loss, prob_loss, pos_loss, flux_loss, shape_loss, bg_loss
+
         
     # 4. Background Loss (Global MSE)
     bg_loss = F.mse_loss(bg_preds, bg_targets, reduction='mean')

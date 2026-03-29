@@ -56,7 +56,7 @@ data_params:
   
   # Model-dependent constants (Aligned with castor.constants)
   max_capacity_per_cell: 3
-  shape_size: 9
+  shape_size: 31
   GLOBAL_STRETCH_SCALE: 10.0
   
   # Rendering & PSF Generation

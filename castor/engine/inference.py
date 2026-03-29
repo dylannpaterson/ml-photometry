@@ -6,7 +6,7 @@ import os
 from scipy.ndimage import zoom
 from astropy.io import fits
 from castor.data.transforms import AstroSpaceTransform
-from castor.constants import GLOBAL_STRETCH_SCALE
+from castor.constants import GLOBAL_STRETCH_SCALE, N_PCA_COMPONENTS
 
 def upsample_background(bg_map, target_size):
     """
@@ -37,15 +37,13 @@ class InferenceEngine:
         self.stretch_scale = config["data_params"].get("GLOBAL_STRETCH_SCALE", GLOBAL_STRETCH_SCALE)
         self.transform = AstroSpaceTransform(stretch_scale=self.stretch_scale)
 
-    def predict(self, image_tensor, threshold=0.5):
+    def predict(self, image_tensor, threshold=0.5, psf_basis=None, mean_psf=None):
         """Runs inference on a single 2D image tensor [1, H, W]."""
         self.model.eval()
         with torch.no_grad():
             input_tensor = image_tensor.unsqueeze(0).to(self.device)
             prediction_dict = self.model(input_tensor)
             
-            # Note: Model now outputs activated probabilities in "stars" 
-            # and raw logits in "p_logits" for loss stability.
             prediction = prediction_dict["stars"].squeeze(0).cpu().numpy()
             bg_map = prediction_dict["background"].squeeze(0).cpu().numpy()
             
@@ -53,16 +51,27 @@ class InferenceEngine:
         grid_h, grid_w, K, _ = prediction.shape
         cell_size = self.img_size // grid_h
         
+        # Determine S from basis if available, else fallback
+        S = 31 if psf_basis is not None else 9 
+        
         for y in range(grid_h):
             for x in range(grid_w):
                 for k in range(K):
                     p, dx, dy, physical_flux, c = prediction[y, x, k, :5]
                     if p > threshold:
-                        # NEW: The model now outputs raw physical photons directly!
                         predicted_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, float(physical_flux), c, p))
-                        shape_vector = prediction[y, x, k, 5:]
-                        S = int(np.sqrt(len(shape_vector)))
-                        predicted_shapes.append(shape_vector.reshape(S, S))
+                        
+                        # Reconstruct PSF from PCA weights
+                        weights = prediction[y, x, k, 5:]
+                        if psf_basis is not None and mean_psf is not None:
+                            # weights: [20], basis: [20, 961], mean: [961]
+                            shape_flat = (weights @ psf_basis) + mean_psf
+                            predicted_shapes.append(shape_flat.reshape(S, S))
+                        else:
+                            # Fallback or raw weight visualization
+                            S_fallback = int(np.sqrt(len(weights)))
+                            predicted_shapes.append(weights.reshape(S_fallback, S_fallback))
+                            
         return predicted_stars, predicted_shapes, bg_map
 
     def visualize(self, image_tensor, true_catalogue, predicted_stars, predicted_shapes, bg_map, gt_bg_map, threshold, chunk_median=0.0, output_path="inference_comparison.png"):
@@ -82,7 +91,8 @@ class InferenceEngine:
             half = S // 2
             y0, y1 = max(0, iy - half), min(H, iy + half + 1)
             x0, x1 = max(0, ix - half), min(W, ix + half + 1)
-            sy0, sy1, sx0, sx1 = half - (iy - y0), half + (y1 - iy), half - (ix - x0), half + (x1 - ix)
+            sy0, sy1 = half - (iy - y0), half + (y1 - iy)
+            sx0, sx1 = half - (ix - x0), half + (x1 - ix)
             reconstruction_stars_linear[y0:y1, x0:x1] += flux * shape[sy0:sy1, sx0:sx1]
 
         # 2. Linear Reconstruction (Residual Space)
@@ -93,7 +103,6 @@ class InferenceEngine:
         img_linear_abs = self.transform.network_to_image(img_stretched, chunk_median)
         full_reconstruction_linear_abs = full_reconstruction_linear + chunk_median
         
-        # NEW: Linear Residual
         residual_linear = img_linear_abs - full_reconstruction_linear_abs
         
         full_bg_abs = full_residual_bg_linear + chunk_median
@@ -115,13 +124,11 @@ class InferenceEngine:
         # Statistics & Matching for Visualization
         matches, unmatched_true, unmatched_pred = match_stars(true_catalogue, predicted_stars, distance_threshold=2.0)
         
-        # Pairs for scatter plot
         matched_true_mags, matched_pred_mags = [], []
         for t_idx, p_idx, _ in matches:
             matched_true_mags.append(np.log10(true_catalogue[t_idx][2] + 1e-9))
             matched_pred_mags.append(np.log10(predicted_stars[p_idx][2] + 1e-9))
 
-        # Full populations for histograms
         all_true_mags = [np.log10(s[2] + 1e-9) for s in true_catalogue]
         all_pred_mags = [np.log10(s[2] + 1e-9) for s in predicted_stars]
 
@@ -132,15 +139,12 @@ class InferenceEngine:
         def add_colorbar(im, ax):
             divider = make_axes_locatable(ax)
             cax = divider.append_axes("right", size="5%", pad=0.05)
-            # Ensure im has finite limits for colorbar
             fig.colorbar(im, cax=cax)
 
         def sanitize_for_plot(data, fill_val=0.0):
             d = data.copy()
-            # Replace Inf/NaN with fill_val
             mask = ~np.isfinite(d)
             d[mask] = fill_val
-            # Clip to extreme but finite values to prevent any Matplotlib internal overflows
             return np.clip(d, -1e15, 1e15)
 
         # Row 1-2: Primary Linear Comparisons
@@ -161,7 +165,6 @@ class InferenceEngine:
         im2 = ax2.imshow(full_reconstruction_linear_abs, cmap='inferno', origin='lower', norm=norm, aspect='equal')
         ax2.set_title("Model (Matched Sources = Lime)")
         
-        # Overlay Match Results
         matched_true_indices = [m[0] for m in matches]
         for i, s in enumerate(true_catalogue):
             if i in matched_true_indices:
@@ -172,13 +175,11 @@ class InferenceEngine:
         add_colorbar(im2, ax2)
         
         ax3 = fig.add_subplot(gs[0:2, 2], sharex=ax1, sharey=ax1)
-        # Linear residual typically has wide range, center on 0 with robust limits
         r_limit = np.percentile(np.abs(residual_linear), 99)
         if r_limit <= 0 or not np.isfinite(r_limit): r_limit = 1.0
         im3 = ax3.imshow(residual_linear, cmap='bwr', origin='lower', vmin=-r_limit, vmax=r_limit, aspect='equal')
         ax3.set_title("Linear Residual (Missed = Black)")
         
-        # Overlay Missed Sources on Residual
         for i, s in enumerate(true_catalogue):
             if i not in matched_true_indices:
                 ax3.plot(s[0], s[1], 'k+', markersize=10, alpha=0.8)
@@ -218,7 +219,6 @@ class InferenceEngine:
                 ax8.grid(True, alpha=0.3)
 
         if all_true_mags:
-            # NEW: Flux Distribution Histogram (ALL stars)
             ax_hist = fig.add_subplot(gs[3, 1])
             true_m_clean = [m for m in all_true_mags if np.isfinite(m)]
             pred_m_clean = [m for m in all_pred_mags if np.isfinite(m)]
@@ -239,13 +239,11 @@ class InferenceEngine:
                 ax_hist.legend()
                 ax_hist.grid(True, alpha=0.2)
 
-        # Completeness (SNR Proxy) Histogram for Missed Stars
         ax9 = fig.add_subplot(gs[4, 1])
         missed_comps = [true_catalogue[i][3] for i in range(len(true_catalogue)) if i not in matched_true_indices]
         matched_comps = [true_catalogue[i][3] for i in matched_true_indices]
         
         if missed_comps or matched_comps:
-            # Filter non-finite comps just in case
             mc_clean = [c for c in matched_comps if np.isfinite(c)]
             misc_clean = [c for c in missed_comps if np.isfinite(c)]
             if mc_clean or misc_clean:

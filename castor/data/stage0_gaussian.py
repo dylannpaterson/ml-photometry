@@ -9,7 +9,7 @@ from scipy.ndimage import gaussian_filter, map_coordinates
 from scipy.signal import fftconvolve
 from scipy.interpolate import UnivariateSpline
 from castor.data.transforms import AstroSpaceTransform
-from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE
+from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE, N_PCA_COMPONENTS
 from numba import njit
 import gc
 
@@ -19,9 +19,10 @@ except ImportError:
     galsim = None
 
 @njit(boundscheck=False)
-def fast_paint_grid(lx, ly, fluxes, snrs, comps, psf_indices, sort_idx, min_snr, grid_size, cell_size, K):
-    # Size is now exactly 6 (p, dx, dy, flux, comp, psf_index)
-    grid_stars = np.zeros((grid_size, grid_size, K, 6), dtype=np.float32)
+def fast_paint_grid(lx, ly, fluxes, snrs, comps, psf_weights, sort_idx, min_snr, grid_size, cell_size, K):
+    # Size is now exactly 5 + N_PCA (Existence, dx, dy, flux, comp, weights...)
+    N_PCA = psf_weights.shape[1]
+    grid_stars = np.zeros((grid_size, grid_size, K, 5 + N_PCA), dtype=np.float32)
     counts = np.zeros((grid_size, grid_size), dtype=np.int32)
     
     for idx in range(len(sort_idx)):
@@ -37,13 +38,14 @@ def fast_paint_grid(lx, ly, fluxes, snrs, comps, psf_indices, sort_idx, min_snr,
         if 0 <= cx < grid_size and 0 <= cy < grid_size:
             slot = counts[cy, cx]
             if slot < K:
-                # Slot 0 is strict existence (1.0), Slot 4 is continuous recoverability
                 grid_stars[cy, cx, slot, 0] = 1.0
                 grid_stars[cy, cx, slot, 1] = lx[i] % cell_size
                 grid_stars[cy, cx, slot, 2] = ly[i] % cell_size
                 grid_stars[cy, cx, slot, 3] = fluxes[i]
                 grid_stars[cy, cx, slot, 4] = comps[i]
-                grid_stars[cy, cx, slot, 5] = psf_indices[i] # STORE INDEX
+                # Store PCA weights directly in the target
+                for w_idx in range(N_PCA):
+                    grid_stars[cy, cx, slot, 5 + w_idx] = psf_weights[i, w_idx]
                 counts[cy, cx] += 1
                 
     return grid_stars
@@ -83,7 +85,7 @@ class GaussianPretrainingProvider(Dataset):
         self.max_stars = max_stars
         self.img_size = image_size
         self.K = max_capacity_per_cell
-        self.S = shape_size
+        self.S = shape_size # Now 31 (PCA Basis Resolution)
         self.read_noise = 5.0
         self.use_fixed_seed = use_fixed_seed
         self.min_snr = min_snr
@@ -93,13 +95,21 @@ class GaussianPretrainingProvider(Dataset):
         self.n_sub = 4
         self.render_kernel_size = 31 # Smooth tails (sigma=1.5)
         self.sigma_fixed = 1.5
+        self.n_pca = N_PCA_COMPONENTS
         
-        # Consistent Elliptical PSF Library (100 items)
-        self.n_library_psfs = 100
-        self.large_psf_library = self._generate_elliptical_library(self.n_library_psfs, self.render_kernel_size)
-        self.target_psf_library = self._crop_and_normalize_library(self.large_psf_library, self.S)
+        # 1. Generate the standard 100 mathematical Gaussians (31x31)
+        raw_library = self._generate_elliptical_library(100, self.render_kernel_size)
         
-        self.kernel_bank = self._precompute_kernel_bank()
+        # 2. Extract the 20 Eigen-PSFs and the weights for those 100 Gaussians
+        self.eigen_psfs, self.psf_weights_lib, self.mean_psf = self._compute_eigen_psfs(raw_library, n_components=self.n_pca)
+        
+        # 3. Final library for reconstruction: [N_PCA + 1, 961]
+        self.psf_library_tensor = torch.cat([
+            torch.from_numpy(self.eigen_psfs).view(self.n_pca, -1),
+            torch.from_numpy(self.mean_psf).view(1, -1)
+        ], dim=0)
+        
+        self.kernel_bank = self._precompute_kernel_bank(raw_library)
         self.n_pix = 4 * np.pi * (self.sigma_fixed ** 2)
         self.psf_peak = 1.0 / (2 * np.pi * self.sigma_fixed**2)
 
@@ -119,25 +129,24 @@ class GaussianPretrainingProvider(Dataset):
             library[i] = psf
         return library
 
-    def _crop_and_normalize_library(self, large_lib, target_size):
-        start = (large_lib.shape[1] - target_size) // 2
-        end = start + target_size
-        cropped = large_lib[:, start:end, start:end]
-        
-        # Do NOT re-normalize. Let the shape sum to the true encircled energy fraction (e.g. 0.88)
-        return cropped 
+    def _compute_eigen_psfs(self, large_library, n_components=20):
+        """Native PyTorch PCA to extract Eigen-PSFs and their weights."""
+        N, H, W = large_library.shape
+        data = torch.from_numpy(large_library).float().view(N, H * W)
+        mean_psf = data.mean(dim=0)
+        centered_data = data - mean_psf
+        U, S, V = torch.pca_lowrank(centered_data, q=n_components)
+        eigen_psfs = V.t().view(n_components, H, W).numpy()
+        psf_weights = (U * S).numpy() 
+        return eigen_psfs, psf_weights, mean_psf.view(H, W).numpy()
 
-    def _precompute_kernel_bank(self):
+    def _precompute_kernel_bank(self, raw_library):
         """Precomputes a bank of shifted kernels for high-speed rendering."""
-        # Note: We now use the first PSF in the library as the 'base' for the fast renderer
-        # or we could pick a random one, but for pre-training, sub-pixel phase is the priority.
-        base_psf = self.large_psf_library[0]
+        base_psf = raw_library[0]
         bank = {}
         for i in range(self.n_sub):
             for j in range(self.n_sub):
-                dx, dy = (i + 0.5) / self.n_sub - 0.5, (j + 0.5) / self.n_sub - 0.5
-                # Simple integer-pixel shift + bilinear for speed during on-the-fly pretraining
-                bank[(i, j)] = base_psf # For now, use the large smooth kernel
+                bank[(i, j)] = base_psf 
         return bank
 
     def __len__(self):
@@ -174,16 +183,16 @@ class GaussianPretrainingProvider(Dataset):
         x_centers = np.random.uniform(0, self.img_size, n_stars)
         y_centers = np.random.uniform(0, self.img_size, n_stars)
 
-        # -----------------------------------------------------------------
-        # NEW: Assign a random PSF index from the elliptical library
-        # -----------------------------------------------------------------
-        psf_indices = np.random.randint(0, self.n_library_psfs, size=n_stars)
+        # 1. Assign a random PSF index from the elliptical library
+        psf_indices = np.random.randint(0, 100, size=n_stars)
+        
+        # 2. Get the continuous PCA weights for these stars
+        psf_weights = self.psf_weights_lib[psf_indices] # [n_stars, N_PCA]
 
         # Rendering
         star_signal = np.zeros((self.img_size, self.img_size), dtype=np.float32)
         monster_cutoff = min(100, int(n_stars * 0.0005))
         cx, cy, cf = x_centers[monster_cutoff:], y_centers[monster_cutoff:], fluxes[monster_cutoff:]
-        c_psf = psf_indices[monster_cutoff:]
         x0, y0 = np.floor(cx).astype(int), np.floor(cy).astype(int)
         phase_x = np.clip(np.floor((cx - x0) * self.n_sub).astype(int), 0, self.n_sub - 1)
         phase_y = np.clip(np.floor((cy - y0) * self.n_sub).astype(int), 0, self.n_sub - 1)
@@ -192,8 +201,6 @@ class GaussianPretrainingProvider(Dataset):
             for j in range(self.n_sub):
                 mask = (phase_x == i) & (phase_y == j)
                 if mask.any():
-                    # For on-the-fly rendering, we use a single kernel from the bank for speed
-                    # but we track the 'intended' PSF index in the target catalog
                     phase_map, _, _ = np.histogram2d(
                         y0[mask], x0[mask], 
                         bins=self.img_size, 
@@ -211,70 +218,42 @@ class GaussianPretrainingProvider(Dataset):
             sy0, sy1 = half - (iy - y0_m), half + (y1_m - iy)
             sx0, sx1 = half - (ix - x0_m), half + (x1_m - ix)
             
-            stamp = self.large_psf_library[p_idx][sy0:sy1, sx0:sx1] * f
+            # Reconstructing high-res PSF for monster rendering
+            psf_reconstructed = (self.eigen_psfs.reshape(self.n_pca, -1).T @ self.psf_weights_lib[p_idx]).reshape(self.render_kernel_size, self.render_kernel_size) + self.mean_psf
+            stamp = psf_reconstructed[sy0:sy1, sx0:sx1] * f
             star_signal[y0_m:y1_m, x0_m:x1_m] += stamp
 
         total_photon_flux = star_signal + sky_level
-        
-        # OFF-LOADED TO GPU: We just return the clean signal for the trainer to add noise
-        # Optimization: np.median(A + c) == np.median(A) + c
         chunk_median = np.median(star_signal) + sky_level
-        normalized_image = self.transform.image_to_network(total_photon_flux, chunk_median) # We will redo this in the trainer
 
         # --- Sub-Pixel Accurate Local Confusion SNR ---
-        # Sample total light using bilinear interpolation at EXACT centers
         total_local_light = map_coordinates(star_signal, [y_centers, x_centers], order=1, mode='nearest')
         local_background = np.maximum(0, total_local_light - (fluxes * self.psf_peak))
         noise_variance = fluxes + self.n_pix * (sky_level + local_background + self.read_noise**2)
         snrs = fluxes / np.sqrt(noise_variance)
 
-        # --- NEW: Probabilistic Completeness (Per-Chunk Empirical) ---
+        # --- Probabilistic Completeness ---
         survived = snrs >= self.min_snr
-        
-        # EDGE CASE 1: Not enough stars in this crop to fit a curve, or identical mags
         if len(mags) < 10 or mags.min() >= mags.max() - 1e-3:
             comps = survived.astype(np.float32)
         else:
             m_min, m_max = mags.min(), mags.max()
             bins = np.linspace(m_min, m_max, 25)
-            
             counts_total, _ = np.histogram(mags, bins=bins)
             counts_survived, _ = np.histogram(mags[survived], bins=bins)
-            
-            # EDGE CASE 2: Mask out empty bins so they don't drag the spline to 0.0
             valid = counts_total > 0
-            
             if valid.sum() < 4:
-                # Still not enough valid populated bins to interpolate reliably
                 comps = survived.astype(np.float32)
             else:
                 bin_comp = counts_survived[valid] / (counts_total[valid] + 1e-9)
                 bin_centers = ((bins[:-1] + bins[1:]) / 2)[valid]
                 comps = np.interp(mags, bin_centers, bin_comp, left=1.0, right=0.0).astype(np.float32)
 
-        # Target Construction (Numba Optimized)
-        half = self.S // 2
-        grid_range = np.arange(-half, half + 1)
-        sy, sx = np.meshgrid(grid_range, grid_range, indexing='ij')
-        psf_flat = np.exp(-(sx**2 + sy**2) / (2 * self.sigma_fixed**2))
-        psf_flat = (psf_flat / psf_flat.sum()).astype(np.float32).flatten()
-        
-        # NEW: Create a 1-item library and an array of 0s for the indices
-        psf_library = psf_flat.reshape(1, -1)
-        psf_indices = np.zeros(n_stars, dtype=np.int32)
-        
+        # Target Construction (Numba Optimized PCA weights)
         base_grid = fast_paint_grid(
-            x_centers, y_centers, fluxes, snrs, comps, psf_indices, sort_idx, 
+            x_centers, y_centers, fluxes, snrs, comps, psf_weights, sort_idx, 
             self.min_snr, self.grid_size, self.cell_size, self.K
         )
-
-        # Catalog for metadata/metrics (kept for debugging, but optimized)
-        catalog_stars = pd.DataFrame({
-            'x': x_centers[survived], 'y': y_centers[survived], 
-            'flux': fluxes[survived], 'mag': mags[survived], 
-            'snr': snrs[survived], 'comp': comps[survived],
-            'exp_time': exp_time, 'zp': zp, 'sky_mag': sky_mag
-        })
 
         bg_target = self.transform.target_bg_to_network(sky_level - chunk_median)
         bg_grid = np.full((self.grid_size, self.grid_size, 1), bg_target, dtype=np.float32)
@@ -282,18 +261,10 @@ class GaussianPretrainingProvider(Dataset):
                             torch.from_numpy(bg_grid)], dim=-1)
 
         return {
-            "image": torch.from_numpy(total_photon_flux).unsqueeze(0), # Send raw physics to GPU 
-            "raw_image": torch.from_numpy(total_photon_flux), 
-            "physics_image": torch.from_numpy(star_signal), 
+            "image": torch.from_numpy(total_photon_flux).unsqueeze(0), 
             "target": target, 
             "chunk_median": float(chunk_median), 
-            "catalog": catalog_stars,
-            "full_mags": mags,
-            "full_snrs": snrs,
-            "full_comps": comps,
-            "base_grid": torch.from_numpy(base_grid),
-            "background_map": torch.from_numpy(bg_grid),
-            "psf_library": torch.from_numpy(psf_library)
+            "psf_library": self.psf_library_tensor.unsqueeze(0) # [1, N_PCA + 1, 961]
         }
 
 class GaussianMosaicDataset(Dataset):
@@ -301,22 +272,12 @@ class GaussianMosaicDataset(Dataset):
         self.data_dir, self.num_samples, self.img_size, self.cell_size = data_dir, num_samples, image_size, cell_size
         self.grid_size = image_size // cell_size
         self.transform = AstroSpaceTransform(stretch_scale=global_stretch_scale)
-        self.K, self.S = MAX_CAPACITY_PER_CELL, SHAPE_SIZE
-        self.sigma_fixed = 1.5
-        self.n_pix = 4 * np.pi * (self.sigma_fixed ** 2)
-        self.psf_peak = 1.0 / (2 * np.pi * self.sigma_fixed**2)
+        self.K = MAX_CAPACITY_PER_CELL
+        self.N_PCA = N_PCA_COMPONENTS
         self.min_snr = 5.0
         
-        # Pre-allocate target shape info
-        self.target_shape = (self.grid_size, self.grid_size, self.K * 6 + 1)
-        
-        # Tracking for Worker-Pinned RAM Cache
-        self.active_mosaic_idx = -1
-        self.active_img = None
-        self.active_cat = None
-        self.active_snrs = None
-        self.active_comps = None
-        self.active_library = None
+        # Pre-allocate target shape info: K * (5 + N_PCA) + 1
+        self.target_shape = (self.grid_size, self.grid_size, self.K * (5 + self.N_PCA) + 1)
         
         # Load mosaic manifests
         self.mosaics = []
@@ -340,26 +301,16 @@ class GaussianMosaicDataset(Dataset):
                 })
         
         if not self.mosaics:
-            print(f"⚠️ Warning: No optimized mosaics found in {data_dir}. Check generation script.")
             return
 
-        # 1. Force initial load in the main thread BEFORE workers fork
-        # Leverage Copy-On-Write inheritance for instant startup
         self.active_mosaic_idx = np.random.randint(0, len(self.mosaics))
         self._load_mosaic_to_ram(self.active_mosaic_idx)
-
         self.max_samples_per_mosaic = 384 
-        
-        # 2. NOW apply the stagger. Workers inherit this and perfectly desync.
         self.samples_from_current = np.random.randint(0, self.max_samples_per_mosaic)
 
     def _load_mosaic_to_ram(self, m_idx):
-        """Sequential block read into RAM with aggressive GC to prevent OOM spikes."""
-        # 1. Nuke old data and force reclaim
         self.active_img = None
         self.active_cat = None
-        self.active_snrs = None
-        self.active_comps = None
         self.active_library = None
         gc.collect()
         
@@ -368,26 +319,13 @@ class GaussianMosaicDataset(Dataset):
         self.active_cat = np.load(mosaic['cat_path']) 
         if mosaic['lib_path']:
             self.active_library = np.load(mosaic['lib_path'])
-        else:
-            # Fallback for old mosaics without a library
-            half = self.S // 2
-            grid_range = np.arange(-half, half + 1)
-            sy, sx = np.meshgrid(grid_range, grid_range, indexing='ij')
-            psf_flat = np.exp(-(sx**2 + sy**2) / (2 * 1.5**2))
-            psf_flat = (psf_flat / psf_flat.sum()).astype(np.float32).flatten()
-            self.active_library = psf_flat.reshape(1, -1)
-        
-        # --- USE PRE-CALCULATED Columns (Moved to generator script) ---
-        self.active_snrs = self.active_cat['snr']
-        self.active_comps = self.active_cat['comp']
-
+            
         self.active_mosaic_idx = m_idx
         self.samples_from_current = 0
 
     def __len__(self): return self.num_samples
 
     def __getitem__(self, idx):
-        # 1. Manage RAM Cache (Removed -1 check to respect COW inheritance and stagger)
         if self.samples_from_current >= self.max_samples_per_mosaic:
             new_idx = np.random.randint(0, len(self.mosaics))
             self._load_mosaic_to_ram(new_idx)
@@ -395,62 +333,42 @@ class GaussianMosaicDataset(Dataset):
         self.samples_from_current += 1
         mosaic = self.mosaics[self.active_mosaic_idx]
         
-        # 2. Slice from RAM
         my, mx = self.active_img.shape
         py = np.random.randint(0, my - self.img_size)
         px = np.random.randint(0, mx - self.img_size)
         star_signal_np = self.active_img[py:py+self.img_size, px:px+self.img_size]
         
-        # 3. Offload Noise to GPU - Return clean physics signal
         pixel_scale = 0.11
         sky_level = (10 ** (-0.4 * (mosaic['sky_mag'] - mosaic['zp']))) * (pixel_scale**2) * mosaic['exp_time']
         
-        # Optimized Tensor Instantiation
         signal_tensor = torch.from_numpy(star_signal_np).float()
         signal_tensor.add_(sky_level).clamp_(min=0.0).unsqueeze_(0)
-        
-        # We need chunk_median for target background normalization
-        # Estimate median directly from the clean signal to match what the noisy median will roughly be
-        # Optimization: np.median(A + c) == np.median(A) + c
         chunk_median = np.median(star_signal_np) + sky_level
         
-        # 4. Binary Search spatial filter in RAM
         y_start = np.searchsorted(self.active_cat['y'], py)
         y_end = np.searchsorted(self.active_cat['y'], py + self.img_size)
-        
         band_cat = self.active_cat[y_start:y_end]
-        band_snrs = self.active_snrs[y_start:y_end]
-        band_comps = self.active_comps[y_start:y_end]
-        
         mask_x = (band_cat['x'] >= px) & (band_cat['x'] < px + self.img_size)
         
-        # Pre-allocate full target buffer using np.empty + fill(0)
-        target_buffer = np.empty(self.target_shape, dtype=np.float32)
-        target_buffer.fill(0)
+        target_buffer = np.zeros(self.target_shape, dtype=np.float32)
         
         if mask_x.any():
             local_cat = band_cat[mask_x]
-            snrs = band_snrs[mask_x]
-            comps = band_comps[mask_x]
-            
             lx, ly = local_cat['x'] - px, local_cat['y'] - py
             fluxes = local_cat['flux']
+            snrs = local_cat['snr']
+            comps = local_cat['comp']
             
-            # Handle old catalogs vs new ones with 'psf_index'
-            if 'psf_index' in local_cat.dtype.names:
-                psf_indices = local_cat['psf_index']
-            else:
-                psf_indices = np.zeros(len(local_cat), dtype=np.int32)
+            # Continuous PCA weights must be in the catalog for this to work
+            psf_weights = np.column_stack([local_cat[f'w{i}'] for i in range(self.N_PCA)])
             
-            # 6. Grid Painting (Numba Optimized)
             sort_idx = np.argsort(fluxes)[::-1]
             grid_stars_np = fast_paint_grid(
-                lx, ly, fluxes, snrs, comps, psf_indices, sort_idx, 
+                lx, ly, fluxes, snrs, comps, psf_weights, sort_idx, 
                 self.min_snr, self.grid_size, self.cell_size, self.K
             )
             target_buffer[:, :, :-1] = grid_stars_np.reshape(self.grid_size, self.grid_size, -1)
         
-        # Add background slot
         bg_val = self.transform.target_bg_to_network(sky_level - chunk_median)
         target_buffer[:, :, -1] = bg_val
         
@@ -458,7 +376,7 @@ class GaussianMosaicDataset(Dataset):
             "image": signal_tensor, 
             "target": torch.from_numpy(target_buffer), 
             "chunk_median": float(chunk_median),
-            "psf_library": torch.from_numpy(self.active_library)
+            "psf_library": torch.from_numpy(self.active_library).unsqueeze(0)
         }
 
 class HDF5MosaicDataset(Dataset):
@@ -469,12 +387,10 @@ class HDF5MosaicDataset(Dataset):
         self.cell_size = DEFAULT_CELL_SIZE
         self.grid_size = self.img_size // self.cell_size
         self.K = MAX_CAPACITY_PER_CELL
-        self.S = SHAPE_SIZE
         
         if not os.path.exists(self.h5_path):
             raise FileNotFoundError(f"HDF5 file not found: {self.h5_path}")
 
-        # Open briefly just to get the length
         with h5py.File(self.h5_path, 'r') as f:
             self.length = len(f['images'])
 
@@ -482,11 +398,9 @@ class HDF5MosaicDataset(Dataset):
         return self.length
 
     def __getitem__(self, idx):
-        # Lazy-load the file per-worker to prevent multiprocessing crashes
         if self.file is None:
             self.file = h5py.File(self.h5_path, 'r')
             
-        # HDF5 handles fast disk-seeking automatically
         img = self.file['images'][idx]
         target = self.file['targets'][idx]
         psf = self.file['psf_libraries'][idx]
@@ -504,13 +418,8 @@ class HDF5MosaicDataset(Dataset):
         import random
         idx = random.randint(0, len(self) - 1)
         sample = self[idx]
-        
-        # ThresholdAnalyzer expects 'base_grid' for true stars
-        # and 'image' for the clean physics signal
         target = sample["target"]
-        # target shape is (grid_size, grid_size, K*6 + 1)
-        # base_grid should be (grid_size, grid_size, K, 6)
-        base_grid = target[:, :, :-1].view(self.grid_size, self.grid_size, self.K, 6)
+        base_grid = target[:, :, :-1].view(self.grid_size, self.grid_size, self.K, -1)
         
         return {
             "image": sample["image"],

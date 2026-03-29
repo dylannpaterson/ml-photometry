@@ -7,7 +7,7 @@ from castor.data.stage0_gaussian import GaussianPretrainingProvider, sample_bulg
 from castor.cloud.config_utils import load_config
 import shutil
 import time
-from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE
+from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, N_PCA_COMPONENTS
 from scipy.signal import fftconvolve
 
 # GPU/JAX Acceleration
@@ -66,6 +66,17 @@ def generate_elliptical_psf_library(num_psfs=100, grid_size=9, sigma=1.5):
         
     return library
 
+def _compute_eigen_psfs(large_library, n_components=20):
+    """Native PyTorch PCA to extract Eigen-PSFs and their weights."""
+    N, H, W = large_library.shape
+    data = torch.from_numpy(large_library).float().view(N, H * W)
+    mean_psf = data.mean(dim=0)
+    centered_data = data - mean_psf
+    U, S, V = torch.pca_lowrank(centered_data, q=n_components)
+    eigen_psfs = V.t().view(n_components, H, W).numpy()
+    psf_weights = (U * S).numpy() 
+    return eigen_psfs, psf_weights, mean_psf.view(H, W).numpy()
+
 def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     """
     Generates a large seamless mosaic using the 'Bake and Drop' strategy.
@@ -96,23 +107,23 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     fluxes = exp_time * (10 ** (-0.4 * (mags - zp)))
     
     # -------------------------------------------------------------
-    # NEW: Generate the library FIRST so the renderer can use it
+    # NEW: PCA-based PSF modeling
     # -------------------------------------------------------------
     N_LIBRARY_PSFS = 100
-    shape_size = params['shape_size']
     RENDER_KERNEL_SIZE = 31 # Fix for shape truncation (sigma=1.5 tails)
     
     # 1. Generate large shapes for realistic rendering
-    large_psf_library = generate_elliptical_psf_library(num_psfs=N_LIBRARY_PSFS, grid_size=RENDER_KERNEL_SIZE)
-    kb_array = large_psf_library.reshape(N_LIBRARY_PSFS, RENDER_KERNEL_SIZE, RENDER_KERNEL_SIZE)
+    large_psf_library_flat = generate_elliptical_psf_library(num_psfs=N_LIBRARY_PSFS, grid_size=RENDER_KERNEL_SIZE)
+    kb_array = large_psf_library_flat.reshape(N_LIBRARY_PSFS, RENDER_KERNEL_SIZE, RENDER_KERNEL_SIZE)
     
-    # 2. Crop out the central core for the target catalog (consistent with model output size)
-    start = (RENDER_KERNEL_SIZE - shape_size) // 2
-    end = start + shape_size
-    target_psf_library = kb_array[:, start:end, start:end]
-    # Re-normalize to ensure the 9x9 core integrates to ~1 (though mathematically it's a bit less)
-    target_psf_library = target_psf_library / (target_psf_library.sum(axis=(1,2), keepdims=True) + 1e-9)
-    psf_library = target_psf_library.reshape(N_LIBRARY_PSFS, -1)
+    # 2. Extract Eigen-PSFs and weights
+    eigen_psfs, psf_weights_lib, mean_psf = _compute_eigen_psfs(kb_array, n_components=N_PCA_COMPONENTS)
+    
+    # 3. Final library for reconstruction: [N_PCA + 1, 961]
+    psf_library = np.concatenate([
+        eigen_psfs.reshape(N_PCA_COMPONENTS, -1),
+        mean_psf.reshape(1, -1)
+    ], axis=0)
     
     if HAS_JAX:
         from castor.data.gpu_renderer import render_generate_and_filter_gpu
@@ -156,17 +167,21 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     # 2. Save Catalog as Structured NumPy
     cat_dtype = [
         ('x', 'f4'), ('y', 'f4'), ('flux', 'f4'), ('mag', 'f4'),
-        ('snr', 'f4'), ('comp', 'f4'),
-        ('psf_index', 'i4') 
+        ('snr', 'f4'), ('comp', 'f4')
     ]
+    # Add PCA weights to the dtype
+    for i in range(N_PCA_COMPONENTS):
+        cat_dtype.append((f'w{i}', 'f4'))
     
     n_visible = len(x_v)
     structured_cat = np.zeros(n_visible, dtype=cat_dtype)
     structured_cat['x'], structured_cat['y'] = x_v, y_v
     structured_cat['flux'], structured_cat['mag'] = flux_v, mag_v
     
-    # Slot the exact indices used by the renderer into the catalog
-    structured_cat['psf_index'] = psf_indices
+    # Store PCA weights
+    weights_v = psf_weights_lib[psf_indices]
+    for i in range(N_PCA_COMPONENTS):
+        structured_cat[f'w{i}'] = weights_v[:, i]
 
     # --- PRE-CALCULATE SNR and COMP (Moved from DataLoader) ---
     print(f"Pre-calculating SNR and Completeness for {n_visible:,} stars...")
@@ -223,9 +238,6 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     np.save(cat_path, structured_cat)
     np.save(meta_path, np.array([exp_time, zp, sky_mag], dtype=np.float32))
     np.save(lib_path, psf_library)
-    
-    duration = time.time() - start_time
-    print(f"✅ Saved Optimized Mosaic {idx} in {duration:.2f}s (Limit: {mag_limit:.2f} | Targets: {n_visible:,})")
     
     duration = time.time() - start_time
     print(f"✅ Saved Optimized Mosaic {idx} in {duration:.2f}s (Limit: {mag_limit:.2f} | Targets: {n_visible:,})")

@@ -277,7 +277,11 @@ def run_infer(stage_idx, config, device, checkpoint=None):
         
         image_tensor = sample["image"]
         target = sample["target"]
-        noisy_median = sample["chunk_median"] # We'll refine this after noise
+        psf_lib = sample["psf_library"] # [N_PCA + 1, 961]
+        
+        # Extract basis and mean for reconstruction
+        psf_basis = psf_lib[:-1, :]
+        mean_psf = psf_lib[-1, :]
         
         # --- THE FIX: Apply Live Noise and Stretch ---
         stretch_scale = data_cfg.get("GLOBAL_STRETCH_SCALE", 10.0)
@@ -294,13 +298,13 @@ def run_infer(stage_idx, config, device, checkpoint=None):
         # ---------------------------------------------
         
         # Extract true stars from the target grid for visualization
-        # target shape is (grid_size, grid_size, K*6 + 1)
         true_stars = []
         cell_size = dataset.cell_size
         grid_size = dataset.grid_size
         K = dataset.K
         
-        target_grid = target[:, :, :-1].view(grid_size, grid_size, K, 6).numpy()
+        # target shape is (grid_size, grid_size, K*25 + 1)
+        target_grid = target[:, :, :-1].view(grid_size, grid_size, K, -1).numpy()
         gt_bg_map = target[:, :, -1:].numpy()
         
         for y in range(grid_size):
@@ -315,7 +319,12 @@ def run_infer(stage_idx, config, device, checkpoint=None):
                         true_stars.append((tgx, tgy, float(raw_flux), tc))
         
         print(f"DEBUG: Found {len(true_stars)} true stars in the chunk.")
-        predicted_stars, predicted_shapes, bg_map = engine.predict(img_stretched)
+        # Pass PCA reconstruction components to predict
+        predicted_stars, predicted_shapes, bg_map = engine.predict(
+            img_stretched, 
+            psf_basis=psf_basis.numpy(), 
+            mean_psf=mean_psf.numpy()
+        )
         
         # DEBUG: Print normalization stats
         matches, _, _ = match_stars(true_stars, predicted_stars)
