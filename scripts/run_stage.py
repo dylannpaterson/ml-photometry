@@ -169,6 +169,8 @@ def run_train(stage_idx, config, device):
     
     # Enable hardware optimizations if multiple workers are used
     use_optimizations = num_workers > 0
+    prefetch_factor = (4 if stage_idx == 0 else 2) if use_optimizations else None
+    
     train_loader = DataLoader(
         train_dataset, 
         batch_size=batch_size, 
@@ -176,7 +178,7 @@ def run_train(stage_idx, config, device):
         num_workers=num_workers,
         pin_memory=use_optimizations,
         persistent_workers=use_optimizations,
-        prefetch_factor=2 if use_optimizations else None,
+        prefetch_factor=prefetch_factor,
         drop_last=True
     )
     val_loader = DataLoader(
@@ -186,7 +188,7 @@ def run_train(stage_idx, config, device):
         num_workers=num_workers,
         pin_memory=use_optimizations,
         persistent_workers=use_optimizations,
-        prefetch_factor=2 if use_optimizations else None,
+        prefetch_factor=prefetch_factor,
         drop_last=True
     )
 
