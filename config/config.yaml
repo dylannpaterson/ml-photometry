@@ -1,6 +1,6 @@
 run_config:
   resume_from_checkpoint: false
-  force_regenerate_data: true
+  force_regenerate_data: false
 
 
 curriculum:
@@ -10,7 +10,7 @@ curriculum:
     name: "Roman Bulge Stage 0 (Full)"
     data_dir: "data/bulge_stage0_full"
     epochs: 200
-    batch_size: 128
+    batch_size: 512
     learning_rate: 0.0001
     num_workers: 3
     resume_from_last_stage: false
@@ -25,7 +25,7 @@ curriculum:
     name: "Multi-Telescope Foundation"
     data_dir: "data/stage1_multitel"
     epochs: 50
-    batch_size: 128
+    batch_size: 512
     learning_rate: 0.0001
     num_workers: 4
     resume_from_last_stage: true
@@ -38,7 +38,7 @@ curriculum:
     name: "Roman High-Fidelity Fine-tuning"
     data_dir: "data/stage2_romanisim"
     epochs: 50
-    batch_size: 32
+    batch_size: 512
     learning_rate: 0.00001
     num_workers: 4
     resume_from_last_stage: true
