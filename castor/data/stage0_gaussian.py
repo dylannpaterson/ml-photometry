@@ -123,8 +123,9 @@ class GaussianPretrainingProvider(Dataset):
         start = (large_lib.shape[1] - target_size) // 2
         end = start + target_size
         cropped = large_lib[:, start:end, start:end]
-        # Re-normalize 9x9 core
-        return cropped / (cropped.sum(axis=(1,2), keepdims=True) + 1e-9)
+        
+        # Do NOT re-normalize. Let the shape sum to the true encircled energy fraction (e.g. 0.88)
+        return cropped 
 
     def _precompute_kernel_bank(self):
         """Precomputes a bank of shifted kernels for high-speed rendering."""
