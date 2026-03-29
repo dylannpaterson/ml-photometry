@@ -461,9 +461,14 @@ class GaussianMosaicDataset(Dataset):
         }
 
 class HDF5MosaicDataset(Dataset):
-    def __init__(self, h5_path):
+    def __init__(self, h5_path, image_size=256):
         self.h5_path = h5_path
         self.file = None
+        self.img_size = image_size
+        self.cell_size = DEFAULT_CELL_SIZE
+        self.grid_size = self.img_size // self.cell_size
+        self.K = MAX_CAPACITY_PER_CELL
+        self.S = SHAPE_SIZE
         
         if not os.path.exists(self.h5_path):
             raise FileNotFoundError(f"HDF5 file not found: {self.h5_path}")
@@ -491,4 +496,24 @@ class HDF5MosaicDataset(Dataset):
             "target": torch.from_numpy(target),
             "psf_library": torch.from_numpy(psf),
             "chunk_median": float(median)
+        }
+
+    def generate_chunk(self):
+        """Compatibility method for older analysis scripts."""
+        import random
+        idx = random.randint(0, len(self) - 1)
+        sample = self[idx]
+        
+        # ThresholdAnalyzer expects 'base_grid' for true stars
+        # and 'image' for the clean physics signal
+        target = sample["target"]
+        # target shape is (grid_size, grid_size, K*6 + 1)
+        # base_grid should be (grid_size, grid_size, K, 6)
+        base_grid = target[:, :, :-1].view(self.grid_size, self.grid_size, self.K, 6)
+        
+        return {
+            "image": sample["image"],
+            "base_grid": base_grid,
+            "background_map": target[:, :, -1:],
+            "chunk_median": sample["chunk_median"]
         }

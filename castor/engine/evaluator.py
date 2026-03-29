@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import os
 from scipy.spatial import cKDTree
 from castor.data.transforms import AstroSpaceTransform
 from castor.constants import MAX_CAPACITY_PER_CELL, GLOBAL_STRETCH_SCALE
@@ -95,36 +96,50 @@ class Evaluator:
 
         # Stage-specific data generation
         if self.stage_idx == 0:
-            from castor.data.stage0_gaussian import GaussianPretrainingProvider
+            from castor.data.stage0_gaussian import HDF5MosaicDataset
             data_cfg = self.config["data_params"]
-            provider = GaussianPretrainingProvider(
-                min_stars=data_cfg["min_stars"],
-                max_stars=data_cfg["max_stars"],
-                image_size=data_cfg["image_size"],
-                max_capacity_per_cell=data_cfg["max_capacity_per_cell"],
-                shape_size=data_cfg["shape_size"],
-                global_stretch_scale=self.stretch_scale
-            )
+            stage_cfg = self.config["curriculum"]["stage0"]
+            val_h5 = os.path.join(stage_cfg["data_dir"], "stage0_val.h5")
             
-            for _ in range(num_chunks):
-                sample = provider[0] # Get one chunk
+            if not os.path.exists(val_h5):
+                print(f"❌ Error: Validation HDF5 not found at {val_h5}. Run 'train' first.")
+                return
+                
+            dataset = HDF5MosaicDataset(val_h5)
+            num_to_eval = min(num_chunks, len(dataset))
+            
+            for i in range(num_to_eval):
+                sample = dataset[i]
                 image_tensor = sample["image"]
                 target_grid = sample["target"]
                 
+                # --- Apply Live Noise and Stretch (Match Training) ---
+                img_pos = torch.clamp(image_tensor, min=0.0)
+                img_noisy = torch.poisson(img_pos)
+                img_noisy += torch.randn_like(img_noisy) * 5.0  # Read noise
+                
+                # Calculate the median of the NOISY image
+                noisy_median = img_noisy.median().item()
+                
+                # Apply the Arcsinh stretch (Network Space)
+                img_stretched = torch.arcsinh((img_noisy - noisy_median) / self.stretch_scale)
+                # -----------------------------------------------------
+
                 # Predict
                 with torch.no_grad():
-                    input_tensor = image_tensor.unsqueeze(0).to(self.device)
+                    input_tensor = img_stretched.unsqueeze(0).to(self.device)
                     prediction_dict = self.model(input_tensor)
                     prediction = prediction_dict["stars"].squeeze(0).cpu().numpy()
                 
                 # Extract True Stars (Filter by completeness for honest recall)
                 true_stars = []
                 grid_h, grid_w = target_grid.shape[:2]
-                K = data_cfg["max_capacity_per_cell"]
-                S2_plus_5 = (target_grid.shape[-1] - 1) // K
-                target_reshaped = target_grid[..., :-1].view(grid_h, grid_w, K, S2_plus_5).numpy()
+                K = self.K
                 
-                cell_size = provider.cell_size
+                # Target in HDF5 is (grid_size, grid_size, K*6 + 1)
+                target_reshaped = target_grid[..., :-1].view(grid_h, grid_w, K, 6).numpy()
+                
+                cell_size = dataset.cell_size
                 for y in range(grid_h):
                     for x in range(grid_w):
                         for k in range(K):
@@ -154,9 +169,9 @@ class Evaluator:
 
                 # Analyze completeness of matched vs missed
                 matched_true_indices = [m[0] for m in matches]
-                for i, star in enumerate(true_stars):
+                for j, star in enumerate(true_stars):
                     comp = star[3]
-                    if i in matched_true_indices:
+                    if j in matched_true_indices:
                         matched_completeness.append(comp)
                     else:
                         missed_completeness.append(comp)
@@ -165,7 +180,7 @@ class Evaluator:
                     for b in range(len(comp_bins)-1):
                         if comp_bins[b] <= comp <= comp_bins[b+1]:
                             comp_total[b] += 1
-                            if i in matched_true_indices:
+                            if j in matched_true_indices:
                                 comp_tp[b] += 1
                             break
 

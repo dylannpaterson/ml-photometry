@@ -36,8 +36,20 @@ class ThresholdAnalyzer:
             image_tensor = sparse_sample["image"]
             target_grid = sparse_sample["base_grid"].numpy()
 
+            # --- Apply Live Noise and Stretch (Match Training) ---
+            img_pos = torch.clamp(image_tensor, min=0.0)
+            img_noisy = torch.poisson(img_pos)
+            img_noisy += torch.randn_like(img_noisy) * 5.0  # Read noise
+            
+            # Calculate the median of the NOISY image
+            noisy_median = img_noisy.median().item()
+            
+            # Apply the Arcsinh stretch (Network Space)
+            img_stretched = torch.arcsinh((img_noisy - noisy_median) / self.stretch_scale)
+            # -----------------------------------------------------
+
             with torch.no_grad():
-                input_tensor = image_tensor.to(self.device)
+                input_tensor = img_stretched.to(self.device)
                 if input_tensor.dim() == 3:
                     input_tensor = input_tensor.unsqueeze(0)
                 
