@@ -64,11 +64,12 @@ class Trainer:
             for i, batch in enumerate(self.train_loader):
                 if isinstance(batch, dict):
                     images = batch["image"].to(self.device, non_blocking=True)
-                    targets = batch["target"].to(self.device, non_blocking=True)
+                    # HDF5 transition: targets may be float16 on disk, must be float32 for loss
+                    targets = batch["target"].to(self.device, non_blocking=True).float()
                     psf_library = batch["psf_library"].to(self.device, non_blocking=True)
                 else:
                     images, targets = batch
-                    images, targets = images.to(self.device, non_blocking=True), targets.to(self.device, non_blocking=True)
+                    images, targets = images.to(self.device, non_blocking=True), targets.to(self.device, non_blocking=True).float()
                     psf_library = None
                 
                 # --- GPU-ACCELERATED LIVE NOISE INJECTION ---
@@ -168,11 +169,12 @@ class Trainer:
             for batch in self.val_loader:
                 if isinstance(batch, dict):
                     images = batch["image"].to(self.device, non_blocking=True)
-                    targets = batch["target"].to(self.device, non_blocking=True)
+                    # HDF5 transition: targets may be float16 on disk, must be float32 for loss
+                    targets = batch["target"].to(self.device, non_blocking=True).float()
                     psf_library = batch["psf_library"].to(self.device, non_blocking=True)
                 else:
                     images, targets = batch
-                    images, targets = images.to(self.device, non_blocking=True), targets.to(self.device, non_blocking=True)
+                    images, targets = images.to(self.device, non_blocking=True), targets.to(self.device, non_blocking=True).float()
                     psf_library = None
                 
                 # --- GPU-ACCELERATED LIVE NOISE INJECTION ---

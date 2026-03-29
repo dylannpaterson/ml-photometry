@@ -117,12 +117,14 @@ def create_hdf5_datasets_combined(data_dir, train_path, val_path, train_samples=
                         local_cat = band_cat[mask_x]
                         lx, ly = local_cat['x'] - px, local_cat['y'] - py
                         local_snrs, local_comps = snrs[y_start:y_end][mask_x], comps[y_start:y_end][mask_x]
+                        # Extract continuous PCA weights from catalog
                         psf_weights = np.column_stack([local_cat[f'w{i}'] for i in range(N_PCA)])
-                        
+
                         sort_idx = np.argsort(local_cat['flux'])[::-1]
-                        grid_stars = fast_paint_grid(lx, ly, local_cat['flux'], local_snrs, local_comps, psf_weights, sort_idx, 5.0, grid_size, cell_size, K)
+                        # NUMBA FIX: Cast weights to float32 for computation (Numba doesn't support float16)
+                        grid_stars = fast_paint_grid(lx, ly, local_cat['flux'], local_snrs, local_comps, psf_weights.astype(np.float32), sort_idx, 5.0, grid_size, cell_size, K)
                         target_buffer[:, :, :-1] = grid_stars.reshape(grid_size, grid_size, -1)
-                    
+
                     target_buffer[:, :, -1] = transform.target_bg_to_network(sky_level - chunk_median)
                     
                     # 3. Write
