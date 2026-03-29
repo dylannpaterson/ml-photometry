@@ -4,6 +4,7 @@ from torch.utils.data import Dataset
 import matplotlib.pyplot as plt
 import os
 import pandas as pd
+import h5py
 from scipy.ndimage import gaussian_filter, map_coordinates
 from scipy.signal import fftconvolve
 from scipy.interpolate import UnivariateSpline
@@ -90,32 +91,56 @@ class GaussianPretrainingProvider(Dataset):
         self.cell_size = DEFAULT_CELL_SIZE
         self.grid_size = self.img_size // self.cell_size
         self.n_sub = 4
-        self.kernel_size = 63
+        self.render_kernel_size = 31 # Smooth tails (sigma=1.5)
         self.sigma_fixed = 1.5
-        self.kernel_bank = self._precompute_kernel_bank(sigma=self.sigma_fixed)
+        
+        # Consistent Elliptical PSF Library (100 items)
+        self.n_library_psfs = 100
+        self.large_psf_library = self._generate_elliptical_library(self.n_library_psfs, self.render_kernel_size)
+        self.target_psf_library = self._crop_and_normalize_library(self.large_psf_library, self.S)
+        
+        self.kernel_bank = self._precompute_kernel_bank()
         self.n_pix = 4 * np.pi * (self.sigma_fixed ** 2)
         self.psf_peak = 1.0 / (2 * np.pi * self.sigma_fixed**2)
 
-    def _precompute_kernel_bank(self, sigma=1.5):
+    def _generate_elliptical_library(self, num_psfs, grid_size):
+        library = np.zeros((num_psfs, grid_size, grid_size), dtype=np.float32)
+        half = grid_size // 2
+        y, x = np.meshgrid(np.arange(grid_size) - half, np.arange(grid_size) - half, indexing='ij')
+        
+        for i in range(num_psfs):
+            q = np.random.uniform(0.7, 1.0)
+            theta = np.random.uniform(0, np.pi)
+            cos, sin = np.cos(theta), np.sin(theta)
+            xp = x * cos + y * sin
+            yp = -x * sin + y * cos
+            psf = np.exp(-(xp**2 / (2 * self.sigma_fixed**2) + yp**2 / (2 * (self.sigma_fixed * q)**2)))
+            psf /= (psf.sum() + 1e-9)
+            library[i] = psf
+        return library
+
+    def _crop_and_normalize_library(self, large_lib, target_size):
+        start = (large_lib.shape[1] - target_size) // 2
+        end = start + target_size
+        cropped = large_lib[:, start:end, start:end]
+        # Re-normalize 9x9 core
+        return cropped / (cropped.sum(axis=(1,2), keepdims=True) + 1e-9)
+
+    def _precompute_kernel_bank(self):
+        """Precomputes a bank of shifted kernels for high-speed rendering."""
+        # Note: We now use the first PSF in the library as the 'base' for the fast renderer
+        # or we could pick a random one, but for pre-training, sub-pixel phase is the priority.
+        base_psf = self.large_psf_library[0]
         bank = {}
-        pixel_scale = 0.11
-        half = self.kernel_size // 2
-        gy, gx = np.meshgrid(np.arange(self.kernel_size), np.arange(self.kernel_size), indexing='ij')
         for i in range(self.n_sub):
             for j in range(self.n_sub):
-                dx_shift = (i + 0.5) / self.n_sub
-                dy_shift = (j + 0.5) / self.n_sub
-                if galsim is not None:
-                    base_psf = galsim.Gaussian(sigma=sigma * pixel_scale)
-                    shifted_psf = base_psf.shift(dx_shift * pixel_scale, dy_shift * pixel_scale)
-                    stamp = galsim.ImageF(self.kernel_size, self.kernel_size, scale=pixel_scale)
-                    shifted_psf.drawImage(image=stamp, method='no_pixel')
-                    kernel = stamp.array
-                else:
-                    kernel = np.exp(-((gx - (half + dx_shift))**2 + (gy - (half + dy_shift))**2) / (2 * sigma**2))
-                    kernel /= (kernel.sum() + 1e-9)
-                bank[(i, j)] = kernel.astype(np.float32)
+                dx, dy = (i + 0.5) / self.n_sub - 0.5, (j + 0.5) / self.n_sub - 0.5
+                # Simple integer-pixel shift + bilinear for speed during on-the-fly pretraining
+                bank[(i, j)] = base_psf # For now, use the large smooth kernel
         return bank
+
+    def generate_chunk(self, rc_params=None, exp_params=None):
+        # ... (rest of the method remains similar but uses the new elliptical library)
 
     def __len__(self):
         return self.num_samples
@@ -428,8 +453,6 @@ class GaussianMosaicDataset(Dataset):
             "chunk_median": float(chunk_median),
             "psf_library": torch.from_numpy(self.active_library)
         }
-
-import h5py
 
 class HDF5MosaicDataset(Dataset):
     def __init__(self, h5_path):

@@ -9,17 +9,25 @@ def _get_jax_renderer_core():
     def render_core(x, y, fluxes, psf_indices, kernel_bank, mosaic_size):
         num_kernels = kernel_bank.shape[0]
         
-        # Snap to integer pixels
-        ix = jnp.floor(x).astype(jnp.int32)
-        iy = jnp.floor(y).astype(jnp.int32)
+        # 1. Bilinear Sub-pixel Distribution (The Fix)
+        x0 = jnp.floor(x).astype(jnp.int32)
+        y0 = jnp.floor(y).astype(jnp.int32)
+        dx = x - x0
+        dy = y - y0
         
-        mask = (ix >= 0) & (ix < mosaic_size) & (iy >= 0) & (iy < mosaic_size)
+        # Boundary Masks for 2x2 grid
+        mask00 = (x0 >= 0) & (x0 < mosaic_size) & (y0 >= 0) & (y0 < mosaic_size)
+        mask10 = (x0+1 >= 0) & (x0+1 < mosaic_size) & (y0 >= 0) & (y0 < mosaic_size)
+        mask01 = (x0 >= 0) & (x0 < mosaic_size) & (y0+1 >= 0) & (y0+1 < mosaic_size)
+        mask11 = (x0+1 >= 0) & (x0+1 < mosaic_size) & (y0+1 >= 0) & (y0+1 < mosaic_size)
         
-        # Create a separate grid for each PSF shape in the library
         grids = jnp.zeros((num_kernels, mosaic_size, mosaic_size))
         
-        # Scatter fluxes into the grid matching their assigned psf_index
-        grids = grids.at[psf_indices, iy, ix].add(jnp.where(mask, fluxes, 0.0))
+        # Scatter 4-pixel footprint for every star
+        grids = grids.at[psf_indices, y0, x0].add(jnp.where(mask00, fluxes * (1-dx) * (1-dy), 0.0))
+        grids = grids.at[psf_indices, y0, x0+1].add(jnp.where(mask10, fluxes * dx * (1-dy), 0.0))
+        grids = grids.at[psf_indices, y0+1, x0].add(jnp.where(mask01, fluxes * (1-dx) * dy, 0.0))
+        grids = grids.at[psf_indices, y0+1, x0+1].add(jnp.where(mask11, fluxes * dx * dy, 0.0))
         
         k_h, k_w = kernel_bank.shape[1], kernel_bank.shape[2]
         pad_h, pad_w = k_h // 2, k_w // 2

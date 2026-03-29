@@ -100,35 +100,58 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     # -------------------------------------------------------------
     N_LIBRARY_PSFS = 100
     shape_size = params['shape_size']
-    psf_library = generate_elliptical_psf_library(num_psfs=N_LIBRARY_PSFS, grid_size=shape_size)
+    RENDER_KERNEL_SIZE = 31 # Fix for shape truncation (sigma=1.5 tails)
     
-    # Reshape the flattened library to (N, H, W) for JAX 2D convolutions
-    kb_array = psf_library.reshape(N_LIBRARY_PSFS, shape_size, shape_size)
+    # 1. Generate large shapes for realistic rendering
+    large_psf_library = generate_elliptical_psf_library(num_psfs=N_LIBRARY_PSFS, grid_size=RENDER_KERNEL_SIZE)
+    kb_array = large_psf_library.reshape(N_LIBRARY_PSFS, RENDER_KERNEL_SIZE, RENDER_KERNEL_SIZE)
+    
+    # 2. Crop out the central core for the target catalog (consistent with model output size)
+    start = (RENDER_KERNEL_SIZE - shape_size) // 2
+    end = start + shape_size
+    target_psf_library = kb_array[:, start:end, start:end]
+    # Re-normalize to ensure the 9x9 core integrates to ~1 (though mathematically it's a bit less)
+    target_psf_library = target_psf_library / (target_psf_library.sum(axis=(1,2), keepdims=True) + 1e-9)
+    psf_library = target_psf_library.reshape(N_LIBRARY_PSFS, -1)
     
     if HAS_JAX:
         from castor.data.gpu_renderer import render_generate_and_filter_gpu
-        # Pass the elliptical library directly to the GPU renderer
+        # Pass the large library directly to the GPU renderer for smooth tails
         full_image, x_v, y_v, psf_indices, flux_v, mag_v = render_generate_and_filter_gpu(
             fluxes, mags, kb_array, mosaic_size, mag_limit=mag_limit
         )
     else:
-        # --- NumPy CPU PATH (Fallback) ---
+        # --- NumPy CPU PATH (Improved Fallback) ---
+        print("🛠️ Running CPU rendering fallback with PSF convolution...")
         x_centers = np.random.uniform(0, mosaic_size, len(mags))
         y_centers = np.random.uniform(0, mosaic_size, len(mags))
         all_psf_indices = np.random.randint(0, N_LIBRARY_PSFS, size=len(mags))
         
-        full_image = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
         v_mask = mags < mag_limit
         x_v, y_v = x_centers[v_mask], y_centers[v_mask]
         flux_v, mag_v = fluxes[v_mask], mags[v_mask]
         psf_indices = all_psf_indices[v_mask]
         
-        # Very slow loop for CPU rendering fallback
-        for x, y, f, p_idx in zip(x_v, y_v, flux_v, psf_indices):
-            ix, iy = int(x), int(y)
-            if 0 <= ix < mosaic_size and 0 <= iy < mosaic_size:
-                # Add central pixel (a rough approximation for CPU fallback)
-                full_image[iy, ix] += f 
+        full_image = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
+        
+        # Bilinear distribution of flux across pixels for sub-pixel accuracy
+        for i in range(N_LIBRARY_PSFS):
+            mask = psf_indices == i
+            if not mask.any(): continue
+            
+            px, py, pf = x_v[mask], y_v[mask], flux_v[mask]
+            x0, y0 = np.floor(px).astype(int), np.floor(py).astype(int)
+            dx, dy = px - x0, py - y0
+            
+            phase_map = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
+            # Add flux to 4 nearest pixels (bilinear scattering)
+            np.add.at(phase_map, (y0, x0), pf * (1-dx) * (1-dy))
+            np.add.at(phase_map, (y0, x0+1), pf * dx * (1-dy))
+            np.add.at(phase_map, (y0+1, x0), pf * (1-dx) * dy)
+            np.add.at(phase_map, (y0+1, x0+1), pf * dx * dy)
+            
+            # Convolve this phase's flux map with its specific PSF
+            full_image += fftconvolve(phase_map, kb_array[i], mode='same')
 
     # 2. Save Catalog as Structured NumPy
     cat_dtype = [
