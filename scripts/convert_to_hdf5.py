@@ -141,6 +141,16 @@ def create_hdf5_dataset(data_dir, output_path, total_samples=50000, img_size=256
                 
                 current_idx += 1
                 
+            # CLEANUP: Remove raw mosaic files immediately to free space for the rest of conversion
+            print(f"🧹 Clearing processed raw files for {os.path.basename(mosaic['img'])}")
+            if os.path.exists(mosaic['img']): os.remove(mosaic['img'])
+            if os.path.exists(mosaic['cat']): os.remove(mosaic['cat'])
+            if mosaic['lib'] and os.path.exists(mosaic['lib']): os.remove(mosaic['lib'])
+            # Also remove the meta file
+            base = mosaic['img'].replace("_img.npy", "")
+            meta_f = base + "_meta.npy"
+            if os.path.exists(meta_f): os.remove(meta_f)
+
             del img_data, cat_data
             gc.collect()
 
