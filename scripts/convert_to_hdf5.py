@@ -55,7 +55,8 @@ def create_hdf5_dataset(data_dir, output_path, total_samples=50000, img_size=256
     with h5py.File(output_path, 'w') as h5f:
         # Enable LZF compression for massive target and image tensors
         images_ds = h5f.create_dataset("images", (total_samples, 1, img_size, img_size), dtype='float32', chunks=(1, 1, img_size, img_size), compression="lzf")
-        targets_ds = h5f.create_dataset("targets", (total_samples, *target_shape), dtype='float32', chunks=(1, *target_shape), compression="lzf")
+        # DOWNCAST: Use float16 for targets to cut disk footprint in half
+        targets_ds = h5f.create_dataset("targets", (total_samples, *target_shape), dtype='float16', chunks=(1, *target_shape), compression="lzf")
         
         psf_ds = None
         medians_ds = h5f.create_dataset("chunk_medians", (total_samples,), dtype='float32')
@@ -133,6 +134,7 @@ def create_hdf5_dataset(data_dir, output_path, total_samples=50000, img_size=256
                 target_buffer[:, :, -1] = transform.target_bg_to_network(sky_level - chunk_median)
                 
                 images_ds[current_idx] = signal_tensor
+                # NumPy will handle the float32 -> float16 cast during assignment
                 targets_ds[current_idx] = target_buffer
                 psf_ds[current_idx] = psf_lib
                 medians_ds[current_idx] = chunk_median

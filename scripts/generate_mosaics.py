@@ -169,9 +169,9 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
         ('x', 'f4'), ('y', 'f4'), ('flux', 'f4'), ('mag', 'f4'),
         ('snr', 'f4'), ('comp', 'f4')
     ]
-    # Add PCA weights to the dtype
+    # Add PCA weights to the dtype as float16 to save space
     for i in range(N_PCA_COMPONENTS):
-        cat_dtype.append((f'w{i}', 'f4'))
+        cat_dtype.append((f'w{i}', 'f2'))
     
     n_visible = len(x_v)
     structured_cat = np.zeros(n_visible, dtype=cat_dtype)
