@@ -60,7 +60,7 @@ def match_stars(true_stars, pred_stars, distance_threshold=2.0, flux_threshold_d
                 min_cost = cost
                 best_p_idx = p_idx
         
-    if best_p_idx != -1:
+        if best_p_idx != -1:
             matches.append((t_idx, best_p_idx, min_cost))
             matched_true.add(t_idx)
             matched_pred.add(best_p_idx)
