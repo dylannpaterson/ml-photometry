@@ -285,11 +285,21 @@ def run_infer(stage_idx, config, device, checkpoint=None):
         
         image_tensor = sample["image"]
         target = sample["target"]
-        psf_lib = sample["psf_library"] # [N_PCA + 1, 961]
         
+        # --- PSF Basis Loading ---
+        # Priority: Local .pt file > Dataset sample
+        local_basis_path = "stage0_psf_basis.pt"
+        if os.path.exists(local_basis_path):
+            print(f"📂 Loading PSF basis from {local_basis_path}...")
+            psf_lib = torch.load(local_basis_path, map_location="cpu")
+        else:
+            psf_lib = sample["psf_library"] # [N_PCA + 1, 961]
+            
         # Extract basis and mean for reconstruction
+        # psf_lib is expected to be [N_PCA + 1, 961]
         psf_basis = psf_lib[:-1, :]
         mean_psf = psf_lib[-1, :]
+        # -------------------------
         
         # --- THE FIX: Apply Live Noise and Stretch ---
         stretch_scale = data_cfg.get("GLOBAL_STRETCH_SCALE", 10.0)
