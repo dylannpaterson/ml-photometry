@@ -53,13 +53,13 @@ def create_hdf5_datasets_combined(data_dir, train_path, val_path, train_samples=
     with h5py.File(train_path, 'w') as h5_train, h5py.File(val_path, 'w') as h5_val:
         # 1. Setup Train Datasets
         tr_imgs = h5_train.create_dataset("images", (train_samples, 1, img_size, img_size), dtype='float32', chunks=(1, 1, img_size, img_size), compression="lzf")
-        tr_tgts = h5_train.create_dataset("targets", (train_samples, *target_shape), dtype='float16', chunks=(1, *target_shape), compression="lzf")
+        tr_tgts = h5_train.create_dataset("targets", (train_samples, *target_shape), dtype='float32', chunks=(1, *target_shape), compression="lzf")
         tr_meds = h5_train.create_dataset("chunk_medians", (train_samples,), dtype='float32')
         tr_psfs = None # Allocated dynamically
         
         # 2. Setup Val Datasets
         val_imgs = h5_val.create_dataset("images", (val_samples, 1, img_size, img_size), dtype='float32', chunks=(1, 1, img_size, img_size), compression="lzf")
-        val_tgts = h5_val.create_dataset("targets", (val_samples, *target_shape), dtype='float16', chunks=(1, *target_shape), compression="lzf")
+        val_tgts = h5_val.create_dataset("targets", (val_samples, *target_shape), dtype='float32', chunks=(1, *target_shape), compression="lzf")
         val_meds = h5_val.create_dataset("chunk_medians", (val_samples,), dtype='float32')
         val_psfs = None
 
