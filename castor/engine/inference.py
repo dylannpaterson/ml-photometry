@@ -38,14 +38,31 @@ class InferenceEngine:
         self.transform = AstroSpaceTransform(stretch_scale=self.stretch_scale)
 
     def predict(self, image_tensor, threshold=0.5, psf_basis=None, mean_psf=None):
-        """Runs inference on a single 2D image tensor [1, H, W]."""
+        """Runs inference on a single 2D image tensor [H, W]."""
         self.model.eval()
         with torch.no_grad():
-            input_tensor = image_tensor.unsqueeze(0).to(self.device)
-            prediction_dict = self.model(input_tensor)
+            # 1. FIX: Apply Median Subtraction and Arcsinh Stretch (Pre-processing)
+            # This ensures raw linear data is correctly scaled for the network
+            chunk_median = image_tensor.median().item()
+            stretched_tensor = torch.arcsinh((image_tensor - chunk_median) / self.stretch_scale)
             
-            prediction = prediction_dict["stars"].squeeze(0).cpu().numpy()
-            bg_map = prediction_dict["background"].squeeze(0).cpu().numpy()
+            # 2. FIX: Ensure [Batch, Channel, H, W] dimensionality
+            if stretched_tensor.dim() == 2:
+                input_tensor = stretched_tensor.unsqueeze(0).unsqueeze(0)
+            elif stretched_tensor.dim() == 3:
+                input_tensor = stretched_tensor.unsqueeze(0)
+            else:
+                input_tensor = stretched_tensor
+                
+            input_tensor = input_tensor.to(self.device)
+
+            # 3. FIX: Match Training Mixed Precision Context
+            with torch.autocast(device_type=self.device.type, dtype=torch.float16):
+                prediction_dict = self.model(input_tensor)
+            
+            # Note: Unpack predictions and convert to float32 for stable CPU processing
+            prediction = prediction_dict["stars"].squeeze(0).float().cpu().numpy()
+            bg_map = prediction_dict["background"].squeeze(0).float().cpu().numpy()
             
         predicted_stars, predicted_shapes = [], []
         grid_h, grid_w, K, _ = prediction.shape

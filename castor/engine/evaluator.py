@@ -128,8 +128,12 @@ class Evaluator:
                 # Predict
                 with torch.no_grad():
                     input_tensor = img_stretched.unsqueeze(0).to(self.device)
-                    prediction_dict = self.model(input_tensor)
-                    prediction = prediction_dict["stars"].squeeze(0).cpu().numpy()
+                    # FIX: Match Training Mixed Precision Context
+                    with torch.autocast(device_type=self.device.type, dtype=torch.float16):
+                        prediction_dict = self.model(input_tensor)
+                    
+                    # FIX: Cast back to numpy via CPU and float32
+                    prediction = prediction_dict["stars"].squeeze(0).float().cpu().numpy()
                 
                 # Extract True Stars
                 true_stars = []
@@ -147,8 +151,8 @@ class Evaluator:
                             tp, tdx, tdy, raw_flux_target, tc = slot[:5]
                             if tp == 1.0:
                                 star_info = ((x * cell_size) + tdx, (y * cell_size) + tdy, float(raw_flux_target), tc)
-                                if tc > 0.5:
-                                    true_stars.append(star_info)
+                                # REMOVED: Redundant tc > 0.5 check (generator already filters these)
+                                true_stars.append(star_info)
                 
                 # Extract Predicted Stars (p > threshold)
                 pred_stars = []
