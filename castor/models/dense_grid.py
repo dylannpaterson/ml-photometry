@@ -141,7 +141,8 @@ class DenseGridModel(nn.Module):
         raw_log_flux = star_out[..., 3:4]
         # CRITICAL: Clamp before exp() to prevent exploding gradients during early epochs
         raw_log_flux = torch.clamp(raw_log_flux, min=-10.0, max=22.0) 
-        flux = torch.exp(raw_log_flux)
+        # FIX: Force float32 evaluation to prevent FP16 overflow on bright stars
+        flux = torch.exp(raw_log_flux.float())
         
         c = torch.sigmoid(star_out[..., 4:5])
         
@@ -237,19 +238,6 @@ def compute_grid_loss(preds, targets, psf_library=None, lambda_prob=5.0, lambda_
         flux_loss = torch.tensor(0.0, device=star_preds.device)
         comp_loss = torch.tensor(0.0, device=star_preds.device)
         shape_loss = torch.tensor(0.0, device=star_preds.device)
-        
-    # 4. Background Loss (Global MSE)
-    bg_loss = F.mse_loss(bg_preds, bg_targets, reduction='mean')
-        
-    total_loss = (lambda_prob * prob_loss + 
-                  lambda_pos * pos_loss + 
-                  lambda_flux * flux_loss +
-                  lambda_comp * comp_loss +
-                  lambda_shape * shape_loss + 
-                  lambda_bg * bg_loss)
-                  
-    return total_loss, prob_loss, pos_loss, flux_loss, shape_loss, bg_loss
-
         
     # 4. Background Loss (Global MSE)
     bg_loss = F.mse_loss(bg_preds, bg_targets, reduction='mean')
