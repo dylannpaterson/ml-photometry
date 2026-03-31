@@ -30,6 +30,9 @@ class Trainer:
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=5)
         self.start_epoch = 0
         
+        # New: Track psf_library for checkpointing
+        self.psf_library = None
+        
         # Add the AMP GradScaler
         self.scaler = torch.amp.GradScaler('cuda' if device.type == 'cuda' else 'cpu')
         
@@ -46,6 +49,10 @@ class Trainer:
             ckpt = torch.load(checkpoint_path, map_location=self.device)
             if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
                 self.model.load_state_dict(ckpt['model_state_dict'])
+                # Restore psf_library if it exists in the checkpoint
+                if 'psf_library' in ckpt:
+                    self.psf_library = ckpt['psf_library']
+                    print("✅ Restored PSF library from checkpoint.")
             else:
                 self.model.load_state_dict(ckpt)
 
@@ -67,6 +74,10 @@ class Trainer:
                     # HDF5 transition: targets may be float16 on disk, must be float32 for loss
                     targets = batch["target"].to(self.device, non_blocking=True).float()
                     psf_library = batch["psf_library"].to(self.device, non_blocking=True)
+                    
+                    # Capture psf_library once for checkpointing
+                    if self.psf_library is None:
+                        self.psf_library = psf_library[0:1].detach().cpu()
                 else:
                     images, targets = batch
                     images, targets = images.to(self.device, non_blocking=True), targets.to(self.device, non_blocking=True).float()
@@ -133,10 +144,17 @@ class Trainer:
                 'model_state_dict': self.model.state_dict(),
                 'optimizer_state_dict': self.optimizer.state_dict(),
                 'val_loss': val_loss,
+                'psf_library': self.psf_library # Save PSF library
             }
             torch.save(checkpoint, os.path.join("checkpoints", f"{self.checkpoint_prefix}_epoch_{epoch+1}.pth"))
             self._prune_checkpoints()
-        torch.save(self.model.state_dict(), os.path.join("checkpoints", f"{self.checkpoint_prefix}_final.pth"))
+        
+        # Save final model state dict and include PSF library in a wrapper for inference compatibility
+        final_ckpt = {
+            'model_state_dict': self.model.state_dict(),
+            'psf_library': self.psf_library
+        }
+        torch.save(final_ckpt, os.path.join("checkpoints", f"{self.checkpoint_prefix}_final.pth"))
 
     def _prune_checkpoints(self, keep_last=10):
         checkpoint_dir = "checkpoints"

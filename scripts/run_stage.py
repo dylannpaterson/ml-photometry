@@ -3,6 +3,7 @@ import torch
 import numpy as np
 import os
 import sys
+import shutil
 from castor.cloud.config_utils import load_config
 from castor.models.dense_grid import DenseGridModel
 from castor.data.dataset import PregeneratedDataset
@@ -29,7 +30,7 @@ def load_stage_model(stage_idx, device, config, checkpoint_path=None):
         
     if not os.path.exists(checkpoint_path):
         print(f"❌ Error: Model checkpoint not found at {checkpoint_path}")
-        return None
+        return None, None
     
     data_cfg = config["data_params"]
     stage_key = f"stage{stage_idx}"
@@ -44,12 +45,20 @@ def load_stage_model(stage_idx, device, config, checkpoint_path=None):
     
     # Handle full checkpoint dict or raw state dict
     ckpt = torch.load(checkpoint_path, map_location=device)
-    if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
-        model.load_state_dict(ckpt['model_state_dict'])
+    psf_library = None
+    if isinstance(ckpt, dict):
+        if 'model_state_dict' in ckpt:
+            model.load_state_dict(ckpt['model_state_dict'])
+        else:
+            model.load_state_dict(ckpt)
+        
+        # Capture psf_library if it exists
+        if 'psf_library' in ckpt:
+            psf_library = ckpt['psf_library']
     else:
         model.load_state_dict(ckpt)
         
-    return model
+    return model, psf_library
 
 def ensure_stage0_data(stage_cfg, data_cfg, config_path):
     """Checks for HDF5 data and generates a small amount if missing."""
@@ -240,7 +249,7 @@ def run_train(stage_idx, config, device):
 
 def run_eval(stage_idx, config, device, checkpoint=None):
     print(f"--- 📊 Curriculum Stage {stage_idx}: Evaluation ---")
-    model = load_stage_model(stage_idx, device, config, checkpoint)
+    model, _ = load_stage_model(stage_idx, device, config, checkpoint)
     if not model: return
 
     if stage_idx == 0:
@@ -261,7 +270,7 @@ def run_infer(stage_idx, config, device, checkpoint=None):
     from castor.engine.evaluator import match_stars
     from castor.engine.inference import InferenceEngine
     print(f"--- 🛰️ Curriculum Stage {stage_idx}: Inference ---")
-    model = load_stage_model(stage_idx, device, config, checkpoint)
+    model, psf_lib_ckpt = load_stage_model(stage_idx, device, config, checkpoint)
     if not model: return
 
     engine = InferenceEngine(model, device, config)
@@ -287,11 +296,13 @@ def run_infer(stage_idx, config, device, checkpoint=None):
         target = sample["target"]
         
         # --- PSF Basis Loading ---
-        # Priority: Local .pt file > Dataset sample
-        local_basis_path = "stage0_psf_basis.pt"
-        if os.path.exists(local_basis_path):
-            print(f"📂 Loading PSF basis from {local_basis_path}...")
-            psf_lib = torch.load(local_basis_path, map_location="cpu")
+        # Priority: Checkpoint embedded library > Local .pt file > Dataset sample
+        if psf_lib_ckpt is not None:
+            print("📂 Using PSF basis embedded in model checkpoint...")
+            psf_lib = psf_lib_ckpt.squeeze(0) # [N_PCA + 1, 961]
+        elif os.path.exists("stage0_psf_basis.pt"):
+            print(f"📂 Loading PSF basis from stage0_psf_basis.pt...")
+            psf_lib = torch.load("stage0_psf_basis.pt", map_location="cpu")
         else:
             psf_lib = sample["psf_library"] # [N_PCA + 1, 961]
             
@@ -370,7 +381,7 @@ def run_infer(stage_idx, config, device, checkpoint=None):
 
 def run_analyze(stage_idx, config, device, checkpoint=None):
     print(f"--- 📈 Curriculum Stage {stage_idx}: Threshold Analysis ---")
-    model = load_stage_model(stage_idx, device, config, checkpoint)
+    model, _ = load_stage_model(stage_idx, device, config, checkpoint)
     if not model: return
 
     if stage_idx == 0:
