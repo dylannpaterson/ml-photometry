@@ -338,8 +338,9 @@ def run_infer(stage_idx, config, device, checkpoint=None):
         
         print(f"DEBUG: Found {len(true_stars)} true stars in the chunk.")
         # Pass PCA reconstruction components to predict
+        # FIX: Pass raw linear noisy image, as predict() handles its own stretch
         predicted_stars, predicted_shapes, bg_map = engine.predict(
-            img_stretched, 
+            img_noisy, 
             psf_basis=psf_basis.numpy(), 
             mean_psf=mean_psf.numpy()
         )
