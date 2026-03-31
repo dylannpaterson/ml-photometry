@@ -12,17 +12,17 @@ To develop a machine learning pipeline capable of performing fast, direct point-
 
 ### Output (The Spatial Grid)
 *   **Format:** 3D Tensor (Flattened Channels)
-*   **Dimensions:** $128 \times 128 \times (K \times 86 + 1)$ (where $K=3$ is optimized for Bulge densities).
-*   **Structure:** The output is a $128 \times 128$ spatial grid. Each cell predicts star parameters for $K$ slots plus one shared local background value. **Canonical Slot Sorting:** Stars within each cell are sorted by flux (brightest to faintest) before being assigned to the $K$ slots. This provides a stable and consistent learning target.
-*   **Slot Values (86 per slot):**
+*   **Dimensions:** $64 \times 64 \times (K \times (5 + N_{PCA}) + 1)$ (where $K=3$ and $N_{PCA}=20$).
+*   **Structure:** The output is a $64 \times 64$ spatial grid (stride 4 relative to input). Each cell predicts star parameters for $K$ slots plus one shared local background value. **Canonical Slot Sorting:** Stars within each cell are sorted by flux (brightest to faintest) before being assigned to the $K$ slots. This provides a stable and consistent learning target.
+*   **Slot Values (25 per slot for $N_{PCA}=20$):**
     1.  **p (and c):** **Completeness & Objectness ($0.0 \to 1.0$)**. Represents the physical recoverability of the source.
-        *   **Calculation:** Computed dynamically during the dataloading phase via a logistic sigmoid centered on the detection threshold (e.g., SNR 5.0): $1.0 / (1.0 + \exp(-2.0 \cdot (\text{SNR} - \text{min\_snr})))$.
+        *   **Logit Bypass:** For training stability, the model outputs raw logits for $p$. Sigmoid is only applied during inference.
         *   **Sub-Pixel Confusion SNR:** The local SNR natively accounts for crowding. It is calculated by sampling the total simulated starlight at the exact sub-pixel coordinates (via bilinear interpolation), subtracting the star's own peak flux, and adding this residual "confusion light" to the sky background and read noise variance.
-    2.  **dx, dy:** Sub-pixel offset from the cell's top-left corner ($0.0 \to 2.0$)
-    3.  **m:** Stretched Flux ($\text{asinh}(\text{Flux} / \text{scale})$). Matches the input feature space for stable regression.
-    4.  **S (Shape):** 9x9 Point Source Profile (81 values). Represents the isolated, centered PSF shape.
+    2.  **dx, dy:** Sub-pixel offset from the cell's top-left corner ($0.0 \to \text{cell\_size}$).
+    3.  **m:** Natural Log Flux ($\ln(\text{Flux} + 1e^{-6})$). Predicts bounded log-flux (clamped between -10.0 and 22.0) for numerical stability.
+    4.  **S (Shape):** Eigen-PSF PCA Weights ($N_{PCA}$ values). Continuous weights that are combined with a predefined global PCA basis and mean PSF to reconstruct high-fidelity $31 \times 31$ point source profiles.
 *   **Background Value (1 per cell):**
-    1.  **b:** Residual Background Level ($\text{asinh}((\text{BG}_{raw} - \text{median}(I_{raw})) / \text{scale})$). Represents local deviations from the chunk's median sky.
+    1.  **b:** Residual Background Level. Represents local deviations from the chunk's median sky in stretched space.
 
 ## 3. Neural Network Architecture
 
@@ -45,21 +45,22 @@ A **Feature Pyramid Network (FPN)** merges deep semantic context from the lower 
 
 ### Stage 3: The Prediction Head
 *   **Spatial Awareness:** Uses **CoordConv** (normalized x,y coordinate channels) to help the model learn geometric dependencies within the grid cells.
-*   **Output Layer:** $K \times (5 + S^2) + 1$ channels (259 channels total for $K=3, S=9$).
+*   **Output Layer:** $K \times (5 + N_{PCA}) + 1$ channels (76 channels total for $K=3, N_{PCA}=20$).
 *   **Activations:**
-    *   **p, c:** Sigmoid.
+    *   **p:** Linear (Raw logits during training, Sigmoid during inference).
+    *   **c:** Sigmoid.
     *   **dx, dy:** Sigmoid $\times \text{cell\_size}$.
-    *   **m, b:** Linear (predicting in stretched space).
-    *   **S:** Softmax over the $S^2$ values per slot.
+    *   **m:** Linear (Bounded Log-Flux).
+    *   **S:** Linear (Continuous PCA Weights).
 
 ## 4. The Loss Function
 *   **Total Loss:** $\mathcal{L}_{Total} = \lambda_1 \mathcal{L}_{Prob} + \lambda_2 \mathcal{L}_{Pos} + \lambda_3 \mathcal{L}_{Flux} + \lambda_4 \mathcal{L}_{Comp} + \lambda_5 \mathcal{L}_{Shape} + \lambda_6 \mathcal{L}_{BG}$
-*   **$\mathcal{L}_{Prob}$:** Focal Loss with inverse-flux importance weighting to boost the detection of faint sources.
+*   **$\mathcal{L}_{Prob}$:** `BCEWithLogitsLoss` combined with manual Focal Loss and inverse-flux importance weighting to boost the detection of faint sources.
 *   **$\mathcal{L}_{Pos}$:** Masked MSE for $dx, dy$ sub-pixel offsets, heavily weighted ($\lambda_2 \approx 50.0$) to force geometric precision.
-*   **$\mathcal{L}_{Flux}$:** Masked MSE for stretched flux ($m$). Weighted ($\lambda_3 \approx 5.0$) to compensate for Arcsinh compression.
+*   **$\mathcal{L}_{Flux}$:** Masked MSE evaluated in natural log space ($\ln(\text{Flux} + 1e^{-6})$).
 *   **$\mathcal{L}_{Comp}$:** Masked MSE for completeness ($c$).
-*   **$\mathcal{L}_{Shape}$:** Masked MSE for the 9x9 PSF.
-*   **$\mathcal{L}_{BG}$:** Global MSE for the Arcsinh-stretched background map.
+*   **$\mathcal{L}_{Shape}$:** **Eigen-PSF Reconstruction Loss**. Predicted weights are multiplied by the PCA basis and added to the mean PSF to reconstruct the $31 \times 31$ profile. Masked MSE is then evaluated in the reconstructed pixel space to guarantee photometric consistency.
+*   **$\mathcal{L}_{BG}$:** Global MSE for the background residuals.
 
 ## 5. Success Metrics (Acceptance Criteria)
 | Metric | Target | Description |
@@ -70,21 +71,18 @@ A **Feature Pyramid Network (FPN)** merges deep semantic context from the lower 
 | **Flux Ratio (Mean)** | $1.00 \pm 0.05$ | Accuracy in magnitude recovery. |
 | **Flux Scatter (StdDev)**| $< 0.10$ | Precision in magnitude recovery. |
 | **Completeness MAE** | $< 0.10$ | Reliability of predicted recoverability score. |
-| **Shape Loss ($S$)** | $< 0.0001$ | PSF profile fidelity. |
+| **Shape Loss ($S$)** | $< 0.0001$ | PSF profile fidelity (Pixel MSE). |
 
 ## 6. Implementation Strategy: The Macro-Sparse Pipeline
-To maintain a virtually negligible disk footprint while preserving extremely high I/O throughput, the pipeline uses a **"Cached Physics, Live Noise"** dual-mmap architecture combined with Just-In-Time (JIT) grid densification.
+To maintain a virtually negligible disk footprint while preserving extremely high I/O throughput, the pipeline uses a **"Cached Physics, Live Noise"** architecture combined with compressed HDF5 storage.
 
-*   **JAX-Accelerated Generation (Two-Tier Speed Hack):** To generate the massive Stage 0 mosaics (up to 8 million stars), the pipeline uses a fused JAX GPU operation (`lax.conv_general_dilated`). This allows for ultra-fast, sub-pixel accurate phase rendering of the point sources directly on the GPU, utilizing dynamic padding to prevent constant XLA recompilation bottlenecks.
-*   **Macro-Sparse Storage:** Instead of saving massive 259-channel target tensors, the offline generator only saves:
-    1.  **The Base Image:** A flat, clean float32 array containing the simulated optical physics (e.g., $4088 \times 4088$).
-    2.  **The Target Catalog:** A lightweight Parquet or HDF5 table containing the ground truth for each star. 
-*   **Tabular Shape Integration ($S$):** The exact $9 \times 9$ optical PSF shape profile for every star is flattened into an 81-value array and saved directly as a column in the Target Catalog alongside its $x, y$, and `flux` coordinates.
-*   **JIT Densification & Live Noise:** During training, the PyTorch `Dataset`:
-    1. Memory-maps the clean image and slices a random $256 \times 256$ crop.
-    2. Dynamically injects sky background, Poisson noise, and Gaussian read noise on the fly, ensuring infinite noise realizations.
-    3. Queries the catalog for stars within the crop bounds and instantly "paints" their $x, y, m$, and $S$ values into a dense $128 \times 128 \times 259$ target tensor in RAM.
-*   **Dynamic Completeness Calculation ($c$):** Because noise is injected live, recoverability cannot be entirely pre-calculated. The dataloader recalculates SNR on the fly—factoring in the newly injected sky/read noise and the exact local background light from neighboring stars—and passes it through a logistic sigmoid.
+*   **JAX-Accelerated Generation (Two-Tier Speed Hack):** To generate the massive Stage 0 mosaics (up to 8 million stars), the pipeline uses a fused JAX GPU operation (`lax.conv_general_dilated`). This allows for ultra-fast, sub-pixel accurate phase rendering of the point sources directly on the GPU.
+*   **Eigen-PSF Storage:** Instead of saving raw pixel grids for every star, the offline generator performs a native PyTorch PCA on the PSF library once per mosaic. It then saves:
+    1.  **The Base Image:** A flat, clean float32 array containing the simulated optical physics.
+    2.  **PCA Basis & Mean:** The 20 principal components and mean PSF (as small $20 \times 961$ and $1 \times 961$ arrays).
+    3.  **Target Catalog:** Lightweight table containing ground truth $x, y, \ln(\text{Flux})$, and the 20 continuous PCA weights per star. 
+*   **HDF5 Conversion with Compression:** Raw mosaics are converted into HDF5 files using **LZF compression** and **float32 precision** for targets. An incremental "sample-and-delete" strategy is used during conversion to minimize the peak disk footprint.
+*   **JIT Live Noise:** During training, the PyTorch `Dataset` dynamically injects sky background, Poisson noise, and Gaussian read noise on the GPU, ensuring infinite noise realizations and preventing overfitting to specific noise patterns.
 
 ## 7. Training Curriculum
 The pipeline uses a multi-stage curriculum to build a robust foundation model for space-based point source recovery.
@@ -101,8 +99,8 @@ The pipeline uses a multi-stage curriculum to build a robust foundation model fo
     2. **Hubble-like:** 4-strut perpendicular diffraction.
     3. **Ideal Space:** Unobscured, pure Airy disks with varying aberrations (coma, astigmatism).
     4. **Ground-based:** Seeing-limited Moffat profiles simulating atmospheric blur.
-* **Astrophysical Priors:** Star counts and fluxes (~150,000 per mosaic) are drawn from an empirical Galactic Bulge luminosity function (e.g., VVV or Besançon) to ensure authentic density ratios and severe crowding.
-* **Training Mechanics:** Utilizing the Macro-Sparse Pipeline, the dataloader slices crops from the 20-mosaic bank, applies $D_4$ symmetry augmentations, and injects live noise. This provides ~50,000 unique, dynamically noisy training chunks for a 100-epoch curriculum.
+* **Astrophysical Priors:** Star counts and fluxes drawn from an empirical Galactic Bulge luminosity function.
+* **Training Mechanics:** Slices crops from the 20-mosaic bank, applies $D_4$ symmetry augmentations, and injects live noise. 
 * **Goal:** Learn to decouple the intrinsic stellar signal from varied instrumental PSFs, smoothly mapping core structures and naturally suppressing diffraction spikes before encountering Romanisim data.
 
 ### Stage 2: Roman-specific High-Fidelity Fine-tuning (The "Mission" Phase)

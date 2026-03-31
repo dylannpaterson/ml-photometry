@@ -1,13 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=castor_train
-#SBATCH --time=48:00:00            
+#SBATCH --time=24:00:00            
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8          
 #SBATCH --mem=64G                  
 #SBATCH --partition=batch-gpu      
 #SBATCH --gpus-per-node=1          
-#SBATCH --constraint="a100|v100" 
 #SBATCH --output=logs/train_%j.out
 #SBATCH --error=logs/train_%j.err
 
