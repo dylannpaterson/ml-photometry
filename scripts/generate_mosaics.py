@@ -138,19 +138,15 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
         y_centers = np.random.uniform(0, mosaic_size, len(mags))
         all_psf_indices = np.random.randint(0, N_LIBRARY_PSFS, size=len(mags))
         
-        v_mask = mags < mag_limit
-        x_v, y_v = x_centers[v_mask], y_centers[v_mask]
-        flux_v, mag_v = fluxes[v_mask], mags[v_mask]
-        psf_indices = all_psf_indices[v_mask]
-        
         full_image = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
         
+        # 1. RENDER EVERYTHING (Including faint background stars)
         # Bilinear distribution of flux across pixels for sub-pixel accuracy
         for i in range(N_LIBRARY_PSFS):
-            mask = psf_indices == i
+            mask = all_psf_indices == i
             if not mask.any(): continue
             
-            px, py, pf = x_v[mask], y_v[mask], flux_v[mask]
+            px, py, pf = x_centers[mask], y_centers[mask], fluxes[mask]
             x0, y0 = np.floor(px).astype(int), np.floor(py).astype(int)
             dx, dy = px - x0, py - y0
             
@@ -163,6 +159,12 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
             
             # Convolve this phase's flux map with its specific PSF
             full_image += fftconvolve(phase_map, kb_array[i], mode='same')
+
+        # 2. FILTER CATALOG (Only keep visible targets for the loss function)
+        v_mask = mags < mag_limit
+        x_v, y_v = x_centers[v_mask], y_centers[v_mask]
+        flux_v, mag_v = fluxes[v_mask], mags[v_mask]
+        psf_indices = all_psf_indices[v_mask]
 
     # 2. Save Catalog as Structured NumPy
     cat_dtype = [

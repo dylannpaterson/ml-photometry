@@ -18,7 +18,7 @@ try:
 except ImportError:
     galsim = None
 
-#@njit(boundscheck=False)
+@njit(boundscheck=False)
 def fast_paint_grid(lx, ly, fluxes, snrs, comps, psf_weights, sort_idx, min_snr, grid_size, cell_size, K):
     # Size is now exactly 5 + N_PCA (Existence, dx, dy, flux, comp, weights...)
     N_PCA = psf_weights.shape[1]
