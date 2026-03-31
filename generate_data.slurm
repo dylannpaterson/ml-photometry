@@ -29,6 +29,7 @@ FINAL_DIR=$(python3 -c "import yaml; c=yaml.safe_load(open('config/config.yaml')
 STAGE_IDX=$(echo $TARGET_STAGE | sed 's/stage//')
 NUM_TRAIN=$(python3 -c "import yaml; c=yaml.safe_load(open('config/config.yaml')); print(c['data_params']['num_train_samples'])")
 NUM_VAL=$(python3 -c "import yaml; c=yaml.safe_load(open('config/config.yaml')); print(c['data_params']['num_val_samples'])")
+NUM_MOSAICS=$(python3 -c "import yaml; c=yaml.safe_load(open('config/config.yaml')); print(c['curriculum']['$TARGET_STAGE']['mosaic_params']['num_mosaics'])")
 
 if [ -z "$FINAL_DIR" ]; then
     echo "❌ Error: Could not find $TARGET_STAGE in config/config.yaml curriculum."
@@ -36,6 +37,7 @@ if [ -z "$FINAL_DIR" ]; then
 fi
 
 echo "📂 Target Directory: $FINAL_DIR"
+echo "🧩 Generating $NUM_MOSAICS mosaics..."
 
 # 3. Data Generation
 # Fixed: Uses dynamic STAGE_IDX and standard config path
@@ -43,7 +45,7 @@ echo "1️⃣ Generating raw mosaics..."
 srun python -u scripts/generate_mosaics.py \
     --config config/config.yaml \
     --stage $STAGE_IDX \
-    --num 1000
+    --num $NUM_MOSAICS
 
 # Fixed: Removed RAW_DIR mismatch; now points to directory containing /mosaics
 # Fixed: Added required sample count arguments from config
