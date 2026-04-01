@@ -225,8 +225,9 @@ def compute_grid_loss(preds, targets, psf_library=None, lambda_prob=5.0, lambda_
             mean_psf = psf_library[0, -1, :]    # [961]
             
             # Reconstruct: weights @ basis + mean
-            shape_pred = (weights_pred @ psf_basis) + mean_psf
-            shape_target = (weights_target @ psf_basis) + mean_psf
+            # FIX: Scale by 100.0 to prevent microscopic MSE and fix dead gradients
+            shape_pred = ((weights_pred @ psf_basis) + mean_psf) * 100.0
+            shape_target = ((weights_target @ psf_basis) + mean_psf) * 100.0
             
             # MSE in pixel space ensures photometric consistency
             shape_loss = F.mse_loss(shape_pred, shape_target, reduction='mean')
