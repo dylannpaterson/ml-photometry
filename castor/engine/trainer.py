@@ -127,6 +127,15 @@ class Trainer:
                     preds_fp32, targets, psf_library=psf_library, **self.loss_params
                 )
                 
+                # --- DIFFRACTION FILTER REGULARIZATION ---
+                # This prevents the physics prior from drifting too far from initialization
+                # and becoming a random convolutional layer.
+                diffraction_reg = self.model.diffraction_filter.get_regularization_loss()
+                lambda_diffraction = self.loss_params.get("lambda_diffraction_reg", 10.0)
+                reg_loss = lambda_diffraction * diffraction_reg
+                loss += reg_loss
+                # ------------------------------------------
+
                 if torch.isnan(loss):
                     print(f"⚠️ NaN detected at step {i}")
                     continue
@@ -146,7 +155,7 @@ class Trainer:
                 
                 if i % 100 == 0:
                     current_lr = self.optimizer.param_groups[0]['lr']
-                    print(f"Epoch [{epoch+1}/{self.epochs}], Step [{i}/{len(self.train_loader)}], LR: {current_lr:.6f}, Loss: {loss.item():.4f} (P:{p_loss.item():.4f}, Pos:{po_loss.item():.4f}, F:{f_loss.item():.4f}, S:{s_loss.item():.4f}, B:{b_loss.item():.4f})")
+                    print(f"Epoch [{epoch+1}/{self.epochs}], Step [{i}/{len(self.train_loader)}], LR: {current_lr:.6f}, Loss: {loss.item():.4f} (P:{p_loss.item():.4f}, Pos:{po_loss.item():.4f}, F:{f_loss.item():.4f}, S:{s_loss.item():.4f}, B:{b_loss.item():.4f}, DReg:{reg_loss.item():.6f})")
             
             avg_epoch_loss = epoch_loss/len(self.train_loader)
             print(f"==> Epoch {epoch+1} Complete | Avg Loss: {avg_epoch_loss:.4f} | Time: {time.time()-start_time:.1f}s")

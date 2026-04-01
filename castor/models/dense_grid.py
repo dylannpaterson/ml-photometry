@@ -52,11 +52,23 @@ class DiffractionAwareFilter(nn.Module):
         
         # 2. Assign the mathematical prior to the Conv2d weights
         # Reshape to match PyTorch weight format: [out_channels, in_channels, H, W]
-        self.conv.weight.data = kernel.view(1, 1, kernel_size, kernel_size).float()
+        initial_weight = kernel.view(1, 1, kernel_size, kernel_size).float()
+        self.conv.weight.data = initial_weight.clone()
+        
+        # NEW: Store the initial weight as a buffer so it stays on the same device
+        # but is NOT updated by the optimizer.
+        self.register_buffer("init_weight", initial_weight)
         
         # 3. CRITICAL: Allow the network to backpropagate and warp this shape 
         # to match the true Roman PSF diffraction spikes!
         self.conv.weight.requires_grad = True
+
+    def get_regularization_loss(self):
+        """
+        Calculates the L2 distance from the initial LoG kernel.
+        This prevents the filter from drifting into a random conv layer.
+        """
+        return torch.sum((self.conv.weight - self.init_weight) ** 2)
 
     def forward(self, x):
         # Concatenate the original raw image with the filtered response
