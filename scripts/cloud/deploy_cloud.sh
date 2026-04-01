@@ -7,7 +7,7 @@
 INSTANCE_NAME="bulge-survey-ml-worker"
 ZONES=("asia-east1-b" "us-east4-c")
 REPO_URL="https://github.com/dylannpaterson/castor.git"
-BRANCH="main"
+BRANCH="model-v2-fpn"
 
 # Stage index (defaults to 0: Gaussian Pre-training)
 STAGE=${2:-0}
@@ -97,14 +97,8 @@ EOF
         
         export PYTHONPATH=\$PYTHONPATH:.
         export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
-        # 1. Pregenerate data for this specific stage (if needed)
-        echo "Checking data for Stage $STAGE (Logging to pregen.log)..."
-        if [ "$STAGE" == "0" ]; then
-            python3 scripts/generate_mosaics.py --num 10 >> pregen.log 2>&1
-        else
-            python3 scripts/pregenerate_data.py $STAGE >> pregen.log 2>&1
-        fi
+        export LD_LIBRARY_PATH=\$LD_LIBRARY_PATH:/usr/local/cuda-12.8/extras/CUPTI/lib64:/usr/local/cuda-12.8/lib64
+        export TF_CPP_MIN_LOG_LEVEL=2
 
         # 2. Launch Training for this specific stage
         echo "Launching Training for Stage $STAGE..."

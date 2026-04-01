@@ -10,10 +10,10 @@ echo "--- Starting Cloud Environment Setup ---"
 sudo apt-get update && sudo apt-get install -y htop nvtop screen
 
 # 2. Install Python Dependencies
-echo "Installing Python dependencies..."
-# scipy is required for Hungarian matching in evaluate.py
+echo "Installing Python dependencies and 'castor' package..."
 pip install --upgrade pip
-pip install scipy matplotlib numpy torch torchvision astropy
+# This will install all dependencies from pyproject.toml
+pip install . --extra-index-url https://download.pytorch.org/whl/cu124
 
 # 3. Verify GPU Availability (Crucial for Cloud runs)
 echo "Checking for NVIDIA GPU..."

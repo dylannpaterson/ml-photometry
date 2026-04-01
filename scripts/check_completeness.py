@@ -2,8 +2,8 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import os
-from src.data.stage0_gaussian import GaussianPretrainingProvider
-from src.cloud.config_utils import load_config
+from castor.data.stage0_gaussian import GaussianPretrainingProvider
+from castor.cloud.config_utils import load_config
 
 def check_completeness(config_path="config/local_fast.yaml"):
     config = load_config(config_path)

@@ -1,21 +1,25 @@
 run_config:
   resume_from_checkpoint: false
-  force_regenerate_data: true
+  force_regenerate_data: false
 
 curriculum:
   stage0:
     name: "Debug Stage"
     data_dir: "data/debug"
-    epochs: 2
-    batch_size: 2
+    epochs: 10
+    batch_size: 4
     learning_rate: 0.001
     resume_from_last_stage: false
+    mosaic_params:
+      num_mosaics: 5
+      mosaic_size: 4088
 
 data_params:
-  num_train_samples: 10
-  num_val_samples: 4
-  min_stars: 10
-  max_stars: 50
+  num_train_samples: 200
+  num_val_samples: 40
+  min_stars: 20
+  max_stars: 100
   image_size: 256
   max_capacity_per_cell: 3
   shape_size: 7
+  GLOBAL_STRETCH_SCALE: 10.0

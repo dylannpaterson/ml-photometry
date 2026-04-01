@@ -2,7 +2,7 @@ import torch
 import matplotlib.pyplot as plt
 import numpy as np
 import os
-from src.data.dataset import PregeneratedDataset
+from castor.data.dataset import PregeneratedDataset
 from matplotlib.colors import LogNorm
 
 def visualize_sample(data_dir, sample_idx=0, output_path="sample_visualization.png"):

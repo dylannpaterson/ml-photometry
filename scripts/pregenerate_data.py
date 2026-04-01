@@ -3,9 +3,10 @@ import os
 import torch
 from tqdm import tqdm
 from multiprocessing import Pool
-from src.data.stage0_gaussian import GaussianPretrainingProvider
-from src.cloud.config_utils import load_config
+from castor.data.stage0_gaussian import GaussianPretrainingProvider
+from castor.cloud.config_utils import load_config
 import shutil
+from castor.constants import MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE
 
 def generate_and_save_sample(args):
     """Worker function to generate a single sample and save it."""
@@ -55,8 +56,9 @@ def main():
         "min_stars": data_cfg["min_stars"],
         "max_stars": data_cfg["max_stars"],
         "image_size": data_cfg["image_size"],
-        "max_capacity_per_cell": data_cfg["max_capacity_per_cell"],
-        "shape_size": data_cfg.get("shape_size", 7)
+        "max_capacity_per_cell": data_cfg.get("max_capacity_per_cell", MAX_CAPACITY_PER_CELL),
+        "shape_size": data_cfg.get("shape_size", SHAPE_SIZE),
+        "global_stretch_scale": data_cfg.get("GLOBAL_STRETCH_SCALE", GLOBAL_STRETCH_SCALE)
     }
     
     num_cpus = os.cpu_count() or 4

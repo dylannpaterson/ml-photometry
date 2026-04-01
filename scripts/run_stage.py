@@ -3,15 +3,17 @@ import torch
 import numpy as np
 import os
 import sys
-from src.cloud.config_utils import load_config
-from src.models.dense_grid import DenseGridModel
-from src.data.dataset import PregeneratedDataset
-from src.engine.trainer import Trainer
-from src.engine.evaluator import Evaluator
+import shutil
+from castor.cloud.config_utils import load_config
+from castor.models.dense_grid import DenseGridModel
+from castor.data.dataset import PregeneratedDataset
+from castor.engine.trainer import Trainer
+from castor.engine.evaluator import Evaluator
 # Removed top-level InferenceEngine import
-from src.engine.analyzer import ThresholdAnalyzer
-from src.data.stage0_gaussian import GaussianPretrainingProvider
+from castor.engine.analyzer import ThresholdAnalyzer
+from castor.data.stage0_gaussian import GaussianPretrainingProvider
 from torch.utils.data import DataLoader
+from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE
 
 def get_stage_config(config, stage_idx):
     """Extracts configuration for a specific curriculum stage."""
@@ -28,20 +30,56 @@ def load_stage_model(stage_idx, device, config, checkpoint_path=None):
         
     if not os.path.exists(checkpoint_path):
         print(f"❌ Error: Model checkpoint not found at {checkpoint_path}")
-        return None
+        return None, None
     
     data_cfg = config["data_params"]
     stage_key = f"stage{stage_idx}"
     stage_cfg = config["curriculum"].get(stage_key, {})
     
-    K = data_cfg["max_capacity_per_cell"]
-    S = data_cfg["shape_size"]
-    # Get cell_size from stage config, default to 4
-    cell_size = stage_cfg.get("cell_size", 4)
+    K = data_cfg.get("max_capacity_per_cell", MAX_CAPACITY_PER_CELL)
+    S = data_cfg.get("shape_size", SHAPE_SIZE)
+    # Get cell_size from stage config, default to DEFAULT_CELL_SIZE
+    cell_size = stage_cfg.get("cell_size", DEFAULT_CELL_SIZE)
     
     model = DenseGridModel(K=K, shape_size=S, cell_size=cell_size).to(device)
-    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-    return model
+    
+    # Handle full checkpoint dict or raw state dict
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    psf_library = None
+    if isinstance(ckpt, dict):
+        if 'model_state_dict' in ckpt:
+            model.load_state_dict(ckpt['model_state_dict'])
+        else:
+            model.load_state_dict(ckpt)
+        
+        # Capture psf_library if it exists
+        if 'psf_library' in ckpt:
+            psf_library = ckpt['psf_library']
+    else:
+        model.load_state_dict(ckpt)
+        
+    return model, psf_library
+
+def ensure_stage0_data(stage_cfg, data_cfg, config_path):
+    """Checks for HDF5 data and generates a small amount if missing."""
+    mosaic_dir = os.path.join(stage_cfg["data_dir"], "mosaics")
+    val_h5 = os.path.join(stage_cfg["data_dir"], "stage0_val.h5")
+    
+    if not os.path.exists(val_h5):
+        print("🔍 Local Stage 0 data not found. Triggering small-scale generation for inference/analysis...")
+        os.makedirs(mosaic_dir, exist_ok=True)
+        
+        # Generate just 2 mosaics for quick local testing
+        os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/generate_mosaics.py --num 2 --stage 0 --config {config_path}")
+        
+        # Convert to a small HDF5 (100 samples is plenty for a few inference visuals)
+        os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/convert_to_hdf5.py --data_dir {stage_cfg['data_dir']} --train_samples 100 --val_samples 100")
+        
+        if not os.path.exists(val_h5):
+            print("❌ Error: Failed to generate local data fallback.")
+            return False
+            
+    return True
 
 def run_train(stage_idx, config, device):
     print(f"--- 🚀 Curriculum Stage {stage_idx}: Training ---")
@@ -64,35 +102,71 @@ def run_train(stage_idx, config, device):
                     os.remove(os.path.join(checkpoint_dir, f))
 
     # Data Setup
-    K = data_cfg["max_capacity_per_cell"]
-    S = data_cfg["shape_size"]
-    cell_size = stage_cfg.get("cell_size", 4)
+    K = data_cfg.get("max_capacity_per_cell", MAX_CAPACITY_PER_CELL)
+    S = data_cfg.get("shape_size", SHAPE_SIZE)
+    cell_size = stage_cfg.get("cell_size", DEFAULT_CELL_SIZE)
+    stretch_scale = data_cfg.get("GLOBAL_STRETCH_SCALE", GLOBAL_STRETCH_SCALE)
 
     if stage_idx == 0:
+        train_h5 = os.path.join(stage_cfg["data_dir"], "stage0_train.h5")
+        val_h5 = os.path.join(stage_cfg["data_dir"], "stage0_val.h5")
         mosaic_dir = os.path.join(stage_cfg["data_dir"], "mosaics")
-        if force_gen or not os.path.exists(mosaic_dir) or not os.listdir(mosaic_dir):
-            print("🛠️ Generating Mosaics for Stage 0...")
-            cfg_path = config.get("config_path", "config/config.yaml")
-            # Extract num_mosaics from config if available
-            mos_cfg = stage_cfg.get("mosaic_params", {"num_mosaics": 5})
-            num_mos = mos_cfg.get("num_mosaics", 5)
-            # Use the correct config file path
-            os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/generate_mosaics.py --num {num_mos} --stage {stage_idx} --config {cfg_path}")
+        
+        # 1. Check if we actually NEED to generate anything
+        needs_gen = force_gen or not os.path.exists(train_h5) or not os.path.exists(val_h5)
+        
+        if needs_gen:
+            # Only generate raw mosaics if they don't already exist
+            if force_gen or not os.path.exists(mosaic_dir) or not os.listdir(mosaic_dir):
+                print("🛠️ Generating Mosaics for Stage 0...")
+                cfg_path = config.get("config_path", "config/config.yaml")
+                mos_cfg = stage_cfg.get("mosaic_params", {"num_mosaics": 5})
+                num_mos = mos_cfg.get("num_mosaics", 5)
+                os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/generate_mosaics.py --num {num_mos} --stage {stage_idx} --config {cfg_path}")
+            
+            print(f"🛠️ HDF5 dataset conversion triggered (force_gen={force_gen})...")
+            # Clear old ones if force_gen is true to avoid h5py append/overlap confusion
+            if force_gen:
+                if os.path.exists(train_h5): os.remove(train_h5)
+                if os.path.exists(val_h5): os.remove(val_h5)
+            
+            # The conversion script now handles incremental cleanup of raw files
+            ret = os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/convert_to_hdf5.py --data_dir {stage_cfg['data_dir']} --train_samples {data_cfg['num_train_samples']} --val_samples {data_cfg['num_val_samples']}")
+            
+            # Final cleanup of the directory itself if it exists
+            if ret == 0 and os.path.exists(mosaic_dir):
+                print(f"🧹 Final cleanup of raw mosaic directory: {mosaic_dir}")
+                shutil.rmtree(mosaic_dir)
 
-        from src.data.stage0_gaussian import GaussianMosaicDataset
-        print("🛠️ Using Mosaic Sampling for high-speed training & validation...")
-        train_dataset = GaussianMosaicDataset(
+        from castor.data.stage0_gaussian import HDF5MosaicDataset
+        print(f"🛠️ Using HDF5 Dataset: {train_h5}")
+        train_dataset = HDF5MosaicDataset(train_h5)
+        val_dataset = HDF5MosaicDataset(val_h5)
+    elif stage_idx == 1:
+        # NEW: Stage 1 Multi-Telescope Foundation Dataset (Macro-Sparse)
+        from castor.data.stage1_dataset import Stage1MacroSparseDataset
+        mosaic_dir = "data/stage1_mosaics"
+        
+        if force_gen or not os.path.exists(mosaic_dir) or not os.listdir(mosaic_dir):
+            print("🛠️ Generating Stage 1 High-Fidelity Mosaics...")
+            os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/generate_stage1_mosaics.py")
+
+        print("🛠️ Using Stage 1 Macro-Sparse Pipeline (Cached Physics, Live Noise)...")
+        train_dataset = Stage1MacroSparseDataset(
             mosaic_dir,
             num_samples=data_cfg["num_train_samples"],
             image_size=data_cfg["image_size"],
-            cell_size=cell_size
+            cell_size=cell_size,
+            K=K,
+            global_stretch_scale=stretch_scale
         )
-        # Use the same mosaics for validation but with a fixed sample count
-        val_dataset = GaussianMosaicDataset(
+        val_dataset = Stage1MacroSparseDataset(
             mosaic_dir,
             num_samples=data_cfg["num_val_samples"],
             image_size=data_cfg["image_size"],
-            cell_size=cell_size
+            cell_size=cell_size,
+            K=K,
+            global_stretch_scale=stretch_scale
         )
     else:
         data_dir = stage_cfg["data_dir"]
@@ -109,8 +183,31 @@ def run_train(stage_idx, config, device):
     
     batch_size = stage_cfg["batch_size"]
     num_workers = stage_cfg.get("num_workers", 0)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    
+    # Enable hardware optimizations if multiple workers are used
+    use_optimizations = num_workers > 0
+    prefetch_factor = (4 if stage_idx == 0 else 2) if use_optimizations else None
+    
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=num_workers,
+        pin_memory=use_optimizations,
+        persistent_workers=use_optimizations,
+        prefetch_factor=prefetch_factor,
+        drop_last=True
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=num_workers,
+        pin_memory=use_optimizations,
+        persistent_workers=use_optimizations,
+        prefetch_factor=prefetch_factor,
+        drop_last=True
+    )
 
     # Model Setup
     model = DenseGridModel(K=K, shape_size=S, cell_size=cell_size).to(device)
@@ -135,15 +232,34 @@ def run_train(stage_idx, config, device):
     elif resume_from_ckpt:
         trainer.resume()
         
-    trainer.train()
+    if os.environ.get("PROFILE") == "1":
+        import cProfile, pstats
+        print("📊 Profiling training run...")
+        profiler = cProfile.Profile()
+        profiler.enable()
+        trainer.train()
+        profiler.disable()
+        stats = pstats.Stats(profiler).sort_stats('tottime')
+        stats.print_stats(50)
+        stats.dump_stats("profile_results.prof")
+        print("✅ Profiling complete. Results saved to profile_results.prof")
+    else:
+        trainer.train()
     print(f"✅ Stage {stage_idx} complete.")
 
 def run_eval(stage_idx, config, device, checkpoint=None):
     print(f"--- 📊 Curriculum Stage {stage_idx}: Evaluation ---")
-    model = load_stage_model(stage_idx, device, config, checkpoint)
+    model, _ = load_stage_model(stage_idx, device, config, checkpoint)
     if not model: return
 
     if stage_idx == 0:
+        # Ensure data exists (Stage 0 only for now)
+        stage_cfg = config["curriculum"]["stage0"]
+        data_cfg = config["data_params"]
+        config_path = config.get("config_path", "config/config.yaml")
+        if not ensure_stage0_data(stage_cfg, data_cfg, config_path):
+            return
+            
         evaluator = Evaluator(model, device, config)
         # Increased to 500 chunks for better statistical stability
         evaluator.run_evaluation(num_chunks=500)
@@ -151,47 +267,94 @@ def run_eval(stage_idx, config, device, checkpoint=None):
         print(f"⚠️ Specialized evaluator for stage {stage_idx} not yet implemented.")
 
 def run_infer(stage_idx, config, device, checkpoint=None):
-    from src.engine.evaluator import match_stars
-    from src.engine.inference import InferenceEngine
+    from castor.engine.evaluator import match_stars
+    from castor.engine.inference import InferenceEngine
     print(f"--- 🛰️ Curriculum Stage {stage_idx}: Inference ---")
-    model = load_stage_model(stage_idx, device, config, checkpoint)
+    model, psf_lib_ckpt = load_stage_model(stage_idx, device, config, checkpoint)
     if not model: return
 
     engine = InferenceEngine(model, device, config)
     
     # Stage-specific provider
     if stage_idx == 0:
+        from castor.data.stage0_gaussian import HDF5MosaicDataset
         data_cfg = config["data_params"]
-        provider = GaussianPretrainingProvider(
-            min_stars=data_cfg["min_stars"],
-            max_stars=data_cfg["max_stars"],
-            image_size=data_cfg["image_size"],
-            max_capacity_per_cell=data_cfg["max_capacity_per_cell"],
-            shape_size=data_cfg["shape_size"]
-        )
+        stage_cfg = config["curriculum"]["stage0"]
+        config_path = config.get("config_path", "config/config.yaml")
         
-        # generate_chunk now returns a sparse dict
-        sparse_sample = provider.generate_chunk()
-        image_tensor = sparse_sample["image"]
-        gt_bg_map = sparse_sample["background_map"].numpy()
+        # Ensure data exists fallback
+        if not ensure_stage0_data(stage_cfg, data_cfg, config_path):
+            return
+            
+        val_h5 = os.path.join(stage_cfg["data_dir"], "stage0_val.h5")
+        dataset = HDF5MosaicDataset(val_h5)
+        import random
+        idx = random.randint(0, len(dataset) - 1)
+        sample = dataset[idx]
         
-        # Extract true stars from the target base_grid for visualization
+        image_tensor = sample["image"]
+        target = sample["target"]
+        
+        # --- PSF Basis Loading ---
+        # Priority: Checkpoint embedded library > Local .pt file > Dataset sample
+        if psf_lib_ckpt is not None:
+            print("📂 Using PSF basis embedded in model checkpoint...")
+            psf_lib = psf_lib_ckpt.squeeze(0) # [N_PCA + 1, 961]
+        elif os.path.exists("stage0_psf_basis.pt"):
+            print(f"📂 Loading PSF basis from stage0_psf_basis.pt...")
+            psf_lib = torch.load("stage0_psf_basis.pt", map_location="cpu")
+        else:
+            psf_lib = sample["psf_library"] # [N_PCA + 1, 961]
+            
+        # Extract basis and mean for reconstruction
+        # psf_lib is expected to be [N_PCA + 1, 961]
+        psf_basis = psf_lib[:-1, :]
+        mean_psf = psf_lib[-1, :]
+        # -------------------------
+        
+        # --- THE FIX: Apply Live Noise and Stretch ---
+        stretch_scale = data_cfg.get("GLOBAL_STRETCH_SCALE", 10.0)
+        
+        img_pos = torch.clamp(image_tensor, min=0.0)
+        img_noisy = torch.poisson(img_pos)
+        img_noisy += torch.randn_like(img_noisy) * 5.0  # Read noise
+        
+        # Calculate the median of the NOISY image to center the stretch
+        noisy_median = img_noisy.median().item()
+        
+        # Apply the Arcsinh stretch (Network Space)
+        img_stretched = torch.arcsinh((img_noisy - noisy_median) / stretch_scale)
+        # ---------------------------------------------
+        
+        # Extract true stars from the target grid for visualization
         true_stars = []
-        target_grid = sparse_sample["base_grid"].numpy()
-        cell_size, grid_size = provider.cell_size, provider.grid_size
-        K = provider.K
+        cell_size = dataset.cell_size
+        grid_size = dataset.grid_size
+        K = dataset.K
+        
+        # target shape is (grid_size, grid_size, K*25 + 1)
+        target_grid = target[:, :, :-1].view(grid_size, grid_size, K, -1).numpy()
+        gt_bg_map = target[:, :, -1:].numpy()
+        
         for y in range(grid_size):
             for x in range(grid_size):
                 for k in range(K):
                     slot = target_grid[y, x, k]
-                    tp, tdx, tdy, tm, tc = slot
+                    tp = slot[0]
                     if tp == 1.0:
+                        tdx, tdy, raw_flux, tc = slot[1], slot[2], slot[3], slot[4]
                         tgx = (x * cell_size) + tdx
                         tgy = (y * cell_size) + tdy
-                        # m in target is log10(flux), convert to linear for visualize
-                        true_stars.append((tgx, tgy, 10**tm, tc))
+                        true_stars.append((tgx, tgy, float(raw_flux), tc))
         
-        predicted_stars, predicted_shapes, bg_map = engine.predict(image_tensor)
+        print(f"DEBUG: Found {len(true_stars)} true stars in the chunk.")
+        # Pass PCA reconstruction components to predict
+        # FIX: Pass raw linear noisy image, as predict() handles its own stretch
+        predicted_stars, predicted_shapes, bg_map = engine.predict(
+            img_noisy, 
+            psf_basis=psf_basis.numpy(), 
+            mean_psf=mean_psf.numpy()
+        )
         
         # DEBUG: Print normalization stats
         matches, _, _ = match_stars(true_stars, predicted_stars)
@@ -212,22 +375,28 @@ def run_infer(stage_idx, config, device, checkpoint=None):
         else:
             print("\n--- Normalization Diagnostic: No matches found ---")
             
-        engine.visualize(image_tensor, true_stars, predicted_stars, predicted_shapes, bg_map, gt_bg_map, threshold=0.5)
+        engine.visualize(img_stretched, true_stars, predicted_stars, predicted_shapes, bg_map, gt_bg_map, threshold=0.5, chunk_median=noisy_median)
     else:
         print(f"⚠️ Specialized inference for stage {stage_idx} not yet implemented.")
 
 def run_analyze(stage_idx, config, device, checkpoint=None):
     print(f"--- 📈 Curriculum Stage {stage_idx}: Threshold Analysis ---")
-    model = load_stage_model(stage_idx, device, config, checkpoint)
+    model, _ = load_stage_model(stage_idx, device, config, checkpoint)
     if not model: return
 
     if stage_idx == 0:
-        provider = GaussianPretrainingProvider(
-            min_stars=config["data_params"]["min_stars"],
-            max_stars=config["data_params"]["max_stars"],
-            image_size=config["data_params"]["image_size"]
-        )
-        analyzer = ThresholdAnalyzer(model, device, provider)
+        from castor.data.stage0_gaussian import HDF5MosaicDataset
+        stage_cfg = config["curriculum"]["stage0"]
+        data_cfg = config["data_params"]
+        config_path = config.get("config_path", "config/config.yaml")
+        
+        # Ensure data exists fallback
+        if not ensure_stage0_data(stage_cfg, data_cfg, config_path):
+            return
+            
+        val_h5 = os.path.join(stage_cfg["data_dir"], "stage0_val.h5")
+        dataset = HDF5MosaicDataset(val_h5)
+        analyzer = ThresholdAnalyzer(model, device, dataset)
         analyzer.run_analysis(num_chunks=20)
     else:
         print(f"⚠️ Specialized analysis for stage {stage_idx} not yet implemented.")
