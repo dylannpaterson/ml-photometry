@@ -202,16 +202,18 @@ def compute_grid_loss(preds, targets, psf_library=None, lambda_prob=5.0, lambda_
     if obj_mask.sum() > 0:
         pos_pred = star_preds[..., 1:3][obj_mask]
         pos_target = star_targets[..., 1:3][obj_mask]
-        pos_loss = F.mse_loss(pos_pred, pos_target, reduction='mean')
+        # Switch to Smooth L1 for robust sub-pixel localization
+        pos_loss = F.smooth_l1_loss(pos_pred, pos_target, reduction='mean')
         
         log_flux_pred = preds["raw_log_flux"][obj_mask]
         flux_target = star_targets[..., 3:4][obj_mask]
         log_flux_target = torch.log(flux_target + 1e-6)
-        flux_loss = F.mse_loss(log_flux_pred, log_flux_target, reduction='mean')
+        # Switch to Smooth L1 to prevent bright star overflow gradients
+        flux_loss = F.smooth_l1_loss(log_flux_pred, log_flux_target, reduction='mean')
         
         comp_pred = star_preds[..., 4:5][obj_mask]
         comp_target = star_targets[..., 4:5][obj_mask]
-        comp_loss = F.mse_loss(comp_pred, comp_target, reduction='mean')
+        comp_loss = F.smooth_l1_loss(comp_pred, comp_target, reduction='mean')
         
         # --- EIGEN-PSF RECONSTRUCTION LOSS ---
         # shape_weights shape: [N_obj, N_PCA]
@@ -229,11 +231,11 @@ def compute_grid_loss(preds, targets, psf_library=None, lambda_prob=5.0, lambda_
             shape_pred = ((weights_pred @ psf_basis) + mean_psf) * 100.0
             shape_target = ((weights_target @ psf_basis) + mean_psf) * 100.0
             
-            # MSE in pixel space ensures photometric consistency
-            shape_loss = F.mse_loss(shape_pred, shape_target, reduction='mean')
+            # Switch to Smooth L1 for photometric consistency across all star brightnesses
+            shape_loss = F.smooth_l1_loss(shape_pred, shape_target, reduction='mean')
         else:
             # Fallback to direct weight MSE if basis is missing
-            shape_loss = F.mse_loss(weights_pred, weights_target, reduction='mean')
+            shape_loss = F.smooth_l1_loss(weights_pred, weights_target, reduction='mean')
     else:
         pos_loss = torch.tensor(0.0, device=star_preds.device)
         flux_loss = torch.tensor(0.0, device=star_preds.device)

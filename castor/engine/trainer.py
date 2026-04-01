@@ -26,8 +26,21 @@ class Trainer:
         self.model, self.train_loader, self.val_loader = model, train_loader, val_loader
         self.config, self.device, self.checkpoint_prefix = config, device, checkpoint_prefix
         self.epochs, self.lr = epochs, lr
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=5)
+        
+        # 1. Transition to AdamW for better weight decay handling
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=1e-4)
+        
+        # 2. Transition to OneCycleLR for faster convergence and local minima escape
+        self.scheduler = optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=self.lr * 5,
+            steps_per_epoch=len(self.train_loader),
+            epochs=self.epochs,
+            pct_start=0.1, # 10% warmup
+            div_factor=25.0,
+            final_div_factor=10000.0
+        )
+        
         self.start_epoch = 0
         
         # New: Track psf_library for checkpointing
@@ -126,6 +139,9 @@ class Trainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 
+                # 4. Step scheduler per batch (Required for OneCycleLR)
+                self.scheduler.step()
+                
                 epoch_loss += loss.item()
                 
                 if i % 100 == 0:
@@ -136,7 +152,7 @@ class Trainer:
             print(f"==> Epoch {epoch+1} Complete | Avg Loss: {avg_epoch_loss:.4f} | Time: {time.time()-start_time:.1f}s")
             val_loss = self.validate(); print(f"Validation Loss: {val_loss:.4f}")
             
-            self.scheduler.step(val_loss)
+            # scheduler.step() moved to batch loop for OneCycleLR
             
             os.makedirs("checkpoints", exist_ok=True)
             # Save full checkpoint dict for easier resuming
