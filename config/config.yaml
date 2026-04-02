@@ -16,7 +16,7 @@ curriculum:
     resume_from_last_stage: false
     cell_size: 4 # Centralized default: 4
     mosaic_params:
-      num_mosaics: 1000
+      num_mosaics: 5000
       mosaic_size: 1024
 
   # Stage 1: Multi-Telescope Foundation Training (GalSim)
@@ -49,8 +49,8 @@ data_params:
   num_val_samples: 5000
   
   # Massive unified population to hit VVV background levels
-  min_stars: 500000
-  max_stars: 10000000
+  min_stars: 5000
+  max_stars: 100000
   
   image_size: 256
   

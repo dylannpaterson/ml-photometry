@@ -199,7 +199,7 @@ class GaussianPretrainingProvider(Dataset):
 
         # Rendering
         star_signal = np.zeros((self.img_size, self.img_size), dtype=np.float32)
-        monster_cutoff = min(100, int(n_stars * 0.0005))
+        monster_cutoff = min(3000, int(n_stars * 0.05))
         cx, cy, cf = x_centers[monster_cutoff:], y_centers[monster_cutoff:], fluxes[monster_cutoff:]
         x0, y0 = np.floor(cx).astype(int), np.floor(cy).astype(int)
         phase_x = np.clip(np.floor((cx - x0) * self.n_sub).astype(int), 0, self.n_sub - 1)
