@@ -85,15 +85,8 @@ class Evaluator:
         self.model.eval()
         
         all_tp, all_fp, all_fn = 0, 0, 0
-        pos_errors, ratios, comp_errors = [], [], []
-        matched_completeness = []
-        missed_completeness = []
+        pos_errors, ratios = [], []
         
-        # Bin recall by completeness (as a proxy for SNR)
-        comp_bins = np.linspace(0, 1, 6)
-        comp_tp = np.zeros(len(comp_bins)-1)
-        comp_total = np.zeros(len(comp_bins)-1)
-
         # Stage-specific data generation
         if self.stage_idx == 0:
             from castor.data.stage0_gaussian import HDF5MosaicDataset
@@ -140,7 +133,7 @@ class Evaluator:
                 grid_h, grid_w = target_grid.shape[:2]
                 K = self.K
                 
-                # Target in HDF5 is (grid_size, grid_size, K * (5 + N_PCA) + 1)
+                # Target in HDF5 is (grid_size, grid_size, K * (4 + N_PCA) + 1)
                 target_reshaped = target_grid[..., :-1].view(grid_h, grid_w, K, -1).numpy()
                 
                 cell_size = dataset.cell_size
@@ -148,10 +141,10 @@ class Evaluator:
                     for x in range(grid_w):
                         for k in range(K):
                             slot = target_reshaped[y, x, k]
-                            tp, tdx, tdy, raw_flux_target, tc = slot[:5]
-                            if tp == 1.0:
-                                star_info = ((x * cell_size) + tdx, (y * cell_size) + tdy, float(raw_flux_target), tc)
-                                # REMOVED: Redundant tc > 0.5 check (generator already filters these)
+                            tp, tdx, tdy, raw_flux_target = slot[:4]
+                            # NEW: For evaluation, we only consider stars with high SNR labels as targets
+                            if tp > 0.5:
+                                star_info = ((x * cell_size) + tdx, (y * cell_size) + tdy, float(raw_flux_target))
                                 true_stars.append(star_info)
                 
                 # Extract Predicted Stars (p > threshold)
@@ -159,9 +152,9 @@ class Evaluator:
                 for y in range(grid_h):
                     for x in range(grid_w):
                         for k in range(K):
-                            p, dx, dy, physical_flux_pred, c = prediction[y, x, k, :5]
+                            p, dx, dy, physical_flux_pred = prediction[y, x, k, :4]
                             if p > threshold:
-                                pred_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, float(physical_flux_pred), c, p))
+                                pred_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, float(physical_flux_pred), p))
                 
                 matches, unmatched_true, unmatched_pred = match_stars(true_stars, pred_stars, distance_threshold=2.0)
                 
@@ -169,39 +162,20 @@ class Evaluator:
                 all_fp += len(unmatched_pred)
                 all_fn += len(unmatched_true)
 
-                matched_true_indices = [m[0] for m in matches]
-                for j, star in enumerate(true_stars):
-                    comp = star[3]
-                    if j in matched_true_indices:
-                        matched_completeness.append(comp)
-                    else:
-                        missed_completeness.append(comp)
-
-                    for b in range(len(comp_bins)-1):
-                        if comp_bins[b] <= comp <= comp_bins[b+1]:
-                            comp_total[b] += 1
-                            if j in matched_true_indices:
-                                comp_tp[b] += 1
-                            break
-
                 for t_idx, p_idx, cost in matches:
                     dist = np.sqrt(np.sum((np.array(true_stars[t_idx][:2]) - np.array(pred_stars[p_idx][:2]))**2))
                     pos_errors.append(dist)
                     
                     t_flux = true_stars[t_idx][2]
                     p_flux = pred_stars[p_idx][2]
-                    t_comp = true_stars[t_idx][3]
-                    p_comp = pred_stars[p_idx][3]
                     
                     ratios.append(p_flux / (t_flux + 1e-9))
-                    comp_errors.append(abs(p_comp - t_comp))
                     
         precision = all_tp / (all_tp + all_fp) if (all_tp + all_fp) > 0 else 0
         recall = all_tp / (all_tp + all_fn) if (all_tp + all_fn) > 0 else 0
         rmse = np.sqrt(np.mean(np.array(pos_errors)**2)) if pos_errors else 1.0
         flux_accuracy = np.median(ratios) if ratios else 0
         flux_scatter = np.std(ratios) if ratios else 0
-        comp_mae = np.mean(comp_errors) if comp_errors else 1.0
 
         print("\n=============================================")
         print(" STAGE 0 ACCEPTANCE CRITERIA CHECK")
@@ -211,15 +185,7 @@ class Evaluator:
         self._print_metric("Positional RMSE", rmse, 0.15, reverse=True)
         self._print_metric("Flux Ratio Accuracy", flux_accuracy, 0.95)
         self._print_metric("Flux Scatter (StdDev)", flux_scatter, 0.10, reverse=True)
-        self._print_metric("Completeness MAE", comp_mae, 0.10, reverse=True)
         print("---------------------------------------------")
-        print(f"📊 Avg Completeness (Detected):   {np.mean(matched_completeness) if matched_completeness else 0:.4f}")
-        print(f"📊 Avg Completeness (Missed):     {np.mean(missed_completeness) if missed_completeness else 0:.4f}")
-        print("---------------------------------------------")
-        print("📈 Recall vs. Completeness (SNR Proxy):")
-        for b in range(len(comp_bins)-1):
-            b_recall = comp_tp[b] / comp_total[b] if comp_total[b] > 0 else 0
-            print(f"   Bin {comp_bins[b]:.1f}-{comp_bins[b+1]:.1f}:   {b_recall:.4f} ({int(comp_tp[b])}/{int(comp_total[b])})")
         
         if recall > 0.9 and precision > 0.9:
             print("\n✅ MODEL IS LOOKING GOOD!")

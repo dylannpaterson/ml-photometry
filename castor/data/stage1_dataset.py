@@ -107,9 +107,8 @@ class Stage1MacroSparseDataset(Dataset):
         local_stars['ly'] = local_stars['y'] - py
         
         # 9. Build Target Grid
-        # NEW: Shape size is now determined by model constants
-        # In this dataset, we use 81 (9x9) which matches SHAPE_SIZE=9 in constants
-        grid_stars = torch.zeros((self.grid_size, self.grid_size, self.K, 5 + 81), dtype=torch.float32)
+        # NEW: Shape size is 81 (9x9) to match generate_stage1_mosaics.py
+        grid_stars = torch.zeros((self.grid_size, self.grid_size, self.K, 4 + 81), dtype=torch.float32)
         
         # Assign to slots (Brightest-to-Faint)
         cell_assignments = {}
@@ -127,17 +126,22 @@ class Stage1MacroSparseDataset(Dataset):
             for slot in range(min(self.K, len(sorted_stars))):
                 star = sorted_stars[slot]
                 
-                # Dynamic Completeness Calculation (Penalized SNR)
+                # Physical SNR
                 snr = star['flux'] / np.sqrt(star['flux'] + sky_level + params['read_noise']**2)
-                completeness = 1.0 / (1.0 + np.exp(-2.0 * (snr - 5.0)))
                 
-                # [p, dx, dy, flux, c, shape...]
-                grid_stars[cy, cx, slot, 0] = 1.0 # p
+                # SNR-based Soft Label for Objectness (Sigmoid Curve)
+                k = 2.0
+                center = 3.0
+                target_p = 1.0 / (1.0 + np.exp(-k * (snr - center)))
+                if snr >= 5.0: target_p = 1.0
+                if snr <= 1.0: target_p = 0.0
+                
+                # [p, dx, dy, flux, shape...]
+                grid_stars[cy, cx, slot, 0] = float(target_p)
                 grid_stars[cy, cx, slot, 1] = float(star['lx'] % self.cell_size) # dx
                 grid_stars[cy, cx, slot, 2] = float(star['ly'] % self.cell_size) # dy
                 grid_stars[cy, cx, slot, 3] = float(star['flux'])
-                grid_stars[cy, cx, slot, 4] = float(completeness)
-                grid_stars[cy, cx, slot, 5:] = torch.from_numpy(star['shape'].copy())
+                grid_stars[cy, cx, slot, 4:] = torch.from_numpy(star['shape'].copy())
 
         # 10. Background Target
         bg_target_linear = sky_level - chunk_median

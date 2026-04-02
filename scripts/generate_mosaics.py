@@ -167,9 +167,10 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
         psf_indices = all_psf_indices[v_mask]
 
     # 2. Save Catalog as Structured NumPy
+    # Structured Catalog
     cat_dtype = [
         ('x', 'f4'), ('y', 'f4'), ('flux', 'f4'), ('mag', 'f4'),
-        ('snr', 'f4'), ('comp', 'f4')
+        ('snr', 'f4')
     ]
     # Add PCA weights to the dtype as float16 to save space
     for i in range(N_PCA_COMPONENTS):
@@ -185,8 +186,8 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     for i in range(N_PCA_COMPONENTS):
         structured_cat[f'w{i}'] = weights_v[:, i]
 
-    # --- PRE-CALCULATE SNR and COMP (Moved from DataLoader) ---
-    print(f"Pre-calculating SNR and Completeness for {n_visible:,} stars...")
+    # --- PRE-CALCULATE SNR (Moved from DataLoader) ---
+    print(f"Pre-calculating SNR for {n_visible:,} stars...")
     pixel_scale = 0.11
     sigma_fixed = 1.5
     n_pix = 4 * np.pi * (sigma_fixed ** 2)
@@ -204,26 +205,6 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     noise_variance = flux_v + n_pix * (sky_level + local_background + 25.0) # read_noise=5.0
     snrs = flux_v / np.sqrt(np.maximum(1.0, noise_variance))
     structured_cat['snr'] = snrs
-    
-    # Global Spline Fitting for Completeness
-    survived = snrs >= min_snr
-    if len(mag_v) < 10 or mag_v.min() >= mag_v.max() - 1e-3:
-        comps = survived.astype(np.float32)
-    else:
-        m_min, m_max = mag_v.min(), mag_v.max()
-        bins = np.linspace(m_min, m_max, 25)
-        counts_total, _ = np.histogram(mag_v, bins=bins)
-        counts_survived, _ = np.histogram(mag_v[survived], bins=bins)
-        
-        valid = counts_total > 0
-        if valid.sum() < 4:
-            comps = survived.astype(np.float32)
-        else:
-            bin_comp = counts_survived[valid] / (counts_total[valid] + 1e-9)
-            bin_centers = ((bins[:-1] + bins[1:]) / 2)[valid]
-            comps = np.interp(mag_v, bin_centers, bin_comp, left=1.0, right=0.0).astype(np.float32)
-    
-    structured_cat['comp'] = comps
 
     # NEW: Pre-sort the catalog by Y-coordinate so the dataloader doesn't have to
     print("Sorting catalog for fast spatial queries...")

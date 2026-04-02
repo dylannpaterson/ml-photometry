@@ -341,13 +341,15 @@ def run_infer(stage_idx, config, device, checkpoint=None):
                 for k in range(K):
                     slot = target_grid[y, x, k]
                     tp = slot[0]
-                    if tp == 1.0:
-                        tdx, tdy, raw_flux, tc = slot[1], slot[2], slot[3], slot[4]
+                    # NEW: For visualization, we keep stars with visible labels
+                    if tp > 0.0:
+                        tdx, tdy, raw_flux = slot[1], slot[2], slot[3]
                         tgx = (x * cell_size) + tdx
                         tgy = (y * cell_size) + tdy
-                        true_stars.append((tgx, tgy, float(raw_flux), tc))
+                        # [p, dx, dy, flux]
+                        true_stars.append((tp, tgx, tgy, float(raw_flux)))
         
-        print(f"DEBUG: Found {len(true_stars)} true stars in the chunk.")
+        print(f"DEBUG: Found {len(true_stars)} stars with non-zero objectness labels in the chunk.")
         # Pass PCA reconstruction components to predict
         # FIX: Pass raw linear noisy image, as predict() handles its own stretch
         predicted_stars, predicted_shapes, bg_map = engine.predict(
@@ -357,7 +359,11 @@ def run_infer(stage_idx, config, device, checkpoint=None):
         )
         
         # DEBUG: Print normalization stats
-        matches, _, _ = match_stars(true_stars, predicted_stars)
+        # Note: predicted_stars elements are (x, y, flux, p)
+        # match_stars expects (x, y, flux) for matching
+        match_true = [(s[1], s[2], s[3]) for s in true_stars]
+        match_pred = [(s[0], s[1], s[2]) for s in predicted_stars]
+        matches, _, _ = match_stars(match_true, match_pred)
         if matches:
             ratios = []
             print("\n--- Normalization Diagnostic ---")

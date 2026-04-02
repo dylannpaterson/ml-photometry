@@ -82,7 +82,7 @@ class DenseGridModel(nn.Module):
         # CHANGED: Now predict PCA weights instead of independent pixels
         self.S2 = N_PCA_COMPONENTS 
         self.cell_size = float(cell_size)
-        self.num_output_channels = self.K * (5 + self.S2) + 1
+        self.num_output_channels = self.K * (4 + self.S2) + 1
 
         # 1. Physics Prior Filter
         self.diffraction_filter = DiffractionAwareFilter(kernel_size=21)
@@ -138,7 +138,7 @@ class DenseGridModel(nn.Module):
         star_out = out[:, :-1, :, :]
         bg_out = out[:, -1:, :, :]
         
-        star_out = star_out.view(B, self.K, 5 + self.S2, H, W)
+        star_out = star_out.view(B, self.K, 4 + self.S2, H, W)
         star_out = star_out.permute(0, 3, 4, 1, 2)
         
         # --- THE LOGIT BYPASS ---
@@ -156,22 +156,20 @@ class DenseGridModel(nn.Module):
         # FIX: Force float32 evaluation to prevent FP16 overflow on bright stars
         flux = torch.exp(raw_log_flux.float())
         
-        c = torch.sigmoid(star_out[..., 4:5])
-        
         # CHANGED: Shape weights are linear (Eigen-PSF weights)
-        shape_weights = star_out[..., 5:]
+        shape_weights = star_out[..., 4:]
         
         # Background residuals can be negative
         bg = bg_out.permute(0, 2, 3, 1)
         
         return {
-            "stars": torch.cat([p, dx, dy, flux, c, shape_weights], dim=-1),
+            "stars": torch.cat([p, dx, dy, flux, shape_weights], dim=-1),
             "p_logits": p_logits, # NEW: Pass raw logits to the loss function
             "raw_log_flux": raw_log_flux, # Logit Bypass
             "background": bg
         }
 
-def compute_grid_loss(preds, targets, psf_library=None, lambda_prob=5.0, lambda_pos=50.0, lambda_flux=5.0, lambda_comp=1.0, lambda_shape=1.0, lambda_bg=0.1, focal_alpha=0.75, focal_gamma=2.0, stretch_scale=GLOBAL_STRETCH_SCALE):
+def compute_grid_loss(preds, targets, psf_library=None, lambda_prob=5.0, lambda_pos=50.0, lambda_flux=5.0, lambda_shape=1.0, lambda_bg=0.1, focal_alpha=0.75, focal_gamma=2.0, stretch_scale=GLOBAL_STRETCH_SCALE):
     """
     Eigen-PSF Loss: Reconstructs high-fidelity 31x31 shapes from predicted weights
     and calculates MSE in pixel space for maximum photometry accuracy.
@@ -180,27 +178,33 @@ def compute_grid_loss(preds, targets, psf_library=None, lambda_prob=5.0, lambda_
     bg_preds = preds["background"]
     
     # 1. Unpack Target Grid
-    # C_target = K * (5 + N_PCA) + 1
+    # C_target = K * (4 + N_PCA) + 1
     B, H, W, C_target = targets.shape
     bg_targets = targets[..., -1:]
     star_targets_flat = targets[..., :-1]
     
     K = MAX_CAPACITY_PER_CELL
-    # Each star has 5 base params (p, dx, dy, flux, c) + N_PCA weights
+    # Each star has 4 base params (p, dx, dy, flux) + N_PCA weights
     star_targets = star_targets_flat.view(B, H, W, K, -1)
     
-    obj_mask = star_targets[..., 0] == 1.0
+    # NEW: Object mask uses target p > 0 (Soft Labels)
+    obj_mask = star_targets[..., 0] > 0.0
     
     # 2. Probability Loss (p) with Faint Star Boosting
     p_pred_probs = torch.clamp(star_preds[..., 0], 1e-7, 1.0 - 1e-7)
     p_pred_logits = preds["p_logits"].squeeze(-1) # Get the raw logits
     p_target = star_targets[..., 0]
     
+    # Binary Cross Entropy with Soft Labels (Logit Space)
     bce_loss = F.binary_cross_entropy_with_logits(p_pred_logits, p_target, reduction='none')
     
     p_t = p_pred_probs * p_target + (1 - p_pred_probs) * (1 - p_target)
     focal_weight = (1 - p_t) ** focal_gamma
-    alpha_t = focal_alpha * p_target + (1 - focal_alpha) * (1 - p_target)
+    
+    # NEW: Alpha balancing for soft labels
+    # We use a threshold to determine "positive" for alpha weighting purposes
+    is_pos = (p_target > 0.5).float()
+    alpha_t = focal_alpha * is_pos + (1 - focal_alpha) * (1 - is_pos)
     
     with torch.no_grad():
         raw_flux_target = star_targets[..., 3]
@@ -223,14 +227,10 @@ def compute_grid_loss(preds, targets, psf_library=None, lambda_prob=5.0, lambda_
         # Switch to Smooth L1 to prevent bright star overflow gradients
         flux_loss = F.smooth_l1_loss(log_flux_pred, log_flux_target, reduction='mean')
         
-        comp_pred = star_preds[..., 4:5][obj_mask]
-        comp_target = star_targets[..., 4:5][obj_mask]
-        comp_loss = F.smooth_l1_loss(comp_pred, comp_target, reduction='mean')
-        
         # --- EIGEN-PSF RECONSTRUCTION LOSS ---
         # shape_weights shape: [N_obj, N_PCA]
-        weights_pred = star_preds[..., 5:][obj_mask]
-        weights_target = star_targets[..., 5:][obj_mask]
+        weights_pred = star_preds[..., 4:][obj_mask]
+        weights_target = star_targets[..., 4:][obj_mask]
         
         if psf_library is not None:
             # psf_library shape: [Batch, N_PCA + 1, 961]
@@ -251,7 +251,6 @@ def compute_grid_loss(preds, targets, psf_library=None, lambda_prob=5.0, lambda_
     else:
         pos_loss = torch.tensor(0.0, device=star_preds.device)
         flux_loss = torch.tensor(0.0, device=star_preds.device)
-        comp_loss = torch.tensor(0.0, device=star_preds.device)
         shape_loss = torch.tensor(0.0, device=star_preds.device)
         
     # 4. Background Loss (Global MSE)
@@ -260,7 +259,6 @@ def compute_grid_loss(preds, targets, psf_library=None, lambda_prob=5.0, lambda_
     total_loss = (lambda_prob * prob_loss + 
                   lambda_pos * pos_loss + 
                   lambda_flux * flux_loss +
-                  lambda_comp * comp_loss +
                   lambda_shape * shape_loss + 
                   lambda_bg * bg_loss)
                   

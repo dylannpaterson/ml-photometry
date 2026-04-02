@@ -19,17 +19,26 @@ except ImportError:
     galsim = None
 
 @njit(boundscheck=False)
-def fast_paint_grid(lx, ly, fluxes, snrs, comps, psf_weights, sort_idx, min_snr, grid_size, cell_size, K):
-    # Size is now exactly 5 + N_PCA (Existence, dx, dy, flux, comp, weights...)
+def fast_paint_grid(lx, ly, fluxes, snrs, psf_weights, sort_idx, min_snr, grid_size, cell_size, K):
+    # Size is now exactly 4 + N_PCA (Existence, dx, dy, flux, weights...)
     N_PCA = psf_weights.shape[1]
-    grid_stars = np.zeros((grid_size, grid_size, K, 5 + N_PCA), dtype=np.float32)
+    grid_stars = np.zeros((grid_size, grid_size, K, 4 + N_PCA), dtype=np.float32)
     counts = np.zeros((grid_size, grid_size), dtype=np.int32)
     
     for idx in range(len(sort_idx)):
         i = sort_idx[idx]
         
-        # 1. Early Exit: Skip target labels for faint stars immediately
-        if snrs[i] < min_snr:
+        # SNR-based Soft Label for Objectness (Sigmoid Curve)
+        # Using the same logic as in stage1_dataset.py
+        k = 2.0
+        center = 3.0
+        snr = snrs[i]
+        target_p = 1.0 / (1.0 + np.exp(-k * (snr - center)))
+        if snr >= 5.0: target_p = 1.0
+        if snr <= 1.0: target_p = 0.0
+
+        # Early Exit: Skip target labels for very faint stars
+        if target_p <= 0.0:
             continue
             
         cx = int(lx[i] // cell_size)
@@ -38,14 +47,13 @@ def fast_paint_grid(lx, ly, fluxes, snrs, comps, psf_weights, sort_idx, min_snr,
         if 0 <= cx < grid_size and 0 <= cy < grid_size:
             slot = counts[cy, cx]
             if slot < K:
-                grid_stars[cy, cx, slot, 0] = 1.0
+                grid_stars[cy, cx, slot, 0] = target_p
                 grid_stars[cy, cx, slot, 1] = lx[i] % cell_size
                 grid_stars[cy, cx, slot, 2] = ly[i] % cell_size
                 grid_stars[cy, cx, slot, 3] = fluxes[i]
-                grid_stars[cy, cx, slot, 4] = comps[i]
                 # Store PCA weights directly in the target
                 for w_idx in range(N_PCA):
-                    grid_stars[cy, cx, slot, 5 + w_idx] = psf_weights[i, w_idx]
+                    grid_stars[cy, cx, slot, 4 + w_idx] = psf_weights[i, w_idx]
                 counts[cy, cx] += 1
                 
     return grid_stars
@@ -232,26 +240,9 @@ class GaussianPretrainingProvider(Dataset):
         noise_variance = fluxes + self.n_pix * (sky_level + local_background + self.read_noise**2)
         snrs = fluxes / np.sqrt(noise_variance)
 
-        # --- Probabilistic Completeness ---
-        survived = snrs >= self.min_snr
-        if len(mags) < 10 or mags.min() >= mags.max() - 1e-3:
-            comps = survived.astype(np.float32)
-        else:
-            m_min, m_max = mags.min(), mags.max()
-            bins = np.linspace(m_min, m_max, 25)
-            counts_total, _ = np.histogram(mags, bins=bins)
-            counts_survived, _ = np.histogram(mags[survived], bins=bins)
-            valid = counts_total > 0
-            if valid.sum() < 4:
-                comps = survived.astype(np.float32)
-            else:
-                bin_comp = counts_survived[valid] / (counts_total[valid] + 1e-9)
-                bin_centers = ((bins[:-1] + bins[1:]) / 2)[valid]
-                comps = np.interp(mags, bin_centers, bin_comp, left=1.0, right=0.0).astype(np.float32)
-
         # Target Construction (Numba Optimized PCA weights)
         base_grid = fast_paint_grid(
-            x_centers, y_centers, fluxes, snrs, comps, psf_weights, sort_idx, 
+            x_centers, y_centers, fluxes, snrs, psf_weights, sort_idx, 
             self.min_snr, self.grid_size, self.cell_size, self.K
         )
 
@@ -276,8 +267,8 @@ class GaussianMosaicDataset(Dataset):
         self.N_PCA = N_PCA_COMPONENTS
         self.min_snr = 5.0
         
-        # Pre-allocate target shape info: K * (5 + N_PCA) + 1
-        self.target_shape = (self.grid_size, self.grid_size, self.K * (5 + self.N_PCA) + 1)
+        # Pre-allocate target shape info: K * (4 + N_PCA) + 1
+        self.target_shape = (self.grid_size, self.grid_size, self.K * (4 + self.N_PCA) + 1)
         
         # Load mosaic manifests
         self.mosaics = []
@@ -357,14 +348,13 @@ class GaussianMosaicDataset(Dataset):
             lx, ly = local_cat['x'] - px, local_cat['y'] - py
             fluxes = local_cat['flux']
             snrs = local_cat['snr']
-            comps = local_cat['comp']
             
             # Continuous PCA weights must be in the catalog for this to work
             psf_weights = np.column_stack([local_cat[f'w{i}'] for i in range(self.N_PCA)])
             
             sort_idx = np.argsort(fluxes)[::-1]
             grid_stars_np = fast_paint_grid(
-                lx, ly, fluxes, snrs, comps, psf_weights, sort_idx, 
+                lx, ly, fluxes, snrs, psf_weights, sort_idx, 
                 self.min_snr, self.grid_size, self.cell_size, self.K
             )
             target_buffer[:, :, :-1] = grid_stars_np.reshape(self.grid_size, self.grid_size, -1)

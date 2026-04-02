@@ -74,12 +74,12 @@ class InferenceEngine:
         for y in range(grid_h):
             for x in range(grid_w):
                 for k in range(K):
-                    p, dx, dy, physical_flux, c = prediction[y, x, k, :5]
+                    p, dx, dy, physical_flux = prediction[y, x, k, :4]
                     if p > threshold:
-                        predicted_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, float(physical_flux), c, p))
+                        predicted_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, float(physical_flux), p))
                         
                         # Reconstruct PSF from PCA weights
-                        weights = prediction[y, x, k, 5:]
+                        weights = prediction[y, x, k, 4:]
                         if psf_basis is not None and mean_psf is not None:
                             # weights: [20], basis: [20, 961], mean: [961]
                             shape_flat = (weights @ psf_basis) + mean_psf
@@ -103,7 +103,7 @@ class InferenceEngine:
         full_gt_residual_bg_stretched = upsample_background(gt_bg_map.squeeze(), (H, W))
         
         reconstruction_stars_linear = np.zeros_like(img_stretched)
-        for (x, y, flux, c, p), shape in zip(predicted_stars, predicted_shapes):
+        for (x, y, flux, p), shape in zip(predicted_stars, predicted_shapes):
             ix, iy, S = int(round(x)), int(round(y)), shape.shape[0]
             half = S // 2
             y0, y1 = max(0, iy - half), min(H, iy + half + 1)
@@ -257,20 +257,47 @@ class InferenceEngine:
                 ax_hist.grid(True, alpha=0.2)
 
         ax9 = fig.add_subplot(gs[4, 1])
-        missed_comps = [true_catalogue[i][3] for i in range(len(true_catalogue)) if i not in matched_true_indices]
-        matched_comps = [true_catalogue[i][3] for i in matched_true_indices]
+        # NEW: For visualization, we use Objectness (p) as the x-axis for detectability plots
+        true_p_labels = [s[0] for s in true_catalogue] # Objectness labels in true catalogue
         
-        if missed_comps or matched_comps:
-            mc_clean = [c for c in matched_comps if np.isfinite(c)]
-            misc_clean = [c for c in missed_comps if np.isfinite(c)]
-            if mc_clean or misc_clean:
-                ax9.hist([mc_clean, misc_clean], bins=20, stacked=True, 
-                        label=['Detected', 'Missed'], color=['g', 'r'], alpha=0.7)
-                ax9.set_xlabel("Target Completeness Score (SNR Proxy)")
-                ax9.set_ylabel("Star Count")
-                ax9.set_title("Detection Success vs. Target Completeness")
-                ax9.legend()
-                ax9.grid(True, alpha=0.2)
+        if true_p_labels:
+            matched_p = [true_catalogue[i][0] for i in matched_true_indices]
+            missed_p = [true_catalogue[i][0] for i in range(len(true_catalogue)) if i not in matched_true_indices]
+            
+            ax9.hist([matched_p, missed_p], bins=20, stacked=True, 
+                    label=['Detected', 'Missed'], color=['g', 'r'], alpha=0.7)
+            ax9.set_xlabel("Target Objectness (SNR Soft Label)")
+            ax9.set_ylabel("Star Count")
+            ax9.set_title("Detection Success vs. Target Objectness")
+            ax9.legend()
+            ax9.grid(True, alpha=0.2)
+
+        # PSF Profile Plots
+        if predicted_shapes:
+            ax_psf_x = fig.add_subplot(gs[3:, 2])
+            ax_psf_y = fig.add_subplot(gs[3:, 3])
+            
+            shapes_clean = [s for s in predicted_shapes if np.all(np.isfinite(s))]
+            if shapes_clean:
+                num_to_plot = min(100, len(shapes_clean))
+                for i in range(num_to_plot):
+                    shape = shapes_clean[i]
+                    prof_x = np.mean(shape, axis=0)
+                    prof_y = np.mean(shape, axis=1)
+                    ax_psf_x.plot(prof_x, color='C0', alpha=0.1, linewidth=1)
+                    ax_psf_y.plot(prof_y, color='C1', alpha=0.1, linewidth=1)
+                
+                all_shapes = np.stack(shapes_clean[:100])
+                ax_psf_x.plot(np.mean(all_shapes, axis=(0, 1)), color='black', linewidth=2, label='Mean')
+                ax_psf_y.plot(np.mean(all_shapes, axis=(0, 2)), color='black', linewidth=2, label='Mean')
+                
+                ax_psf_x.set_title("PSF X-Profiles (Y-avg)")
+                ax_psf_y.set_title("PSF Y-Profiles (X-avg)")
+                ax_psf_x.set_xlabel("Pixels"); ax_psf_y.set_xlabel("Pixels")
+                ax_psf_x.grid(True, alpha=0.2); ax_psf_y.grid(True, alpha=0.2)
+
+        plt.suptitle(f"Generative Diagnostic (Scale={self.stretch_scale}) | Predicted Stars: {len(predicted_stars)}", fontsize=24)
+        plt.savefig(output_path); print(f"Comparison saved to {output_path}")
 
         # PSF Profile Plots
         if predicted_shapes:
