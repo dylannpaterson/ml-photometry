@@ -201,18 +201,11 @@ def compute_grid_loss(preds, targets, psf_library=None, lambda_prob=5.0, lambda_
     p_t = p_pred_probs * p_target + (1 - p_pred_probs) * (1 - p_target)
     focal_weight = (1 - p_t) ** focal_gamma
     
-    # NEW: Alpha balancing for soft labels
-    # We use a threshold to determine "positive" for alpha weighting purposes
-    is_pos = (p_target > 0.5).float()
-    alpha_t = focal_alpha * is_pos + (1 - focal_alpha) * (1 - is_pos)
+    # NEW: Continuous Alpha balancing for soft labels
+    # We interpolate alpha_t smoothly based on p_target to avoid discontinuities
+    alpha_t = p_target * focal_alpha + (1 - p_target) * (1 - focal_alpha)
     
-    with torch.no_grad():
-        raw_flux_target = star_targets[..., 3]
-        stretched_target = torch.arcsinh(raw_flux_target / stretch_scale)
-        boost_weight = torch.where(obj_mask, 1.0 + (12.0 - stretched_target) / 6.0, torch.tensor(1.0, device=p_pred_probs.device))
-        boost_weight = torch.clamp(boost_weight, 1.0, 5.0)
-    
-    prob_loss = (alpha_t * focal_weight * bce_loss * boost_weight).mean()
+    prob_loss = (alpha_t * focal_weight * bce_loss).mean()
     
     # 3. Regression Losses (Masked)
     if obj_mask.sum() > 0:
