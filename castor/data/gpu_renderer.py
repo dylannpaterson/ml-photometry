@@ -85,7 +85,7 @@ def _get_jax_renderer_core():
         )
         
         final_image = (base_rendered + jnp.sum(eigen_rendered, axis=1)).squeeze()
-        return final_image, star_weights
+        return jnp.maximum(0, final_image), star_weights
     
     return render_core
 

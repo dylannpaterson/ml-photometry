@@ -111,7 +111,6 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
         random_noise = np.random.randn(*base_weights.shape) * (s_vals * perturb_scale)
         star_weights = base_weights + random_noise
         
-        # Bilinear scattering constants
         x0, y0 = np.floor(px).astype(int), np.floor(py).astype(int)
         dx, dy = px - x0, py - y0
         valid = (x0 >= 0) & (x0 < mosaic_size-1) & (y0 >= 0) & (y0 < mosaic_size-1)
@@ -152,14 +151,14 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
 
         full_image = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
         with scipy.fft.set_backend(scipy.fft, workers=-1):
-            # Bilinear scatter all stars for base PSF pass
             full_image += fftconvolve(scatter_all(fluxes), mean_psf, mode='same')
-            
             is_bright = mags < mag_limit
             if is_bright.any():
                 for j in range(N_PCA_COMPONENTS):
-                    # Bilinear scatter jiggled weights for bright stars for each eigen pass
                     full_image += fftconvolve(scatter_all(fluxes, weights_column=star_weights[:, j], mask=is_bright), eigen_psfs[j], mode='same')
+
+        # Ensure physical validity (PCA perturbations can occasionally dip below 0)
+        full_image = np.maximum(0, full_image)
 
         v_mask = mags < mag_limit
         x_v, y_v, flux_v, mag_v, final_weights_v = px[v_mask], py[v_mask], fluxes[v_mask], mags[v_mask], star_weights[v_mask]
@@ -182,11 +181,13 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config/config.yaml")
+    parser.add_argument("--stage", type=int, default=0)
     parser.add_argument("--num", type=int, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     args = parser.parse_args()
     cfg = load_config(args.config)
-    stage_cfg = cfg["curriculum"]["stage0"]
+    stage_key = f"stage{args.stage}"
+    stage_cfg = cfg["curriculum"][stage_key]
     num = args.num if args.num else stage_cfg["mosaic_params"]["num_mosaics"]
     out = args.output_dir if args.output_dir else os.path.join(stage_cfg["data_dir"], "mosaics")
     os.makedirs(out, exist_ok=True)
