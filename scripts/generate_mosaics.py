@@ -11,6 +11,7 @@ from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZ
 from scipy.signal import fftconvolve
 import scipy.fft
 from numba import njit
+from scipy.ndimage import map_coordinates
 
 # GPU/JAX Acceleration
 try:
@@ -35,15 +36,12 @@ def _numba_paint_hybrid(image, x, y, fluxes, stamps):
     half = S // 2
     H, W = image.shape
     for i in range(N):
-        # Coordinates and flux
         px, py, f = x[i], y[i], fluxes[i]
         ix, iy = int(px), int(py)
         dx, dy = px - ix, py - iy
         
-        # 4-pixel bilinear weights
         w00, w10, w01, w11 = (1-dx)*(1-dy), dx*(1-dy), (1-dx)*dy, dx*dy
         
-        # Paint the stamp
         for sj in range(S):
             curr_y = iy + sj - half
             if curr_y < 0 or curr_y >= H - 1: continue
@@ -130,7 +128,15 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size, master_psf_
     
     eigen_psfs, psf_weights_lib, mean_psf = master_psf_data
     
-    # Decide path: JAX only if GPU is available
+    # Pre-calculate diffraction-aware metrics for all library states
+    # 1. Reconstruct PSF peaks (accounting for 20 PCA components)
+    half = SHAPE_SIZE // 2
+    lib_peaks = mean_psf[half, half] + psf_weights_lib @ eigen_psfs[:, half, half]
+    
+    # 2. Reconstruct effective areas (Optimal SNR aperture area ~ 1/Sum(P^2))
+    # For speed, we approximate Sum(P^2) using the mean PSF area (it doesn't vary much)
+    eff_area = 1.0 / np.sum(mean_psf**2)
+    
     use_jax = HAS_JAX and is_gpu_available()
     
     if use_jax:
@@ -138,12 +144,10 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size, master_psf_
             fluxes, mags, psf_weights_lib, mean_psf, eigen_psfs, mosaic_size, mag_limit=mag_limit
         )
     else:
-        # --- Optimized Hybrid NumPy/Numba Path ---
         px, py = np.random.uniform(0, mosaic_size, len(fluxes)), np.random.uniform(0, mosaic_size, len(fluxes))
         all_psf_indices = np.random.randint(0, 100, size=len(fluxes))
         
-        # 1. Base Pass (All Stars convolved with Mean PSF)
-        # 4-pixel bilinear scattering into a single grid
+        # Base Pass (Bilinear Scatter)
         x0, y0 = np.floor(px).astype(int), np.floor(py).astype(int)
         dx, dy = px - x0, py - y0
         valid = (x0 >= 0) & (x0 < mosaic_size-1) & (y0 >= 0) & (y0 < mosaic_size-1)
@@ -152,45 +156,56 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size, master_psf_
                                   y0[valid] * mosaic_size + x0[valid] + 1,
                                   (y0[valid]+1) * mosaic_size + x0[valid],
                                   (y0[valid]+1) * mosaic_size + x0[valid] + 1])
-        
         f_v = fluxes[valid]
         vals = np.concatenate([f_v * (1-dx[valid]) * (1-dy[valid]),
                                f_v * dx[valid] * (1-dy[valid]),
                                f_v * (1-dx[valid]) * dy[valid],
                                f_v * dx[valid] * dy[valid]])
-        
         base_grid = scatter_bincount(mosaic_size, indices, vals)
         
         with scipy.fft.set_backend(scipy.fft, workers=-1):
             full_image = fftconvolve(base_grid, mean_psf, mode='same')
             
-        # 2. Eigen Correction Pass (Bright Stars Only - Numba Direct Paint)
+        # Correction Pass (Numba Paint)
         is_bright = mags < mag_limit
         if is_bright.any():
             b_px, b_py, b_f = px[is_bright], py[is_bright], fluxes[is_bright]
             b_weights = psf_weights_lib[all_psf_indices[is_bright]]
-            
-            # Pre-calculate unique Eigen-PSF sum for each bright star
-            # Correction PSF = Sum(w_j * eigen_psf_j)
-            # [N_bright, 20] @ [20, 127*127] -> [N_bright, 127*127]
             correction_stamps = (b_weights @ eigen_psfs.reshape(N_PCA_COMPONENTS, -1)).reshape(-1, SHAPE_SIZE, SHAPE_SIZE)
-            
-            # Ultra-fast Numba painting (Reduces 20 FFTs to ~0.5s of compute)
             _numba_paint_hybrid(full_image, b_px, b_py, b_f, correction_stamps)
 
         full_image = np.maximum(0, full_image)
         v_mask = mags < mag_limit
-        x_v, y_v, flux_v, mag_v, final_weights_v = px[v_mask], py[v_mask], fluxes[v_mask], mags[v_mask], psf_weights_lib[all_psf_indices[v_mask]]
+        x_v, y_v, flux_v, mag_v, psf_indices = px[v_mask], py[v_mask], fluxes[v_mask], mags[v_mask], all_psf_indices[v_mask]
+        final_weights_v = psf_weights_lib[psf_indices]
 
+    # --- Accurate SNR Calculation ---
+    sky_level = (10 ** (-0.4 * (sky_mag - zp))) * (0.11**2) * exp_time
+    
+    # 1. Bilinear sample total light at the star's exact center
+    # This captures background + confusion light + the star's own peak
+    total_local_light = map_coordinates(full_image, [y_v, x_v], order=1, mode='nearest')
+    
+    # 2. Calculate the star's contribution to that specific center point
+    # After bilinear scattering, the peak is attenuated. 
+    # PeakAttenuation ~ (1-dx)(1-dy) if star was at integer, but here it's convolved.
+    # We use the reconstructed peak for that specific library PSF state.
+    star_own_peak = flux_v * lib_peaks[psf_indices]
+    
+    # 3. isolate local confusion background from other stars
+    confusion_bg = np.maximum(0, total_local_light - star_own_peak)
+    
+    # 4. Final Diffraction-Aware Noise Formula
+    # Variance = StarFlux + Area * (Sky + Confusion + ReadNoise^2)
+    # Area is the effective footprint of the diffraction-spiked PSF
+    noise_variance = flux_v + eff_area * (sky_level + confusion_bg + 25.0)
+    
     cat_dtype = [('x', 'f4'), ('y', 'f4'), ('flux', 'f4'), ('mag', 'f4'), ('snr', 'f4')] + [(f'w{i}', 'f2') for i in range(N_PCA_COMPONENTS)]
     structured_cat = np.zeros(len(x_v), dtype=cat_dtype)
     structured_cat['x'], structured_cat['y'], structured_cat['flux'], structured_cat['mag'] = x_v, y_v, flux_v, mag_v
+    structured_cat['snr'] = flux_v / np.sqrt(np.maximum(1.0, noise_variance))
     for i in range(N_PCA_COMPONENTS): structured_cat[f'w{i}'] = final_weights_v[:, i]
-
-    sky_level = (10 ** (-0.4 * (sky_mag - zp))) * (0.11**2) * exp_time
-    total_local = full_image[np.clip(y_v.astype(int), 0, mosaic_size-1), np.clip(x_v.astype(int), 0, mosaic_size-1)]
-    noise_var = flux_v + (4 * np.pi * 1.5**2) * (sky_level + np.maximum(0, total_local - flux_v*0.07) + 25.0)
-    structured_cat['snr'] = flux_v / np.sqrt(np.maximum(1.0, noise_var))
+    
     structured_cat = structured_cat[np.argsort(structured_cat['y'])]
 
     for suffix, data in [('img', full_image), ('cat', structured_cat), ('meta', np.array([exp_time, zp, sky_mag])), ('psf_lib', np.concatenate([eigen_psfs.reshape(N_PCA_COMPONENTS, -1), mean_psf.reshape(1, -1)], axis=0))]:
