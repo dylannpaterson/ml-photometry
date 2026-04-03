@@ -12,7 +12,7 @@ from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZ
 from numba import njit
 import gc
 
-@njit(boundscheck=False)
+#@njit(boundscheck=False)
 def fast_paint_grid(lx, ly, fluxes, snrs, psf_weights, sort_idx, min_snr, grid_size, cell_size, K):
     N_PCA = psf_weights.shape[1]
     grid_stars = np.zeros((grid_size, grid_size, K, 4 + N_PCA), dtype=np.float32)
@@ -70,7 +70,8 @@ def sample_bulge_magnitudes(n_total, rc_mag, rc_sigma, rc_enhancement=3.0, m_min
 class GaussianPretrainingProvider(Dataset):
     def __init__(self, num_samples=1000, min_stars=1000000, max_stars=8000000, image_size=256, 
                  max_capacity_per_cell=MAX_CAPACITY_PER_CELL, shape_size=SHAPE_SIZE, 
-                 use_fixed_seed=False, global_stretch_scale=GLOBAL_STRETCH_SCALE, min_snr=5.0):
+                 use_fixed_seed=False, global_stretch_scale=GLOBAL_STRETCH_SCALE, min_snr=5.0,
+                 psf_library_path=None):
         self.num_samples = num_samples
         self.min_stars = min_stars
         self.max_stars = max_stars
@@ -85,11 +86,20 @@ class GaussianPretrainingProvider(Dataset):
         self.grid_size = self.img_size // self.cell_size
         self.n_pca = N_PCA_COMPONENTS
         
-        # 1. Generate pristine optical-only library
-        raw_library = self._generate_optical_library(100, self.S)
-        
-        # 2. Extract Eigen-PSFs
-        self.eigen_psfs, self.psf_weights_lib, self.mean_psf = self._compute_eigen_psfs(raw_library, n_components=self.n_pca)
+        if psf_library_path and os.path.exists(psf_library_path):
+            print(f"📂 GaussianPretrainingProvider: Loading Master PSF Library from {psf_library_path}")
+            master_data = torch.load(psf_library_path, map_location='cpu', weights_only=True)
+            if isinstance(master_data, dict):
+                self.eigen_psfs = master_data['eigen_psfs']
+                self.psf_weights_lib = master_data['weights_lib']
+                self.mean_psf = master_data['mean_psf']
+            else:
+                self.eigen_psfs, self.psf_weights_lib, self.mean_psf = master_data
+        else:
+            # 1. Generate pristine optical-only library
+            raw_library = self._generate_optical_library(100, self.S)
+            # 2. Extract Eigen-PSFs
+            self.eigen_psfs, self.psf_weights_lib, self.mean_psf = self._compute_eigen_psfs(raw_library, n_components=self.n_pca)
         
         self.psf_library_tensor = torch.cat([
             torch.from_numpy(self.eigen_psfs).view(self.n_pca, -1),
@@ -283,13 +293,32 @@ class HDF5MosaicDataset(Dataset):
         self.h5_path, self.file, self.img_size = h5_path, None, image_size
         self.cell_size, self.grid_size, self.K = DEFAULT_CELL_SIZE, image_size // DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL
         if not os.path.exists(self.h5_path): raise FileNotFoundError(f"HDF5 file not found: {self.h5_path}")
-        with h5py.File(self.h5_path, 'r') as f: self.length = len(f['images'])
+        
+        # Open briefly to get length and ensure PSF library consistency
+        with h5py.File(self.h5_path, 'r') as f:
+            self.length = len(f['images'])
+            # Cache one copy of the PSF library per dataset to avoid repeated HDF5 reads
+            if 'psf_libraries' in f and len(f['psf_libraries']) > 0:
+                self.psf_library = torch.from_numpy(f['psf_libraries'][0]).float()
+            else:
+                self.psf_library = None
 
     def __len__(self): return self.length
 
     def __getitem__(self, idx):
-        if self.file is None: self.file = h5py.File(self.h5_path, 'r')
-        return {"image": torch.from_numpy(self.file['images'][idx]), "target": torch.from_numpy(self.file['targets'][idx]), "psf_library": torch.from_numpy(self.file['psf_libraries'][idx]), "chunk_median": float(self.file['chunk_medians'][idx])}
+        if self.file is None:
+            self.file = h5py.File(self.h5_path, 'r', swmr=True, libver='latest')
+            
+        img = torch.from_numpy(self.file['images'][idx]).float()
+        target = torch.from_numpy(self.file['targets'][idx]).float()
+        median = float(self.file['chunk_medians'][idx])
+
+        return {
+            "image": img,
+            "target": target,
+            "psf_library": self.psf_library, # Reuse cached tensor
+            "chunk_median": median
+        }
 
     def generate_chunk(self):
         import random

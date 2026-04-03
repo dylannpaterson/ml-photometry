@@ -10,14 +10,14 @@ curriculum:
     name: "Roman Bulge Stage 0 (Full)"
     data_dir: "data/bulge_stage0_full"
     epochs: 500
-    batch_size: 128
+    batch_size: 32
     learning_rate: 0.0001
-    num_workers: 2
+    num_workers: 0
     resume_from_last_stage: false
     cell_size: 4 # Centralized default: 4
     mosaic_params:
-      num_mosaics: 2000
-      val_mosaics: 400
+      num_mosaics: 1
+      val_mosaics: 1
       mosaic_size: 1024
 
   # Stage 1: Multi-Telescope Foundation Training (GalSim)
@@ -47,8 +47,8 @@ curriculum:
 
 data_params:
   # Samples to cover the unique parameter states
-  num_train_samples: 50000 
-  num_val_samples: 5000
+  num_train_samples: 50
+  num_val_samples: 5
   
   # Massive unified population to hit VVV background levels
   min_stars: 50000
@@ -62,7 +62,7 @@ data_params:
   GLOBAL_STRETCH_SCALE: 10.0
   
   # Rendering & PSF Generation
-  n_library_psfs: 20
+  n_library_psfs: 100
   min_snr: 5.0
   
   # Instrument & Observation Physics (Roman WFI Defaults)
