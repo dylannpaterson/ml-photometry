@@ -33,7 +33,12 @@ def calculate_safe_magnitude_cutoff(exp_time, zp, sky_mag, read_noise=5.0, sigma
     min_flux = (-b + np.sqrt(b**2 - 4*a*c)) / (2*a)
     return zp - 2.5 * np.log10(min_flux / exp_time)
 
-def generate_elliptical_psf_library(num_psfs=100, grid_size=127):
+def generate_field_realistic_psf_library(num_psfs=100, grid_size=127):
+    """
+    Generates a library of varied Roman-style PSFs simulating random positions
+    across the image plane.
+    """
+    print(f"📡 Generating Master PSF Library ({num_psfs} PSFs)...")
     library = np.zeros((num_psfs, grid_size, grid_size), dtype=np.float32)
     half = grid_size // 2
     
@@ -48,9 +53,19 @@ def generate_elliptical_psf_library(num_psfs=100, grid_size=127):
     y, x = np.meshgrid(np.arange(grid_size) - half, np.arange(grid_size) - half, indexing='ij')
     
     for i in range(num_psfs):
-        s_jit = np.random.uniform(0.3, 0.8)
-        q = np.random.uniform(0.7, 1.0)
-        theta = np.random.uniform(0, np.pi)
+        # 1. Simulate a random detector position (-2048 to 2048)
+        fx, fy = np.random.uniform(-2048, 2048), np.random.uniform(-2048, 2048)
+        r_norm = np.sqrt(fx**2 + fy**2) / 2896.0 # Max radius ~2896
+        
+        # 2. Field Distortion: Ellipticity increases with radius
+        q = np.random.uniform(0.85, 1.0) - (0.15 * r_norm)
+        
+        # 3. PSF Bloat: Jitter scale increases slightly at edges
+        s_jit = np.random.uniform(0.3, 0.6) + (0.2 * r_norm)
+        
+        # 4. Position Angle: Radially linked + random offset
+        theta = np.arctan2(fy, fx) + np.random.normal(0, 0.2)
+        
         cos, sin = np.cos(theta), np.sin(theta)
         xp, yp = x * cos + y * sin, -x * sin + y * cos
         jitter_kernel = np.exp(-(xp**2 / (2 * s_jit**2) + yp**2 / (2 * (s_jit * q)**2)))
@@ -75,13 +90,13 @@ def _compute_eigen_psfs(large_library, n_components=20):
     U, S, V = torch.pca_lowrank(centered_data, q=n_components)
     eigen_psfs = V.t().view(n_components, H, W).numpy()
     psf_weights = (U * S).numpy() 
-    return eigen_psfs, psf_weights, mean_psf.view(H, W).numpy(), S.numpy()
+    return eigen_psfs, psf_weights, mean_psf.view(H, W).numpy()
 
 def scatter_bincount(mosaic_size, flat_indices, weights):
     """Ultra-fast accumulation using np.bincount."""
     return np.bincount(flat_indices, weights=weights, minlength=mosaic_size*mosaic_size).reshape(mosaic_size, mosaic_size)
 
-def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
+def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size, master_psf_data):
     start_time = time.time()
     area_ratio = (mosaic_size / params['image_size'])**2
     exp_time, zp, sky_mag = np.random.uniform(30.0, 60.0), 26.5, 22.0
@@ -93,23 +108,18 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
     mags = sample_bulge_magnitudes(n_stars_total, np.random.uniform(14.5, 16.5), np.random.uniform(0.2, 0.5), np.random.uniform(5.0, 15.0), m_min=12.0, m_max=32.0, gamma=np.random.uniform(0.25, 0.35))
     fluxes = exp_time * (10 ** (-0.4 * (mags - zp)))
     
-    kb_array = generate_elliptical_psf_library(num_psfs=100, grid_size=SHAPE_SIZE)
-    eigen_psfs, psf_weights_lib, mean_psf, s_vals = _compute_eigen_psfs(kb_array, n_components=N_PCA_COMPONENTS)
+    # Use the master PSF data passed from main
+    eigen_psfs, psf_weights_lib, mean_psf = master_psf_data
     
     if HAS_JAX:
         full_image, x_v, y_v, psf_indices, flux_v, mag_v, final_weights_v = render_generate_and_filter_gpu(
-            fluxes, mags, psf_weights_lib, mean_psf, eigen_psfs, s_vals, mosaic_size, mag_limit=mag_limit
+            fluxes, mags, psf_weights_lib, mean_psf, eigen_psfs, mosaic_size, mag_limit=mag_limit
         )
     else:
         print(f"🛠️ Running Ultra-Fast Eigen-Convolution (NumPy Optimized)...")
         px, py = np.random.uniform(0, mosaic_size, len(fluxes)), np.random.uniform(0, mosaic_size, len(fluxes))
         all_psf_indices = np.random.randint(0, 100, size=len(fluxes))
-        
-        # Eigen-Jiggling: Pre-calculate unique weights for ALL stars
-        perturb_scale = 0.05
-        base_weights = psf_weights_lib[all_psf_indices] # [N, 20]
-        random_noise = np.random.randn(*base_weights.shape) * (s_vals * perturb_scale)
-        star_weights = base_weights + random_noise
+        star_weights = psf_weights_lib[all_psf_indices]
         
         x0, y0 = np.floor(px).astype(int), np.floor(py).astype(int)
         dx, dy = px - x0, py - y0
@@ -157,9 +167,7 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
                 for j in range(N_PCA_COMPONENTS):
                     full_image += fftconvolve(scatter_all(fluxes, weights_column=star_weights[:, j], mask=is_bright), eigen_psfs[j], mode='same')
 
-        # Ensure physical validity (PCA perturbations can occasionally dip below 0)
         full_image = np.maximum(0, full_image)
-
         v_mask = mags < mag_limit
         x_v, y_v, flux_v, mag_v, final_weights_v = px[v_mask], py[v_mask], fluxes[v_mask], mags[v_mask], star_weights[v_mask]
 
@@ -184,15 +192,37 @@ def main():
     parser.add_argument("--stage", type=int, default=0)
     parser.add_argument("--num", type=int, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--psf_library", type=str, default=None, help="Path to pre-generated PSF library (.pt)")
     args = parser.parse_args()
+    
     cfg = load_config(args.config)
     stage_key = f"stage{args.stage}"
     stage_cfg = cfg["curriculum"][stage_key]
+    
+    # 1. Master PSF Library Handling
+    if args.psf_library and os.path.exists(args.psf_library):
+        print(f"📂 Loading Master PSF Library from {args.psf_library}...")
+        master_data = torch.load(args.psf_library, map_location='cpu')
+        # master_data is expected to be a dict or tuple containing (eigen_psfs, psf_weights_lib, mean_psf)
+        if isinstance(master_data, dict):
+            master_psf_data = (master_data['eigen_psfs'], master_data['weights_lib'], master_data['mean_psf'])
+        else:
+            master_psf_data = master_data
+    else:
+        # Generate once for this run
+        kb_array = generate_field_realistic_psf_library(num_psfs=100, grid_size=SHAPE_SIZE)
+        master_psf_data = _compute_eigen_psfs(kb_array, n_components=N_PCA_COMPONENTS)
+        # Optional: Save it for future reuse
+        # torch.save(master_psf_data, "master_psf_library.pt")
+
     num = args.num if args.num else stage_cfg["mosaic_params"]["num_mosaics"]
     out = args.output_dir if args.output_dir else os.path.join(stage_cfg["data_dir"], "mosaics")
     os.makedirs(out, exist_ok=True)
+    
     params = {"min_stars": cfg["data_params"]["min_stars"], "max_stars": cfg["data_params"]["max_stars"], "image_size": cfg["data_params"]["image_size"]}
-    for i in range(num): generate_mosaic(i, out, params, stage_cfg["mosaic_params"]["mosaic_size"], stage_cfg["cell_size"])
+    
+    for i in range(num): 
+        generate_mosaic(i, out, params, stage_cfg["mosaic_params"]["mosaic_size"], stage_cfg["cell_size"], master_psf_data)
 
 if __name__ == "__main__":
     main()

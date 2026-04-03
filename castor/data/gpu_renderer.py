@@ -7,15 +7,13 @@ import time
 
 def _get_jax_renderer_core():
     """
-    PCA-optimized JAX renderer with Eigen-Jiggling.
-    Draws all stars with the mean PSF, but only applies eigen-corrections
-    to stars brighter than the magnitude limit.
+    PCA-optimized JAX renderer.
+    Draws stars by picking discrete weights from a library of realistic PSFs.
     """
-    def render_core(x, y, fluxes, mags, psf_indices, weights_lib, mean_psf, eigen_psfs, s_vals, mosaic_size, mag_limit, key):
+    def render_core(x, y, fluxes, mags, psf_indices, weights_lib, mean_psf, eigen_psfs, mosaic_size, mag_limit):
         n_pca = eigen_psfs.shape[0]
-        n_stars = fluxes.shape[0]
         
-        # 1. Bilinear Sub-pixel Distribution (The 4-pixel footprint)
+        # 1. Bilinear Sub-pixel Distribution
         x0 = jnp.floor(x).astype(jnp.int32)
         y0 = jnp.floor(y).astype(jnp.int32)
         dx = x - x0
@@ -28,27 +26,19 @@ def _get_jax_renderer_core():
         mask11 = (x0+1 >= 0) & (x0+1 < mosaic_size) & (y0+1 >= 0) & (y0+1 < mosaic_size)
         
         # --- Base Pass (All Stars) ---
-        # Bilinear scatter into a single grid for the mean PSF
         base_grid = jnp.zeros((1, mosaic_size, mosaic_size))
         base_grid = base_grid.at[0, y0, x0].add(jnp.where(mask00, fluxes * (1-dx) * (1-dy), 0.0))
         base_grid = base_grid.at[0, y0, x0+1].add(jnp.where(mask10, fluxes * dx * (1-dy), 0.0))
         base_grid = base_grid.at[0, y0+1, x0].add(jnp.where(mask01, fluxes * (1-dx) * dy, 0.0))
         base_grid = base_grid.at[0, y0+1, x0+1].add(jnp.where(mask11, fluxes * dx * dy, 0.0))
         
-        # --- Eigen-Jiggling Pass (Bright Stars Only) ---
+        # --- Eigen Passes (Bright Stars Only) ---
         is_bright = mags < mag_limit
         bright_fluxes = jnp.where(is_bright, fluxes, 0.0)
         
-        # Assign base weights from library
-        base_star_weights = weights_lib[psf_indices] # [N, n_pca]
+        # Pick weights directly from the realistic library (no noise added here)
+        star_weights = weights_lib[psf_indices] # [N, n_pca]
         
-        # Add perturbation proportional to singular values (Simulate local breathing/jitter)
-        perturb_scale = 0.05
-        noise = jax.random.normal(key, shape=(n_stars, n_pca)) * (s_vals * perturb_scale)
-        star_weights = base_star_weights + noise
-        
-        # Scatter each eigen-component using bilinear weights
-        # We use a scan here to handle 20 components efficiently
         def scatter_eigen(carry, i):
             w_f = bright_fluxes * star_weights[:, i]
             grid = jnp.zeros((mosaic_size, mosaic_size))
@@ -64,7 +54,6 @@ def _get_jax_renderer_core():
         k_h, k_w = mean_psf.shape
         pad_h, pad_w = k_h // 2, k_w // 2
         
-        # 11-Pass Eigen-Convolution (1 Base + N_PCA Eigen)
         base_kernel = mean_psf[::-1, ::-1].reshape((1, 1, k_h, k_w))
         base_rendered = lax.conv_general_dilated(
             base_grid[jnp.newaxis, :, :, :],
@@ -92,32 +81,26 @@ def _get_jax_renderer_core():
 def _get_fused_generator_renderer():
     render_core = _get_jax_renderer_core()
     
-    def fused_op(key, fluxes, mags, weights_lib, mean_psf, eigen_psfs, s_vals, mosaic_size, mag_limit):
+    def fused_op(key, fluxes, mags, weights_lib, mean_psf, eigen_psfs, mosaic_size, mag_limit):
         n_stars = fluxes.shape[0]
         num_psfs = weights_lib.shape[0]
-        k1, k2, k3, k4 = jax.random.split(key, 4)
+        k1, k2, k3 = jax.random.split(key, 3)
         
-        # Coordinate Generation
         x = jax.random.uniform(k1, shape=(n_stars,), minval=0.0, maxval=float(mosaic_size))
         y = jax.random.uniform(k2, shape=(n_stars,), minval=0.0, maxval=float(mosaic_size))
-        
-        # PSF Library Selection
         psf_indices = jax.random.randint(k3, shape=(n_stars,), minval=0, maxval=num_psfs)
         
-        # Jiggled Rendering
-        image, final_star_weights = render_core(x, y, fluxes, mags, psf_indices, weights_lib, mean_psf, eigen_psfs, s_vals, mosaic_size, mag_limit, k4)
-        
-        # Catalog Filter
+        image, final_star_weights = render_core(x, y, fluxes, mags, psf_indices, weights_lib, mean_psf, eigen_psfs, mosaic_size, mag_limit)
         catalog_mask = mags < mag_limit
         
         return image, x, y, psf_indices, catalog_mask, final_star_weights
 
-    return jax.jit(fused_op, static_argnums=(7, 8))
+    return jax.jit(fused_op, static_argnums=(6, 7))
 
 _FUSED_OP = None
 _JAX_KEY = jax.random.PRNGKey(int(time.time())) if 'time' in globals() else jax.random.PRNGKey(42)
 
-def render_generate_and_filter_gpu(fluxes, mags, weights_lib, mean_psf, eigen_psfs, s_vals, mosaic_size, mag_limit=27.0):
+def render_generate_and_filter_gpu(fluxes, mags, weights_lib, mean_psf, eigen_psfs, mosaic_size, mag_limit=27.0):
     global _FUSED_OP, _JAX_KEY
     if _FUSED_OP is None:
         _FUSED_OP = _get_fused_generator_renderer()
@@ -140,10 +123,9 @@ def render_generate_and_filter_gpu(fluxes, mags, weights_lib, mean_psf, eigen_ps
     weights_jax = jnp.array(weights_lib)
     mean_psf_jax = jnp.array(mean_psf)
     eigen_psfs_jax = jnp.array(eigen_psfs)
-    s_vals_jax = jnp.array(s_vals)
     
     image_jax, x_jax, y_jax, psf_jax, mask_jax, weights_jax_out = _FUSED_OP(
-        subkey, fluxes_jax, mags_jax, weights_jax, mean_psf_jax, eigen_psfs_jax, s_vals_jax, mosaic_size, float(mag_limit)
+        subkey, fluxes_jax, mags_jax, weights_jax, mean_psf_jax, eigen_psfs_jax, mosaic_size, float(mag_limit)
     )
     
     image = np.array(image_jax)

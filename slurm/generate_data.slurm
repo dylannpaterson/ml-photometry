@@ -39,18 +39,29 @@ fi
 
 TRAIN_MOS_DIR="$FINAL_DIR/mosaics_train"
 VAL_MOS_DIR="$FINAL_DIR/mosaics_val"
+MASTER_PSF_LIB="$FINAL_DIR/master_psf_library.pt"
 
 echo "📂 Target Directory: $FINAL_DIR"
 echo "🧩 Generating $NUM_MOSAICS train and $NUM_VAL_MOSAICS val mosaics..."
 
-# 3. Data Generation
+# 3. Master PSF Library Generation (Do once for the whole dataset)
+mkdir -p "$FINAL_DIR"
+if [ ! -f "$MASTER_PSF_LIB" ]; then
+    echo "📡 Pre-generating Master PSF Library..."
+    srun python -u scripts/pregenerate_psf_library.py --num_psfs 100 --output "$MASTER_PSF_LIB"
+else
+    echo "📂 Using existing Master PSF Library at $MASTER_PSF_LIB"
+fi
+
+# 4. Data Generation
 echo "1️⃣ Generating raw TRAINING mosaics..."
 mkdir -p "$TRAIN_MOS_DIR"
 srun python -u scripts/generate_mosaics.py \
     --config config/config.yaml \
     --stage $STAGE_IDX \
     --num $NUM_MOSAICS \
-    --output_dir "$TRAIN_MOS_DIR"
+    --output_dir "$TRAIN_MOS_DIR" \
+    --psf_library "$MASTER_PSF_LIB"
 
 echo "2️⃣ Generating raw VALIDATION mosaics..."
 mkdir -p "$VAL_MOS_DIR"
@@ -58,7 +69,8 @@ srun python -u scripts/generate_mosaics.py \
     --config config/config.yaml \
     --stage $STAGE_IDX \
     --num $NUM_VAL_MOSAICS \
-    --output_dir "$VAL_MOS_DIR"
+    --output_dir "$VAL_MOS_DIR" \
+    --psf_library "$MASTER_PSF_LIB"
 
 echo "3️⃣ Converting to HDF5 (Separate Splits)..."
 srun python -u scripts/convert_to_hdf5.py \
