@@ -163,7 +163,7 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size, master_psf_
                                f_v * dx[valid] * dy[valid]])
         base_grid = scatter_bincount(mosaic_size, indices, vals)
         
-        with scipy.fft.set_backend(scipy.fft, workers=-1):
+        with scipy.fft.set_backend(scipy.fft):
             full_image = fftconvolve(base_grid, mean_psf, mode='same')
             
         # Correction Pass (Numba Paint)
