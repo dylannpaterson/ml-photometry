@@ -165,6 +165,12 @@ class Trainer:
             # scheduler.step() moved to batch loop for OneCycleLR
             
             os.makedirs("checkpoints", exist_ok=True)
+            
+            # Persist PSF Library to disk if it doesn't exist (Safety Layer)
+            if self.psf_library is not None and not os.path.exists("master_psf_library.pt"):
+                torch.save(self.psf_library, "master_psf_library.pt")
+                print("💾 Persisted Master PSF Library from training batch to disk.")
+
             # Save full checkpoint dict for easier resuming
             checkpoint = {
                 'epoch': epoch,
