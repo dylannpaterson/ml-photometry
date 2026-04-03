@@ -227,76 +227,58 @@ class DenseGridModel(nn.Module):
 
 def compute_grid_loss(preds, targets, psf_library=None, lambda_prob=5.0, lambda_pos=50.0, lambda_flux=5.0, lambda_shape=1.0, lambda_bg=0.1, focal_alpha=0.75, focal_gamma=2.0, stretch_scale=GLOBAL_STRETCH_SCALE):
     """
-    Eigen-PSF Loss: Reconstructs high-fidelity 31x31 shapes from predicted weights
-    and calculates MSE in pixel space for maximum photometry accuracy.
+    Latent (Weight-Wise) Loss:
+    Calculates shape loss directly in PCA weight space. This is faster,
+    more memory efficient, and ensures that structural details (diffraction spikes)
+    are treated with equal importance to the core photometry.
     """
     star_preds = preds["stars"]
     bg_preds = preds["background"]
     
     # 1. Unpack Target Grid
-    # C_target = K * (4 + N_PCA) + 1
     B, H, W, C_target = targets.shape
     bg_targets = targets[..., -1:]
     star_targets_flat = targets[..., :-1]
     
     K = MAX_CAPACITY_PER_CELL
-    # Each star has 4 base params (p, dx, dy, flux) + N_PCA weights
     star_targets = star_targets_flat.view(B, H, W, K, -1)
     
-    # NEW: Object mask uses target p > 0 (Soft Labels)
+    # Object mask uses target p > 0 (Soft Labels)
     obj_mask = star_targets[..., 0] > 0.0
     
-    # 2. Probability Loss (p) with Faint Star Boosting
+    # 2. Probability Loss (p) with Focal Loss
     p_pred_probs = torch.clamp(star_preds[..., 0], 1e-7, 1.0 - 1e-7)
-    p_pred_logits = preds["p_logits"].squeeze(-1) # Get the raw logits
+    p_pred_logits = preds["p_logits"].squeeze(-1) 
     p_target = star_targets[..., 0]
     
-    # Binary Cross Entropy with Soft Labels (Logit Space)
     bce_loss = F.binary_cross_entropy_with_logits(p_pred_logits, p_target, reduction='none')
-    
     p_t = p_pred_probs * p_target + (1 - p_pred_probs) * (1 - p_target)
     focal_weight = (1 - p_t) ** focal_gamma
-    
-    # NEW: Continuous Alpha balancing for soft labels
-    # We interpolate alpha_t smoothly based on p_target to avoid discontinuities
     alpha_t = p_target * focal_alpha + (1 - p_target) * (1 - focal_alpha)
     
     prob_loss = (alpha_t * focal_weight * bce_loss).mean()
     
     # 3. Regression Losses (Masked)
     if obj_mask.sum() > 0:
+        # Position Loss
         pos_pred = star_preds[..., 1:3][obj_mask]
         pos_target = star_targets[..., 1:3][obj_mask]
-        # Switch to Smooth L1 for robust sub-pixel localization
         pos_loss = F.smooth_l1_loss(pos_pred, pos_target, reduction='mean')
         
+        # Flux Loss (Log-space)
         log_flux_pred = preds["raw_log_flux"][obj_mask]
         flux_target = star_targets[..., 3:4][obj_mask]
         log_flux_target = torch.log(flux_target + 1e-6)
-        # Switch to Smooth L1 to prevent bright star overflow gradients
         flux_loss = F.smooth_l1_loss(log_flux_pred, log_flux_target, reduction='mean')
         
-        # --- EIGEN-PSF RECONSTRUCTION LOSS ---
-        # shape_weights shape: [N_obj, N_PCA]
+        # --- LATENT WEIGHT LOSS ---
+        # Predict the 20 PCA weights directly
         weights_pred = star_preds[..., 4:][obj_mask]
         weights_target = star_targets[..., 4:][obj_mask]
         
-        if psf_library is not None:
-            # psf_library shape: [Batch, N_PCA + 1, 961]
-            # [:, :N_PCA, :] are components, [:, -1, :] is the mean PSF
-            psf_basis = psf_library[0, :-1, :] # [N_PCA, 961]
-            mean_psf = psf_library[0, -1, :]    # [961]
-            
-            # Reconstruct: weights @ basis + mean
-            # FIX: Scale by 100.0 to prevent microscopic MSE and fix dead gradients
-            shape_pred = ((weights_pred @ psf_basis) + mean_psf) * 100.0
-            shape_target = ((weights_target @ psf_basis) + mean_psf) * 100.0
-            
-            # Switch to Smooth L1 for photometric consistency across all star brightnesses
-            shape_loss = F.smooth_l1_loss(shape_pred, shape_target, reduction='mean')
-        else:
-            # Fallback to direct weight MSE if basis is missing
-            shape_loss = F.smooth_l1_loss(weights_pred, weights_target, reduction='mean')
+        # Direct Latent Space Loss
+        # We use Smooth L1 for robust convergence
+        shape_loss = F.smooth_l1_loss(weights_pred, weights_target, reduction='mean')
     else:
         pos_loss = torch.tensor(0.0, device=star_preds.device)
         flux_loss = torch.tensor(0.0, device=star_preds.device)
