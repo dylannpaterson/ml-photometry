@@ -37,7 +37,7 @@ class InferenceEngine:
         self.stretch_scale = config["data_params"].get("GLOBAL_STRETCH_SCALE", GLOBAL_STRETCH_SCALE)
         self.transform = AstroSpaceTransform(stretch_scale=self.stretch_scale)
 
-    def predict(self, image_tensor, threshold=0.5, psf_basis=None, mean_psf=None):
+    def predict(self, image_tensor, threshold=0.1, psf_basis=None, mean_psf=None):
         """Runs inference on a single 2D image tensor [H, W]."""
         self.model.eval()
         with torch.no_grad():
@@ -104,10 +104,18 @@ class InferenceEngine:
         full_residual_bg_stretched = upsample_background(bg_map.squeeze(), (H, W))
         full_gt_residual_bg_stretched = upsample_background(gt_bg_map.squeeze(), (H, W))
         
-        # --- SUB-PIXEL ACCURATE RECONSTRUCTION ---
-        # We scatter the PSF shape across the 4 nearest integer pixels based on predicted offsets
+        # --- DEFINITION: DETECTED = p >= 0.5 ---
+        # We only use detected stars for the reconstruction and matching markers
+        detected_stars = []
+        detected_shapes = []
+        for s, shp in zip(predicted_stars, predicted_shapes):
+            if s[3] >= 0.5:
+                detected_stars.append(s)
+                detected_shapes.append(shp)
+
+        # --- SUB-PIXEL ACCURATE RECONSTRUCTION (Detected Only) ---
         reconstruction_stars_linear = np.zeros_like(img_stretched)
-        for (x, y, flux, p), shape in zip(predicted_stars, predicted_shapes):
+        for (x, y, flux, p), shape in zip(detected_stars, detected_shapes):
             S = shape.shape[0]
             half = S // 2
             
@@ -165,21 +173,19 @@ class InferenceEngine:
         hdul.writeto(fits_path, overwrite=True)
         print(f"FITS data saved to {fits_path}")
 
-        # Statistics & Matching for Visualization
-        # FIX: match_stars expects (x, y, flux) format
+        # Statistics & Matching for Visualization (Detected Only)
         match_true = [(s[1], s[2], s[3]) for s in true_catalogue]
-        match_pred = [(s[0], s[1], s[2]) for s in predicted_stars]
+        match_pred = [(s[0], s[1], s[2]) for s in detected_stars]
         matches, unmatched_true, unmatched_pred = match_stars(match_true, match_pred, distance_threshold=2.0)
         
         matched_true_mags, matched_pred_mags = [], []
         for t_idx, p_idx, _ in matches:
             # true_catalogue: (p, x, y, flux) -> index 3
-            # predicted_stars: (x, y, flux, p) -> index 2
+            # detected_stars: (x, y, flux, p) -> index 2
             matched_true_mags.append(np.log10(true_catalogue[t_idx][3] + 1e-9))
-            matched_pred_mags.append(np.log10(predicted_stars[p_idx][2] + 1e-9))
+            matched_pred_mags.append(np.log10(detected_stars[p_idx][2] + 1e-9))
 
         all_true_mags = [np.log10(s[3] + 1e-9) for s in true_catalogue]
-        all_pred_mags = [np.log10(s[2] + 1e-9) for s in predicted_stars]
 
         # 6. Figure Layout
         fig = plt.figure(figsize=(30, 24))
@@ -214,17 +220,23 @@ class InferenceEngine:
         im2 = ax2.imshow(full_reconstruction_linear_abs, cmap='inferno', origin='lower', norm=norm, aspect='equal')
         ax2.set_title("Model (Matched Sources = Lime)")
         
+        # --- MARKER FILTERING ---
+        # Only plot markers for 'visible' true stars (p >= 0.1)
+        # to avoid cluttering the plot with millions of background sources.
+        visible_true_indices = [i for i, s in enumerate(true_catalogue) if s[0] >= 0.1]
         matched_true_indices = [m[0] for m in matches]
-        for i, s in enumerate(true_catalogue):
+        
+        for i in visible_true_indices:
+            s = true_catalogue[i]
             if i in matched_true_indices:
                 ax2.plot(s[1], s[2], color='lime', marker='+', linestyle='None', markersize=10, alpha=0.8)
             else:
                 ax1.plot(s[1], s[2], color='cyan', marker='+', linestyle='None', markersize=10, alpha=0.8)
         
-        # Plot predicted stars as small red dots to see over-prediction
-        pred_x = [s[0] for s in predicted_stars]
-        pred_y = [s[1] for s in predicted_stars]
-        ax2.scatter(pred_x, pred_y, color='red', s=1, alpha=0.5, label='Predicted')
+        # Plot DETECTED stars as small red dots
+        pred_x = [s[0] for s in detected_stars]
+        pred_y = [s[1] for s in detected_stars]
+        ax2.scatter(pred_x, pred_y, color='red', s=1, alpha=0.5, label='Detected')
 
         add_colorbar(im2, ax2)
         
@@ -234,8 +246,9 @@ class InferenceEngine:
         im3 = ax3.imshow(residual_linear, cmap='bwr', origin='lower', vmin=-r_limit, vmax=r_limit, aspect='equal')
         ax3.set_title("Linear Residual (Missed = Black)")
         
-        for i, s in enumerate(true_catalogue):
+        for i in visible_true_indices:
             if i not in matched_true_indices:
+                s = true_catalogue[i]
                 ax3.plot(s[1], s[2], 'k+', markersize=10, alpha=0.8)
         
         add_colorbar(im3, ax3)
@@ -275,27 +288,35 @@ class InferenceEngine:
         if all_true_mags:
             ax_hist = fig.add_subplot(gs[3, 1])
             true_m_clean = [m for m in all_true_mags if np.isfinite(m)]
-            pred_m_clean = [m for m in all_pred_mags if np.isfinite(m)]
+            
+            # Use ALL predicted candidates (>=0.1) for the multi-threshold LF plot
+            m_p90 = [np.log10(s[2] + 1e-9) for s in predicted_stars if s[3] >= 0.9]
+            m_p50 = [np.log10(s[2] + 1e-9) for s in predicted_stars if s[3] >= 0.5]
+            m_p10 = [np.log10(s[2] + 1e-9) for s in predicted_stars if s[3] >= 0.1]
             
             if true_m_clean:
                 mmin_h, mmax_h = min(true_m_clean), max(true_m_clean)
-                if pred_m_clean:
-                    mmin_h = min(mmin_h, min(pred_m_clean))
-                    mmax_h = max(mmax_h, max(pred_m_clean))
+                all_possible = true_m_clean + m_p10
+                if all_possible:
+                    mmin_h = min(all_possible)
+                    mmax_h = max(all_possible)
                 
                 bins = np.linspace(mmin_h, mmax_h, 30)
-                ax_hist.hist(true_m_clean, bins=bins, alpha=0.3, label='True (Full)', color='gray')
-                if pred_m_clean:
-                    ax_hist.hist(pred_m_clean, bins=bins, alpha=0.5, label='Predicted (Full)', color='C0', histtype='step', linewidth=2)
+                ax_hist.hist(true_m_clean, bins=bins, alpha=0.2, label='Truth', color='black')
+                
+                ax_hist.hist(m_p10, bins=bins, alpha=0.4, label='p >= 0.1', color='C0', histtype='step', linewidth=1, linestyle=':')
+                ax_hist.hist(m_p50, bins=bins, alpha=0.7, label='p >= 0.5', color='C0', histtype='step', linewidth=1.5, linestyle='--')
+                ax_hist.hist(m_p90, bins=bins, alpha=1.0, label='p >= 0.9', color='C0', histtype='step', linewidth=2)
+                
                 ax_hist.set_xlabel("log10(Flux)")
                 ax_hist.set_ylabel("Count")
-                ax_hist.set_title("Luminosity Function Comparison (All Stars)")
+                ax_hist.set_title("Luminosity Function vs. Confidence")
                 ax_hist.legend()
                 ax_hist.grid(True, alpha=0.2)
 
         ax9 = fig.add_subplot(gs[4, 1])
-        # NEW: For visualization, we use Objectness (p) as the x-axis for detectability plots
-        true_p_labels = [s[0] for s in true_catalogue] # Objectness labels in true catalogue
+        # Detectability plots use ground truth vs matches
+        true_p_labels = [s[0] for s in true_catalogue]
         
         if true_p_labels:
             matched_p = [true_catalogue[i][0] for i in matched_true_indices]
@@ -309,12 +330,12 @@ class InferenceEngine:
             ax9.legend()
             ax9.grid(True, alpha=0.2)
 
-        # PSF Profile Plots
-        if predicted_shapes:
+        # PSF Profile Plots (Detected only)
+        if detected_shapes:
             ax_psf_x = fig.add_subplot(gs[3:, 2])
             ax_psf_y = fig.add_subplot(gs[3:, 3])
             
-            shapes_clean = [s for s in predicted_shapes if np.all(np.isfinite(s))]
+            shapes_clean = [s for s in detected_shapes if np.all(np.isfinite(s))]
             if shapes_clean:
                 num_to_plot = min(100, len(shapes_clean))
                 for i in range(num_to_plot):
@@ -333,5 +354,5 @@ class InferenceEngine:
                 ax_psf_x.set_xlabel("Pixels"); ax_psf_y.set_xlabel("Pixels")
                 ax_psf_x.grid(True, alpha=0.2); ax_psf_y.grid(True, alpha=0.2)
 
-        plt.suptitle(f"Generative Diagnostic (Scale={self.stretch_scale}) | Predicted Stars: {len(predicted_stars)}", fontsize=24)
+        plt.suptitle(f"Generative Diagnostic (Scale={self.stretch_scale}) | Predicted Stars (p>=0.5): {len(detected_stars)}", fontsize=24)
         plt.savefig(output_path); print(f"Comparison saved to {output_path}")
