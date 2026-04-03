@@ -149,14 +149,14 @@ class Trainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 
-                # 4. FIX: Step scheduler AFTER optimizer.step()
-                self.scheduler.step()
-                
                 epoch_loss += loss.item()
                 
                 if i % 100 == 0:
                     current_lr = self.optimizer.param_groups[0]['lr']
                     print(f"Epoch [{epoch+1}/{self.epochs}], Step [{i}/{len(self.train_loader)}], LR: {current_lr:.6f}, Loss: {loss.item():.4f} (P:{p_loss.item():.4f}, Pos:{po_loss.item():.4f}, F:{f_loss.item():.4f}, S:{s_loss.item():.4f}, B:{b_loss.item():.4f}, DReg:{reg_loss_val:.6f})")
+
+                # 4. FIX: Step scheduler at the very end of the batch processing
+                self.scheduler.step()
             
             avg_epoch_loss = epoch_loss/len(self.train_loader)
             print(f"==> Epoch {epoch+1} Complete | Avg Loss: {avg_epoch_loss:.4f} | Time: {time.time()-start_time:.1f}s")
