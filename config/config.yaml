@@ -47,8 +47,8 @@ curriculum:
 
 data_params:
   # Samples to cover the unique parameter states
-  num_train_samples: 50
-  num_val_samples: 5
+  num_train_samples: 32
+  num_val_samples: 32
   
   # Massive unified population to hit VVV background levels
   min_stars: 50000

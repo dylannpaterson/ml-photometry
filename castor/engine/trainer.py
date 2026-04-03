@@ -149,7 +149,7 @@ class Trainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 
-                # 4. Step scheduler per batch (Required for OneCycleLR)
+                # 4. FIX: Step scheduler AFTER optimizer.step()
                 self.scheduler.step()
                 
                 epoch_loss += loss.item()
@@ -161,8 +161,6 @@ class Trainer:
             avg_epoch_loss = epoch_loss/len(self.train_loader)
             print(f"==> Epoch {epoch+1} Complete | Avg Loss: {avg_epoch_loss:.4f} | Time: {time.time()-start_time:.1f}s")
             val_loss = self.validate(); print(f"Validation Loss: {val_loss:.4f}")
-            
-            # scheduler.step() moved to batch loop for OneCycleLR
             
             os.makedirs("checkpoints", exist_ok=True)
             
@@ -216,6 +214,10 @@ class Trainer:
 
     def validate(self):
         self.model.eval(); val_loss = 0
+        num_batches = len(self.val_loader)
+        if num_batches == 0:
+            return 0.0 # Safety for empty val_loader
+            
         with torch.no_grad():
             for batch in self.val_loader:
                 if isinstance(batch, dict):
@@ -244,4 +246,4 @@ class Trainer:
                 preds_fp32 = {k: v.float() for k, v in preds.items()}
                 loss, _, _, _, _, _ = compute_grid_loss(preds_fp32, targets, psf_library=psf_library, **self.loss_params)
                 val_loss += loss.item()
-        return val_loss / len(self.val_loader)
+        return val_loss / num_batches
