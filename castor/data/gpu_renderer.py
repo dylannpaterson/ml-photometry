@@ -5,10 +5,15 @@ import numpy as np
 import math
 import time
 
+def is_gpu_available():
+    try:
+        return any(d.platform == 'gpu' for d in jax.devices())
+    except:
+        return False
+
 def _get_jax_renderer_core():
     """
     PCA-optimized JAX renderer.
-    Draws stars by picking discrete weights from a library of realistic PSFs.
     """
     def render_core(x, y, fluxes, mags, psf_indices, weights_lib, mean_psf, eigen_psfs, mosaic_size, mag_limit):
         n_pca = eigen_psfs.shape[0]
@@ -35,9 +40,7 @@ def _get_jax_renderer_core():
         # --- Eigen Passes (Bright Stars Only) ---
         is_bright = mags < mag_limit
         bright_fluxes = jnp.where(is_bright, fluxes, 0.0)
-        
-        # Pick weights directly from the realistic library (no noise added here)
-        star_weights = weights_lib[psf_indices] # [N, n_pca]
+        star_weights = weights_lib[psf_indices]
         
         def scatter_eigen(carry, i):
             w_f = bright_fluxes * star_weights[:, i]
