@@ -32,40 +32,70 @@ class FPNBlock(nn.Module):
         return self.smooth(self.lateral(high_res) + self.up(low_res))
 
 class DiffractionAwareFilter(nn.Module):
-    def __init__(self, kernel_size=21, sigma=3.0):
+    def __init__(self, kernel_size=21, sigma=3.0, psf_library_path="master_psf_library.pt"):
         super(DiffractionAwareFilter, self).__init__()
 
         # 1 in channel (raw flux), 1 out channel (filter response)
         self.conv = nn.Conv2d(1, 1, kernel_size=kernel_size, padding=kernel_size//2, bias=False)
 
-        # Priority initialization: Realistic Roman PSF prior
-        if os.path.exists("roman_psf_prior.pt"):
+        # Priority 1: Master PSF Library (The survey-average blurred PSF)
+        # Priority 2: Realistic Roman Template (The pristine core)
+        # Priority 3: Analytical Mexican Hat (Fallback)
+        
+        kernel = None
+        
+        # Try Priority 1: Library Mean
+        if os.path.exists(psf_library_path):
             try:
-                # Load high-fidelity prior (expected 31x31 or similar)
-                realistic_psf = torch.load("roman_psf_prior.pt", map_location='cpu', weights_only=True)
-                # Crop or pad to match kernel_size
-                curr_s = realistic_psf.shape[0]
-                if curr_s > kernel_size:
-                    start = (curr_s - kernel_size) // 2
-                    kernel = realistic_psf[start:start+kernel_size, start:start+kernel_size]
+                master_data = torch.load(psf_library_path, map_location='cpu', weights_only=True)
+                # Reconstruct mean_psf (stored as flattened in psf_lib or dict)
+                if isinstance(master_data, dict):
+                    m_psf = torch.from_numpy(master_data['mean_psf']).float()
                 else:
-                    kernel = F.pad(realistic_psf, [(kernel_size-curr_s)//2]*4)
+                    m_psf = torch.from_numpy(master_data[2]).float() # (eigen, weights, mean)
                 
-                # Zero-mean and normalize
-                kernel = kernel - kernel.mean()
-                kernel = kernel / torch.max(torch.abs(kernel))
-                print("🛰️ DiffractionAwareFilter initialized with Realistic Roman Prior")
+                # Reshape to 2D if needed (assume square)
+                if m_psf.dim() == 1:
+                    s = int(m_psf.shape[0]**0.5)
+                    m_psf = m_psf.view(s, s)
+                
+                kernel = self._fit_to_kernel_size(m_psf, kernel_size)
+                print(f"🛰️ DiffractionAwareFilter: Initialized with Master Library Mean ({psf_library_path})")
             except Exception as e:
-                print(f"⚠️ Failed to load roman_psf_prior.pt: {e}. Falling back to analytical prior.")
-                kernel = self._generate_analytical_prior(kernel_size, sigma)
-        else:
-            kernel = self._generate_analytical_prior(kernel_size, sigma)
+                print(f"⚠️ Failed to load master library for prior: {e}")
 
-        # Assign the prior to the Conv2d weights
+        # Try Priority 2: Pristine Template
+        if kernel is None and os.path.exists("roman_psf_prior.pt"):
+            try:
+                realistic_psf = torch.load("roman_psf_prior.pt", map_location='cpu', weights_only=True).float()
+                kernel = self._fit_to_kernel_size(realistic_psf, kernel_size)
+                print("🛰️ DiffractionAwareFilter: Initialized with Realistic Roman Template")
+            except Exception: pass
+
+        # Priority 3: Analytical Fallback
+        if kernel is None:
+            kernel = self._generate_analytical_prior(kernel_size, sigma)
+            print("🛰️ DiffractionAwareFilter: Initialized with Analytical Mexican Hat")
+
+        # Zero-mean and normalize (Acts as a high-pass/edge-like detector)
+        kernel = kernel - kernel.mean()
+        kernel = kernel / torch.max(torch.abs(kernel))
+
         initial_weight = kernel.view(1, 1, kernel_size, kernel_size).float()
         self.conv.weight.data = initial_weight.clone()
         self.register_buffer("init_weight", initial_weight)
         self.conv.weight.requires_grad = True
+
+    def _fit_to_kernel_size(self, psf, kernel_size):
+        """ Crops or pads a PSF to match the target kernel size. """
+        curr_s = psf.shape[0]
+        if curr_s > kernel_size:
+            start = (curr_s - kernel_size) // 2
+            return psf[start:start+kernel_size, start:start+kernel_size]
+        elif curr_s < kernel_size:
+            pad = (kernel_size - curr_s) // 2
+            return F.pad(psf, [pad, pad, pad, pad])
+        return psf
 
     def _generate_analytical_prior(self, kernel_size, sigma):
         # 1. Generate the 2D Mexican Hat (Laplacian of Gaussian) kernel
