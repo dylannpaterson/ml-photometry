@@ -128,7 +128,9 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size, master_psf_
     # 1. GENERATE GLOBAL EXPOSURE JITTER
     # -------------------------------------------------------------------------
     # Spacecraft vibration is global across the whole detector for one exposure.
-    s_jit = np.random.uniform(0.1, 0.25) # ~11 to 28 mas RMS
+    # Roman pointing requirement is 14 mas RMS per axis.
+    # 14 mas / 110 mas/pixel = 0.127 pixels.
+    s_jit = np.random.normal(0.127, 0.01) 
     q_jit = np.random.uniform(0.8, 1.0)
     theta_jit = np.random.uniform(0, np.pi)
     
