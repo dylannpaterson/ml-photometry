@@ -3,9 +3,10 @@
 #SBATCH --time=12:00:00            
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16         
-#SBATCH --mem=64G                 
-#SBATCH --partition=batch          
+#SBATCH --cpus-per-task=8          
+#SBATCH --mem=64G                  
+#SBATCH --partition=batch-gpu      
+#SBATCH --gpus-per-node=1          
 #SBATCH --output=logs/gen_%j.out
 #SBATCH --error=logs/gen_%j.err
 

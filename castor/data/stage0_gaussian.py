@@ -12,7 +12,7 @@ from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZ
 from numba import njit
 import gc
 
-#@njit(boundscheck=False)
+@njit(boundscheck=False)
 def fast_paint_grid(lx, ly, fluxes, snrs, psf_weights, sort_idx, min_snr, grid_size, cell_size, K):
     N_PCA = psf_weights.shape[1]
     grid_stars = np.zeros((grid_size, grid_size, K, 4 + N_PCA), dtype=np.float32)
