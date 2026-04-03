@@ -6,79 +6,118 @@ import math
 import time
 
 def _get_jax_renderer_core():
-    def render_core(x, y, fluxes, psf_indices, kernel_bank, mosaic_size):
-        num_kernels = kernel_bank.shape[0]
+    """
+    PCA-optimized JAX renderer with Eigen-Jiggling.
+    Draws all stars with the mean PSF, but only applies eigen-corrections
+    to stars brighter than the magnitude limit.
+    """
+    def render_core(x, y, fluxes, mags, psf_indices, weights_lib, mean_psf, eigen_psfs, s_vals, mosaic_size, mag_limit, key):
+        n_pca = eigen_psfs.shape[0]
+        n_stars = fluxes.shape[0]
         
-        # 1. Bilinear Sub-pixel Distribution (The Fix)
+        # 1. Bilinear Sub-pixel Distribution (The 4-pixel footprint)
         x0 = jnp.floor(x).astype(jnp.int32)
         y0 = jnp.floor(y).astype(jnp.int32)
         dx = x - x0
         dy = y - y0
         
-        # Boundary Masks for 2x2 grid
+        # Boundary Masks
         mask00 = (x0 >= 0) & (x0 < mosaic_size) & (y0 >= 0) & (y0 < mosaic_size)
         mask10 = (x0+1 >= 0) & (x0+1 < mosaic_size) & (y0 >= 0) & (y0 < mosaic_size)
         mask01 = (x0 >= 0) & (x0 < mosaic_size) & (y0+1 >= 0) & (y0+1 < mosaic_size)
         mask11 = (x0+1 >= 0) & (x0+1 < mosaic_size) & (y0+1 >= 0) & (y0+1 < mosaic_size)
         
-        grids = jnp.zeros((num_kernels, mosaic_size, mosaic_size))
+        # --- Base Pass (All Stars) ---
+        # Bilinear scatter into a single grid for the mean PSF
+        base_grid = jnp.zeros((1, mosaic_size, mosaic_size))
+        base_grid = base_grid.at[0, y0, x0].add(jnp.where(mask00, fluxes * (1-dx) * (1-dy), 0.0))
+        base_grid = base_grid.at[0, y0, x0+1].add(jnp.where(mask10, fluxes * dx * (1-dy), 0.0))
+        base_grid = base_grid.at[0, y0+1, x0].add(jnp.where(mask01, fluxes * (1-dx) * dy, 0.0))
+        base_grid = base_grid.at[0, y0+1, x0+1].add(jnp.where(mask11, fluxes * dx * dy, 0.0))
         
-        # Scatter 4-pixel footprint for every star
-        grids = grids.at[psf_indices, y0, x0].add(jnp.where(mask00, fluxes * (1-dx) * (1-dy), 0.0))
-        grids = grids.at[psf_indices, y0, x0+1].add(jnp.where(mask10, fluxes * dx * (1-dy), 0.0))
-        grids = grids.at[psf_indices, y0+1, x0].add(jnp.where(mask01, fluxes * (1-dx) * dy, 0.0))
-        grids = grids.at[psf_indices, y0+1, x0+1].add(jnp.where(mask11, fluxes * dx * dy, 0.0))
+        # --- Eigen-Jiggling Pass (Bright Stars Only) ---
+        is_bright = mags < mag_limit
+        bright_fluxes = jnp.where(is_bright, fluxes, 0.0)
         
-        k_h, k_w = kernel_bank.shape[1], kernel_bank.shape[2]
+        # Assign base weights from library
+        base_star_weights = weights_lib[psf_indices] # [N, n_pca]
+        
+        # Add perturbation proportional to singular values (Simulate local breathing/jitter)
+        perturb_scale = 0.05
+        noise = jax.random.normal(key, shape=(n_stars, n_pca)) * (s_vals * perturb_scale)
+        star_weights = base_star_weights + noise
+        
+        # Scatter each eigen-component using bilinear weights
+        # We use a scan here to handle 20 components efficiently
+        def scatter_eigen(carry, i):
+            w_f = bright_fluxes * star_weights[:, i]
+            grid = jnp.zeros((mosaic_size, mosaic_size))
+            grid = grid.at[y0, x0].add(jnp.where(mask00, w_f * (1-dx) * (1-dy), 0.0))
+            grid = grid.at[y0, x0+1].add(jnp.where(mask10, w_f * dx * (1-dy), 0.0))
+            grid = grid.at[y0+1, x0].add(jnp.where(mask01, w_f * (1-dx) * dy, 0.0))
+            grid = grid.at[y0+1, x0+1].add(jnp.where(mask11, w_f * dx * dy, 0.0))
+            return carry, grid
+
+        _, eigen_grids = jax.lax.scan(scatter_eigen, None, jnp.arange(n_pca))
+            
+        # Convolutions
+        k_h, k_w = mean_psf.shape
         pad_h, pad_w = k_h // 2, k_w // 2
         
-        kernels_flipped = kernel_bank[:, ::-1, ::-1]
-        kernels_reshaped = kernels_flipped.reshape((num_kernels, 1, k_h, k_w))
-        grids_reshaped = grids[jnp.newaxis, :, :, :] 
-        
-        # Convolve all grids simultaneously using grouped convolution
-        rendered_phases = lax.conv_general_dilated(
-            grids_reshaped,
-            kernels_reshaped,
+        # 11-Pass Eigen-Convolution (1 Base + N_PCA Eigen)
+        base_kernel = mean_psf[::-1, ::-1].reshape((1, 1, k_h, k_w))
+        base_rendered = lax.conv_general_dilated(
+            base_grid[jnp.newaxis, :, :, :],
+            base_kernel,
             window_strides=(1, 1),
             padding=[(pad_h, pad_h), (pad_w, pad_w)],
-            dimension_numbers=('NCHW', 'OIHW', 'NCHW'), 
-            feature_group_count=num_kernels
+            dimension_numbers=('NCHW', 'OIHW', 'NCHW')
         )
         
-        return jnp.sum(rendered_phases, axis=1).squeeze()
+        eigen_kernels = eigen_psfs[:, ::-1, ::-1].reshape((n_pca, 1, k_h, k_w))
+        eigen_rendered = lax.conv_general_dilated(
+            eigen_grids[jnp.newaxis, :, :, :],
+            eigen_kernels,
+            window_strides=(1, 1),
+            padding=[(pad_h, pad_h), (pad_w, pad_w)],
+            dimension_numbers=('NCHW', 'OIHW', 'NCHW'),
+            feature_group_count=n_pca
+        )
+        
+        final_image = (base_rendered + jnp.sum(eigen_rendered, axis=1)).squeeze()
+        return final_image, star_weights
     
     return render_core
 
 def _get_fused_generator_renderer():
     render_core = _get_jax_renderer_core()
     
-    def fused_op(key, fluxes, mags, kernel_bank, mosaic_size, mag_limit):
+    def fused_op(key, fluxes, mags, weights_lib, mean_psf, eigen_psfs, s_vals, mosaic_size, mag_limit):
         n_stars = fluxes.shape[0]
-        num_kernels = kernel_bank.shape[0]
-        k1, k2, k3 = jax.random.split(key, 3)
+        num_psfs = weights_lib.shape[0]
+        k1, k2, k3, k4 = jax.random.split(key, 4)
         
-        # 1. Generate Coordinates directly on GPU
+        # Coordinate Generation
         x = jax.random.uniform(k1, shape=(n_stars,), minval=0.0, maxval=float(mosaic_size))
         y = jax.random.uniform(k2, shape=(n_stars,), minval=0.0, maxval=float(mosaic_size))
         
-        # 2. Assign a random PSF index from the library
-        psf_indices = jax.random.randint(k3, shape=(n_stars,), minval=0, maxval=num_kernels)
+        # PSF Library Selection
+        psf_indices = jax.random.randint(k3, shape=(n_stars,), minval=0, maxval=num_psfs)
         
-        # 3. Render
-        image = render_core(x, y, fluxes, psf_indices, kernel_bank, mosaic_size)
+        # Jiggled Rendering
+        image, final_star_weights = render_core(x, y, fluxes, mags, psf_indices, weights_lib, mean_psf, eigen_psfs, s_vals, mosaic_size, mag_limit, k4)
         
-        # 4. Filter Mask
+        # Catalog Filter
         catalog_mask = mags < mag_limit
         
-        return image, x, y, psf_indices, catalog_mask
+        return image, x, y, psf_indices, catalog_mask, final_star_weights
 
-    return jax.jit(fused_op, static_argnums=(4,))
+    return jax.jit(fused_op, static_argnums=(7, 8))
 
 _FUSED_OP = None
 _JAX_KEY = jax.random.PRNGKey(int(time.time())) if 'time' in globals() else jax.random.PRNGKey(42)
 
-def render_generate_and_filter_gpu(fluxes, mags, kernel_bank, mosaic_size, mag_limit=27.0):
+def render_generate_and_filter_gpu(fluxes, mags, weights_lib, mean_psf, eigen_psfs, s_vals, mosaic_size, mag_limit=27.0):
     global _FUSED_OP, _JAX_KEY
     if _FUSED_OP is None:
         _FUSED_OP = _get_fused_generator_renderer()
@@ -86,7 +125,7 @@ def render_generate_and_filter_gpu(fluxes, mags, kernel_bank, mosaic_size, mag_l
     _JAX_KEY, subkey = jax.random.split(_JAX_KEY)
     
     current_size = len(fluxes)
-    chunk_size = 1_000_000 
+    chunk_size = 100_000
     padded_size = int(math.ceil(current_size / chunk_size)) * chunk_size
     pad_width = padded_size - current_size
     
@@ -98,17 +137,23 @@ def render_generate_and_filter_gpu(fluxes, mags, kernel_bank, mosaic_size, mag_l
 
     fluxes_jax = jnp.array(fluxes_padded)
     mags_jax = jnp.array(mags_padded)
-    kernels_jax = jnp.array(kernel_bank)
+    weights_jax = jnp.array(weights_lib)
+    mean_psf_jax = jnp.array(mean_psf)
+    eigen_psfs_jax = jnp.array(eigen_psfs)
+    s_vals_jax = jnp.array(s_vals)
     
-    image_jax, x_jax, y_jax, psf_jax, mask_jax = _FUSED_OP(subkey, fluxes_jax, mags_jax, kernels_jax, mosaic_size, mag_limit)
+    image_jax, x_jax, y_jax, psf_jax, mask_jax, weights_jax_out = _FUSED_OP(
+        subkey, fluxes_jax, mags_jax, weights_jax, mean_psf_jax, eigen_psfs_jax, s_vals_jax, mosaic_size, float(mag_limit)
+    )
     
     image = np.array(image_jax)
-    mask = np.array(mask_jax)
+    mask = np.array(mask_jax)[:current_size]
     
-    valid_x = np.array(x_jax)[mask]
-    valid_y = np.array(y_jax)[mask]
-    valid_psf = np.array(psf_jax)[mask]
-    valid_flux = np.array(fluxes_jax)[mask]
-    valid_mags = np.array(mags_jax)[mask]
+    x_v = np.array(x_jax)[:current_size][mask]
+    y_v = np.array(y_jax)[:current_size][mask]
+    psf_v = np.array(psf_jax)[:current_size][mask]
+    flux_v = fluxes[mask]
+    mag_v = mags[mask]
+    weights_v = np.array(weights_jax_out)[:current_size][mask]
     
-    return image, valid_x, valid_y, valid_psf, valid_flux, valid_mags
+    return image, x_v, y_v, psf_v, flux_v, mag_v, weights_v

@@ -34,35 +34,60 @@ class FPNBlock(nn.Module):
 class DiffractionAwareFilter(nn.Module):
     def __init__(self, kernel_size=21, sigma=3.0):
         super(DiffractionAwareFilter, self).__init__()
-        
+
         # 1 in channel (raw flux), 1 out channel (filter response)
         self.conv = nn.Conv2d(1, 1, kernel_size=kernel_size, padding=kernel_size//2, bias=False)
-        
+
+        # Priority initialization: Realistic Roman PSF prior
+        if os.path.exists("roman_psf_prior.pt"):
+            try:
+                # Load high-fidelity prior (expected 31x31 or similar)
+                realistic_psf = torch.load("roman_psf_prior.pt", map_location='cpu', weights_only=True)
+                # Crop or pad to match kernel_size
+                curr_s = realistic_psf.shape[0]
+                if curr_s > kernel_size:
+                    start = (curr_s - kernel_size) // 2
+                    kernel = realistic_psf[start:start+kernel_size, start:start+kernel_size]
+                else:
+                    kernel = F.pad(realistic_psf, [(kernel_size-curr_s)//2]*4)
+                
+                # Zero-mean and normalize
+                kernel = kernel - kernel.mean()
+                kernel = kernel / torch.max(torch.abs(kernel))
+                print("🛰️ DiffractionAwareFilter initialized with Realistic Roman Prior")
+            except Exception as e:
+                print(f"⚠️ Failed to load roman_psf_prior.pt: {e}. Falling back to analytical prior.")
+                kernel = self._generate_analytical_prior(kernel_size, sigma)
+        else:
+            kernel = self._generate_analytical_prior(kernel_size, sigma)
+
+        # Assign the prior to the Conv2d weights
+        initial_weight = kernel.view(1, 1, kernel_size, kernel_size).float()
+        self.conv.weight.data = initial_weight.clone()
+        self.register_buffer("init_weight", initial_weight)
+        self.conv.weight.requires_grad = True
+
+    def _generate_analytical_prior(self, kernel_size, sigma):
         # 1. Generate the 2D Mexican Hat (Laplacian of Gaussian) kernel
         grid = torch.arange(-kernel_size // 2 + 1., kernel_size // 2 + 1.)
         y, x = torch.meshgrid(grid, grid, indexing='ij')
         r2 = x**2 + y**2
-        
+
         # LoG Formula
         kernel = -(1.0 / (np.pi * sigma**4)) * (1.0 - r2 / (2 * sigma**2)) * torch.exp(-r2 / (2 * sigma**2))
-        
+
+        # 2. Add Spikes to the prior (3 lines at 0, 60, 120 degrees)
+        angles = [0, np.pi/3, 2*np.pi/3]
+        for angle in angles:
+            # Distance from each pixel to the infinite line at this angle
+            dist_to_line = torch.abs(x * np.sin(angle) - y * np.cos(torch.tensor(angle)))
+            # Add a thin exponential spike
+            kernel += torch.exp(-dist_to_line / 0.5) * 0.05
+
         # Normalize the kernel so it doesn't blow up the activations
         kernel = kernel - kernel.mean()
         kernel = kernel / torch.max(torch.abs(kernel))
-        
-        # 2. Assign the mathematical prior to the Conv2d weights
-        # Reshape to match PyTorch weight format: [out_channels, in_channels, H, W]
-        initial_weight = kernel.view(1, 1, kernel_size, kernel_size).float()
-        self.conv.weight.data = initial_weight.clone()
-        
-        # NEW: Store the initial weight as a buffer so it stays on the same device
-        # but is NOT updated by the optimizer.
-        self.register_buffer("init_weight", initial_weight)
-        
-        # 3. CRITICAL: Allow the network to backpropagate and warp this shape 
-        # to match the true Roman PSF diffraction spikes!
-        self.conv.weight.requires_grad = True
-
+        return kernel
     def get_regularization_loss(self):
         """
         Calculates the L2 distance from the initial LoG kernel.

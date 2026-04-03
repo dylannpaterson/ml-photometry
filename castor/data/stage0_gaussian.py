@@ -12,13 +12,18 @@ from castor.data.transforms import AstroSpaceTransform
 from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE, N_PCA_COMPONENTS
 from numba import njit
 import gc
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 try:
     import galsim
 except ImportError:
     galsim = None
 
-#@njit(boundscheck=False)
+def convolve_worker(phase_map, psf):
+    """Worker function for parallel convolution."""
+    return fftconvolve(phase_map, psf, mode='same')
+
+@njit(boundscheck=False)
 def fast_paint_grid(lx, ly, fluxes, snrs, psf_weights, sort_idx, min_snr, grid_size, cell_size, K):
     # Size is now exactly 4 + N_PCA (Existence, dx, dy, flux, weights...)
     N_PCA = psf_weights.shape[1]
@@ -95,7 +100,7 @@ class GaussianPretrainingProvider(Dataset):
         self.max_stars = max_stars
         self.img_size = image_size
         self.K = max_capacity_per_cell
-        self.S = shape_size # Now 31 (PCA Basis Resolution)
+        self.S = shape_size # Now 127
         self.read_noise = 5.0
         self.use_fixed_seed = use_fixed_seed
         self.min_snr = min_snr
@@ -103,7 +108,7 @@ class GaussianPretrainingProvider(Dataset):
         self.cell_size = DEFAULT_CELL_SIZE
         self.grid_size = self.img_size // self.cell_size
         self.n_sub = 4
-        self.render_kernel_size = 31 # Smooth tails (sigma=1.5)
+        self.render_kernel_size = self.S # Smooth tails (sigma=1.5)
         self.sigma_fixed = 1.5
         self.n_pca = N_PCA_COMPONENTS
         
@@ -124,17 +129,54 @@ class GaussianPretrainingProvider(Dataset):
         self.psf_peak = 1.0 / (2 * np.pi * self.sigma_fixed**2)
 
     def _generate_elliptical_library(self, num_psfs, grid_size):
+        """
+        Generates a library of varied Roman-style PSFs by convolving a high-fidelity 
+        optical template with a varied elliptical jitter kernel.
+        """
         library = np.zeros((num_psfs, grid_size, grid_size), dtype=np.float32)
         half = grid_size // 2
+        
+        # 1. Load the Realistic Optical Template
+        optical_template = None
+        if os.path.exists("roman_psf_prior.pt"):
+            try:
+                optical_template = torch.load("roman_psf_prior.pt", map_location='cpu', weights_only=True).numpy()
+                print("🛰️ GaussianPretrainingProvider: Using roman_psf_prior.pt as optical template")
+            except Exception as e:
+                print(f"⚠️ Failed to load template: {e}")
+
         y, x = np.meshgrid(np.arange(grid_size) - half, np.arange(grid_size) - half, indexing='ij')
         
         for i in range(num_psfs):
+            # 2. Generate a Varied Elliptical Jitter/Detector Kernel
+            s_jit = np.random.uniform(0.3, 0.8)
             q = np.random.uniform(0.7, 1.0)
             theta = np.random.uniform(0, np.pi)
             cos, sin = np.cos(theta), np.sin(theta)
             xp = x * cos + y * sin
             yp = -x * sin + y * cos
-            psf = np.exp(-(xp**2 / (2 * self.sigma_fixed**2) + yp**2 / (2 * (self.sigma_fixed * q)**2)))
+            jitter_kernel = np.exp(-(xp**2 / (2 * s_jit**2) + yp**2 / (2 * (s_jit * q)**2)))
+            jitter_kernel /= (jitter_kernel.sum() + 1e-9)
+            
+            if optical_template is not None:
+                # 3. CONVOLVE: Physics-correct combination of optics + jitter
+                # Randomly rotate the optical template first (SCA orientation)
+                from scipy.ndimage import rotate
+                angle = np.random.uniform(0, 360)
+                rotated_template = rotate(optical_template, angle, reshape=False, order=3, mode='constant', cval=0.0)
+                
+                # Combine
+                psf = fftconvolve(rotated_template, jitter_kernel, mode='same')
+            else:
+                # Fallback to analytical spiked model
+                psf = np.exp(-(xp**2 / (2 * self.sigma_fixed**2) + yp**2 / (2 * (self.sigma_fixed * q)**2)))
+                angles = [0, np.pi/3, 2*np.pi/3]
+                for angle in angles:
+                    dist_to_line = np.abs(x * np.sin(angle) - y * np.cos(angle))
+                    psf += np.exp(-dist_to_line / 0.4) * 0.05 * np.exp(-(x**2 + y**2) / (2 * 10**2))
+                
+            # Ensure positivity and normalize
+            psf = np.maximum(0, psf)
             psf /= (psf.sum() + 1e-9)
             library[i] = psf
         return library
@@ -201,37 +243,37 @@ class GaussianPretrainingProvider(Dataset):
 
         # Rendering
         star_signal = np.zeros((self.img_size, self.img_size), dtype=np.float32)
-        monster_cutoff = min(3000, int(n_stars * 0.05))
-        cx, cy, cf = x_centers[monster_cutoff:], y_centers[monster_cutoff:], fluxes[monster_cutoff:]
-        x0, y0 = np.floor(cx).astype(int), np.floor(cy).astype(int)
-        phase_x = np.clip(np.floor((cx - x0) * self.n_sub).astype(int), 0, self.n_sub - 1)
-        phase_y = np.clip(np.floor((cy - y0) * self.n_sub).astype(int), 0, self.n_sub - 1)
-
-        for i in range(self.n_sub):
-            for j in range(self.n_sub):
-                mask = (phase_x == i) & (phase_y == j)
-                if mask.any():
-                    phase_map, _, _ = np.histogram2d(
-                        y0[mask], x0[mask], 
-                        bins=self.img_size, 
-                        range=[[0, self.img_size], [0, self.img_size]], 
-                        weights=cf[mask]
-                    )
-                    star_signal += fftconvolve(phase_map, self.kernel_bank[(i, j)], mode='same').astype(np.float32)
-
-        for i in range(monster_cutoff):
-            fx, fy, f, p_idx = x_centers[i], y_centers[i], fluxes[i], psf_indices[i]
-            half = self.render_kernel_size // 2
-            ix, iy = int(fx), int(fy)
-            y0_m, y1_m = max(0, iy-half), min(self.img_size, iy+half+1)
-            x0_m, x1_m = max(0, ix-half), min(self.img_size, ix+half+1)
-            sy0, sy1 = half - (iy - y0_m), half + (y1_m - iy)
-            sx0, sx1 = half - (ix - x0_m), half + (x1_m - ix)
+        
+        # Prepare phase maps for each PSF
+        num_psf_lib = self.psf_weights_lib.shape[0]
+        phase_maps = [np.zeros((self.img_size, self.img_size), dtype=np.float32) for _ in range(num_psf_lib)]
+        for i in range(n_stars):
+            p_idx = psf_indices[i]
+            px, py, pf = x_centers[i], y_centers[i], fluxes[i]
+            x0, y0 = np.floor(px).astype(int), np.floor(py).astype(int)
+            dx, dy = px - x0, py - y0
             
-            # Reconstructing high-res PSF for monster rendering
-            psf_reconstructed = (self.eigen_psfs.reshape(self.n_pca, -1).T @ self.psf_weights_lib[p_idx]).reshape(self.render_kernel_size, self.render_kernel_size) + self.mean_psf
-            stamp = psf_reconstructed[sy0:sy1, sx0:sx1] * f
-            star_signal[y0_m:y1_m, x0_m:x1_m] += stamp
+            # 4-pixel bilinear distribution
+            if 0 <= x0 < self.img_size-1 and 0 <= y0 < self.img_size-1:
+                phase_maps[p_idx][y0, x0] += pf * (1-dx) * (1-dy)
+                phase_maps[p_idx][y0, x0+1] += pf * dx * (1-dy)
+                phase_maps[p_idx][y0+1, x0] += pf * (1-dx) * dy
+                phase_maps[p_idx][y0+1, x0+1] += pf * dx * dy
+
+        # Parallel Convolutions (12 cores)
+        # Note: We use the already computed 'raw_library' from __init__ for the PSFs
+        kb_array = [self.kernel_bank[(0,0)]] * num_psf_lib # All same for base pretraining currently
+        # Wait, the elliptical library generator actually populates unique PSFs.
+        # Let's re-fetch them from the internal state correctly.
+        # The Elliptical Library is generated during __init__ and stored in self.kernel_bank? No.
+        # It's generated but then only eigen components are kept?
+        # Let's fix __init__ to keep the raw library for rendering.
+        
+        # Actually, let's keep the existing loop structure but parallelize it.
+        with ProcessPoolExecutor(max_workers=12) as executor:
+            futures = [executor.submit(convolve_worker, phase_maps[i], self._raw_library[i]) for i in range(num_psf_lib)]
+            for future in as_completed(futures):
+                star_signal += future.result()
 
         total_photon_flux = star_signal + sky_level
         chunk_median = np.median(star_signal) + sky_level

@@ -62,7 +62,7 @@ data_params:
   GLOBAL_STRETCH_SCALE: 10.0
   
   # Rendering & PSF Generation
-  n_library_psfs: 100
+  n_library_psfs: 20
   min_snr: 5.0
   
   # Instrument & Observation Physics (Roman WFI Defaults)

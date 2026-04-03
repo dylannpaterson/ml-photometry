@@ -3,12 +3,13 @@ import os
 import torch
 import numpy as np
 import pandas as pd
-from castor.data.stage0_gaussian import GaussianPretrainingProvider, sample_bulge_magnitudes
+from castor.data.stage0_gaussian import sample_bulge_magnitudes
 from castor.cloud.config_utils import load_config
 import shutil
 import time
 from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, N_PCA_COMPONENTS
 from scipy.signal import fftconvolve
+import scipy.fft
 
 # GPU/JAX Acceleration
 try:
@@ -24,50 +25,49 @@ except ImportError:
     print("⚠️ JAX not found, falling back to slow NumPy path")
 
 def calculate_safe_magnitude_cutoff(exp_time, zp, sky_mag, read_noise=5.0, sigma=1.5, snr_cutoff=2.0):
-    """
-    Calculates the faintest magnitude that could theoretically reach snr_cutoff
-    in a perfectly isolated, empty patch of sky.
-    """
     pixel_scale = 0.11
     sky_level = (10 ** (-0.4 * (sky_mag - zp))) * (pixel_scale**2) * exp_time
     n_pix = 4 * np.pi * (sigma ** 2)
     bg_variance = n_pix * (sky_level + read_noise**2)
-    
-    # Solve quadratic: F^2 - snr^2*F - snr^2*bg_var = 0
     a, b, c = 1.0, -(snr_cutoff**2), -(snr_cutoff**2) * bg_variance
     min_flux = (-b + np.sqrt(b**2 - 4*a*c)) / (2*a)
-    
-    mag_cutoff = zp - 2.5 * np.log10(min_flux / exp_time)
-    return mag_cutoff
+    return zp - 2.5 * np.log10(min_flux / exp_time)
 
-def generate_elliptical_psf_library(num_psfs=100, grid_size=9, sigma=1.5):
-    """
-    Generates a library of varied elliptical Gaussians to simulate spatially varying PSFs.
-    Each PSF is a flattened grid_size x grid_size array.
-    """
-    library = np.zeros((num_psfs, grid_size * grid_size), dtype=np.float32)
+def generate_elliptical_psf_library(num_psfs=100, grid_size=127):
+    library = np.zeros((num_psfs, grid_size, grid_size), dtype=np.float32)
     half = grid_size // 2
+    
+    optical_template = None
+    if os.path.exists("roman_psf_prior.pt"):
+        try:
+            optical_template = torch.load("roman_psf_prior.pt", map_location='cpu', weights_only=True).numpy()
+            print("🛰️ Using roman_psf_prior.pt as optical template")
+        except Exception as e:
+            print(f"⚠️ Failed to load template: {e}")
+
     y, x = np.meshgrid(np.arange(grid_size) - half, np.arange(grid_size) - half, indexing='ij')
     
     for i in range(num_psfs):
-        # vary ellipticity and position angle
-        q = np.random.uniform(0.7, 1.0) # axis ratio
-        theta = np.random.uniform(0, np.pi) # position angle
-        
-        # rotation matrix
+        s_jit = np.random.uniform(0.3, 0.8)
+        q = np.random.uniform(0.7, 1.0)
+        theta = np.random.uniform(0, np.pi)
         cos, sin = np.cos(theta), np.sin(theta)
-        xp = x * cos + y * sin
-        yp = -x * sin + y * cos
+        xp, yp = x * cos + y * sin, -x * sin + y * cos
+        jitter_kernel = np.exp(-(xp**2 / (2 * s_jit**2) + yp**2 / (2 * (s_jit * q)**2)))
+        jitter_kernel /= (jitter_kernel.sum() + 1e-9)
         
-        # elliptical gaussian
-        psf = np.exp(-(xp**2 / (2 * sigma**2) + yp**2 / (2 * (sigma * q)**2)))
-        psf /= psf.sum()
-        library[i] = psf.flatten()
-        
+        if optical_template is not None:
+            from scipy.ndimage import rotate
+            rotated = rotate(optical_template, np.random.uniform(0, 360), reshape=False, order=3, mode='constant', cval=0.0)
+            psf = fftconvolve(rotated, jitter_kernel, mode='same')
+        else:
+            psf = jitter_kernel
+            
+        psf = np.maximum(0, psf)
+        library[i] = psf / (psf.sum() + 1e-9)
     return library
 
 def _compute_eigen_psfs(large_library, n_components=20):
-    """Native PyTorch PCA to extract Eigen-PSFs and their weights."""
     N, H, W = large_library.shape
     data = torch.from_numpy(large_library).float().view(N, H * W)
     mean_psf = data.mean(dim=0)
@@ -75,194 +75,123 @@ def _compute_eigen_psfs(large_library, n_components=20):
     U, S, V = torch.pca_lowrank(centered_data, q=n_components)
     eigen_psfs = V.t().view(n_components, H, W).numpy()
     psf_weights = (U * S).numpy() 
-    return eigen_psfs, psf_weights, mean_psf.view(H, W).numpy()
+    return eigen_psfs, psf_weights, mean_psf.view(H, W).numpy(), S.numpy()
+
+def scatter_bincount(mosaic_size, flat_indices, weights):
+    """Ultra-fast accumulation using np.bincount."""
+    return np.bincount(flat_indices, weights=weights, minlength=mosaic_size*mosaic_size).reshape(mosaic_size, mosaic_size)
 
 def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size):
-    """
-    Generates a large seamless mosaic using the 'Bake and Drop' strategy.
-    Uses a mathematically guaranteed SNR cutoff for catalog culling.
-    """
     start_time = time.time()
-    training_size = params['image_size']
-    area_ratio = (mosaic_size / training_size)**2
-    
-    # 1. Global Physical Parameters
-    rc_loc = np.random.uniform(14.5, 16.5)
-    rc_scale = np.random.uniform(0.2, 0.5)
-    rc_enhancement = np.random.uniform(5.0, 15.0)
-    lf_gamma = np.random.uniform(0.25, 0.35)
-    exp_time = np.random.uniform(30.0, 60.0)
-    zp, sky_mag = 26.5, 22.0
-    
-    # Calculate dynamic safety cutoff (e.g., SNR 2.0 limit)
+    area_ratio = (mosaic_size / params['image_size'])**2
+    exp_time, zp, sky_mag = np.random.uniform(30.0, 60.0), 26.5, 22.0
     mag_limit = calculate_safe_magnitude_cutoff(exp_time, zp, sky_mag, snr_cutoff=2.0)
     
-    # Full massive population (physics) - Log-uniform sampling for better density coverage
-    min_total = params['min_stars'] * area_ratio
-    max_total = params['max_stars'] * area_ratio
-    n_stars_total = int(10 ** np.random.uniform(np.log10(min_total), np.log10(max_total)))
+    n_stars_total = int(10 ** np.random.uniform(np.log10(params['min_stars'] * area_ratio), np.log10(params['max_stars'] * area_ratio)))
+    print(f"📦 Mosaic {idx}: Sampling {n_stars_total:,} stars...")
     
-    print(f"Generating Global Catalog for Mosaic {idx} ({n_stars_total:,} stars)...")
-    mags = sample_bulge_magnitudes(n_stars_total, rc_loc, rc_scale, rc_enhancement, m_min=12.0, m_max=32.0, gamma=lf_gamma)
+    mags = sample_bulge_magnitudes(n_stars_total, np.random.uniform(14.5, 16.5), np.random.uniform(0.2, 0.5), np.random.uniform(5.0, 15.0), m_min=12.0, m_max=32.0, gamma=np.random.uniform(0.25, 0.35))
     fluxes = exp_time * (10 ** (-0.4 * (mags - zp)))
     
-    # -------------------------------------------------------------
-    # NEW: PCA-based PSF modeling
-    # -------------------------------------------------------------
-    N_LIBRARY_PSFS = 100
-    RENDER_KERNEL_SIZE = 31 # Fix for shape truncation (sigma=1.5 tails)
-    
-    # 1. Generate large shapes for realistic rendering
-    large_psf_library_flat = generate_elliptical_psf_library(num_psfs=N_LIBRARY_PSFS, grid_size=RENDER_KERNEL_SIZE)
-    kb_array = large_psf_library_flat.reshape(N_LIBRARY_PSFS, RENDER_KERNEL_SIZE, RENDER_KERNEL_SIZE)
-    
-    # 2. Extract Eigen-PSFs and weights
-    eigen_psfs, psf_weights_lib, mean_psf = _compute_eigen_psfs(kb_array, n_components=N_PCA_COMPONENTS)
-    
-    # 3. Final library for reconstruction: [N_PCA + 1, 961]
-    psf_library = np.concatenate([
-        eigen_psfs.reshape(N_PCA_COMPONENTS, -1),
-        mean_psf.reshape(1, -1)
-    ], axis=0)
+    kb_array = generate_elliptical_psf_library(num_psfs=100, grid_size=SHAPE_SIZE)
+    eigen_psfs, psf_weights_lib, mean_psf, s_vals = _compute_eigen_psfs(kb_array, n_components=N_PCA_COMPONENTS)
     
     if HAS_JAX:
-        from castor.data.gpu_renderer import render_generate_and_filter_gpu
-        # Pass the large library directly to the GPU renderer for smooth tails
-        full_image, x_v, y_v, psf_indices, flux_v, mag_v = render_generate_and_filter_gpu(
-            fluxes, mags, kb_array, mosaic_size, mag_limit=mag_limit
+        full_image, x_v, y_v, psf_indices, flux_v, mag_v, final_weights_v = render_generate_and_filter_gpu(
+            fluxes, mags, psf_weights_lib, mean_psf, eigen_psfs, s_vals, mosaic_size, mag_limit=mag_limit
         )
     else:
-        # --- NumPy CPU PATH (Improved Fallback) ---
-        print("🛠️ Running CPU rendering fallback with PSF convolution...")
-        x_centers = np.random.uniform(0, mosaic_size, len(mags))
-        y_centers = np.random.uniform(0, mosaic_size, len(mags))
-        all_psf_indices = np.random.randint(0, N_LIBRARY_PSFS, size=len(mags))
+        print(f"🛠️ Running Ultra-Fast Eigen-Convolution (NumPy Optimized)...")
+        px, py = np.random.uniform(0, mosaic_size, len(fluxes)), np.random.uniform(0, mosaic_size, len(fluxes))
+        all_psf_indices = np.random.randint(0, 100, size=len(fluxes))
         
+        # Eigen-Jiggling: Pre-calculate unique weights for ALL stars
+        perturb_scale = 0.05
+        base_weights = psf_weights_lib[all_psf_indices] # [N, 20]
+        random_noise = np.random.randn(*base_weights.shape) * (s_vals * perturb_scale)
+        star_weights = base_weights + random_noise
+        
+        # Bilinear scattering constants
+        x0, y0 = np.floor(px).astype(int), np.floor(py).astype(int)
+        dx, dy = px - x0, py - y0
+        valid = (x0 >= 0) & (x0 < mosaic_size-1) & (y0 >= 0) & (y0 < mosaic_size-1)
+        
+        idx00 = y0[valid] * mosaic_size + x0[valid]
+        idx10 = idx00 + 1
+        idx01 = idx00 + mosaic_size
+        idx11 = idx01 + 1
+        
+        w00, w10, w01, w11 = (1-dx[valid])*(1-dy[valid]), dx[valid]*(1-dy[valid]), (1-dx[valid])*dy[valid], dx[valid]*dy[valid]
+        
+        def scatter_all(star_fluxes, weights_column=None, mask=None):
+            if mask is not None:
+                eff_valid = valid & mask
+                m_px, m_py = px[eff_valid], py[eff_valid]
+                m_x0, m_y0 = np.floor(m_px).astype(int), np.floor(m_py).astype(int)
+                m_dx, m_dy = m_px - m_x0, m_py - m_y0
+                m_idx00 = m_y0 * mosaic_size + m_x0
+                m_idx10, m_idx01, m_idx11 = m_idx00 + 1, m_idx00 + mosaic_size, m_idx00 + mosaic_size + 1
+                m_w00, m_w10, m_w01, m_w11 = (1-m_dx)*(1-m_dy), m_dx*(1-m_dy), (1-m_dx)*m_dy, m_dx*m_dy
+                
+                if weights_column is not None:
+                    f_v = (star_fluxes * weights_column)[eff_valid]
+                else:
+                    f_v = star_fluxes[eff_valid]
+                    
+                indices = np.concatenate([m_idx00, m_idx10, m_idx01, m_idx11])
+                vals = np.concatenate([f_v*m_w00, f_v*m_w10, f_v*m_w01, f_v*m_w11])
+            else:
+                if weights_column is not None:
+                    f_v = (star_fluxes * weights_column)[valid]
+                else:
+                    f_v = star_fluxes[valid]
+                    
+                indices = np.concatenate([idx00, idx10, idx01, idx11])
+                vals = np.concatenate([f_v*w00, f_v*w10, f_v*w01, f_v*w11])
+            return scatter_bincount(mosaic_size, indices, vals)
+
         full_image = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
-        
-        # 1. RENDER EVERYTHING (Including faint background stars)
-        # Bilinear distribution of flux across pixels for sub-pixel accuracy
-        for i in range(N_LIBRARY_PSFS):
-            mask = all_psf_indices == i
-            if not mask.any(): continue
+        with scipy.fft.set_backend(scipy.fft, workers=-1):
+            # Bilinear scatter all stars for base PSF pass
+            full_image += fftconvolve(scatter_all(fluxes), mean_psf, mode='same')
             
-            px, py, pf = x_centers[mask], y_centers[mask], fluxes[mask]
-            x0, y0 = np.floor(px).astype(int), np.floor(py).astype(int)
-            dx, dy = px - x0, py - y0
-            
-            phase_map = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
-            # Add flux to 4 nearest pixels (bilinear scattering)
-            np.add.at(phase_map, (y0, x0), pf * (1-dx) * (1-dy))
-            np.add.at(phase_map, (y0, x0+1), pf * dx * (1-dy))
-            np.add.at(phase_map, (y0+1, x0), pf * (1-dx) * dy)
-            np.add.at(phase_map, (y0+1, x0+1), pf * dx * dy)
-            
-            # Convolve this phase's flux map with its specific PSF
-            full_image += fftconvolve(phase_map, kb_array[i], mode='same')
+            is_bright = mags < mag_limit
+            if is_bright.any():
+                for j in range(N_PCA_COMPONENTS):
+                    # Bilinear scatter jiggled weights for bright stars for each eigen pass
+                    full_image += fftconvolve(scatter_all(fluxes, weights_column=star_weights[:, j], mask=is_bright), eigen_psfs[j], mode='same')
 
-        # 2. FILTER CATALOG (Only keep visible targets for the loss function)
         v_mask = mags < mag_limit
-        x_v, y_v = x_centers[v_mask], y_centers[v_mask]
-        flux_v, mag_v = fluxes[v_mask], mags[v_mask]
-        psf_indices = all_psf_indices[v_mask]
+        x_v, y_v, flux_v, mag_v, final_weights_v = px[v_mask], py[v_mask], fluxes[v_mask], mags[v_mask], star_weights[v_mask]
 
-    # 2. Save Catalog as Structured NumPy
-    # Structured Catalog
-    cat_dtype = [
-        ('x', 'f4'), ('y', 'f4'), ('flux', 'f4'), ('mag', 'f4'),
-        ('snr', 'f4')
-    ]
-    # Add PCA weights to the dtype as float16 to save space
-    for i in range(N_PCA_COMPONENTS):
-        cat_dtype.append((f'w{i}', 'f2'))
-    
-    n_visible = len(x_v)
-    structured_cat = np.zeros(n_visible, dtype=cat_dtype)
-    structured_cat['x'], structured_cat['y'] = x_v, y_v
-    structured_cat['flux'], structured_cat['mag'] = flux_v, mag_v
-    
-    # Store PCA weights
-    weights_v = psf_weights_lib[psf_indices]
-    for i in range(N_PCA_COMPONENTS):
-        structured_cat[f'w{i}'] = weights_v[:, i]
+    cat_dtype = [('x', 'f4'), ('y', 'f4'), ('flux', 'f4'), ('mag', 'f4'), ('snr', 'f4')] + [(f'w{i}', 'f2') for i in range(N_PCA_COMPONENTS)]
+    structured_cat = np.zeros(len(x_v), dtype=cat_dtype)
+    structured_cat['x'], structured_cat['y'], structured_cat['flux'], structured_cat['mag'] = x_v, y_v, flux_v, mag_v
+    for i in range(N_PCA_COMPONENTS): structured_cat[f'w{i}'] = final_weights_v[:, i]
 
-    # --- PRE-CALCULATE SNR (Moved from DataLoader) ---
-    print(f"Pre-calculating SNR for {n_visible:,} stars...")
-    pixel_scale = 0.11
-    sigma_fixed = 1.5
-    n_pix = 4 * np.pi * (sigma_fixed ** 2)
-    psf_peak = 1.0 / (2 * np.pi * sigma_fixed**2)
-    min_snr = 5.0 # Project Standard
-    
-    sky_level = (10 ** (-0.4 * (sky_mag - zp))) * (pixel_scale**2) * exp_time
-    
-    # Local background from the rendered mosaic
-    ly_idx = np.clip(y_v.astype(np.int32), 0, mosaic_size - 1)
-    lx_idx = np.clip(x_v.astype(np.int32), 0, mosaic_size - 1)
-    total_local_light = full_image[ly_idx, lx_idx]
-    
-    local_background = np.maximum(0, total_local_light - (flux_v * psf_peak))
-    noise_variance = flux_v + n_pix * (sky_level + local_background + 25.0) # read_noise=5.0
-    snrs = flux_v / np.sqrt(np.maximum(1.0, noise_variance))
-    structured_cat['snr'] = snrs
+    sky_level = (10 ** (-0.4 * (sky_mag - zp))) * (0.11**2) * exp_time
+    total_local = full_image[np.clip(y_v.astype(int), 0, mosaic_size-1), np.clip(x_v.astype(int), 0, mosaic_size-1)]
+    noise_var = flux_v + (4 * np.pi * 1.5**2) * (sky_level + np.maximum(0, total_local - flux_v*0.07) + 25.0)
+    structured_cat['snr'] = flux_v / np.sqrt(np.maximum(1.0, noise_var))
+    structured_cat = structured_cat[np.argsort(structured_cat['y'])]
 
-    # NEW: Pre-sort the catalog by Y-coordinate so the dataloader doesn't have to
-    print("Sorting catalog for fast spatial queries...")
-    sort_idx = np.argsort(structured_cat['y'])
-    structured_cat = structured_cat[sort_idx]
-
-    # 3. Save Files
-    image_path = os.path.join(output_dir, f"mosaic_{idx:03d}_img.npy")
-    cat_path = os.path.join(output_dir, f"mosaic_{idx:03d}_cat.npy")
-    meta_path = os.path.join(output_dir, f"mosaic_{idx:03d}_meta.npy")
-    lib_path = os.path.join(output_dir, f"mosaic_{idx:03d}_psf_lib.npy")
-    
-    np.save(image_path, full_image)
-    np.save(cat_path, structured_cat)
-    np.save(meta_path, np.array([exp_time, zp, sky_mag], dtype=np.float32))
-    np.save(lib_path, psf_library)
-    
-    duration = time.time() - start_time
-    print(f"✅ Saved Optimized Mosaic {idx} in {duration:.2f}s (Limit: {mag_limit:.2f} | Targets: {n_visible:,})")
+    for suffix, data in [('img', full_image), ('cat', structured_cat), ('meta', np.array([exp_time, zp, sky_mag])), ('psf_lib', np.concatenate([eigen_psfs.reshape(N_PCA_COMPONENTS, -1), mean_psf.reshape(1, -1)], axis=0))]:
+        np.save(os.path.join(output_dir, f"mosaic_{idx:03d}_{suffix}.npy"), data)
+    print(f"✅ Mosaic {idx} done in {time.time() - start_time:.2f}s")
 
 def main():
-    parser = argparse.ArgumentParser(description="Pregenerate Optimized Compact Mosaics")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config/config.yaml")
-    parser.add_argument("--stage", type=int, default=0)
     parser.add_argument("--num", type=int, default=None)
-    parser.add_argument("--output_dir", type=str, default=None, help="Specific directory to save mosaics")
-    parser.add_argument("--start_idx", type=int, default=0, help="Starting index for mosaic filenames")
-    
+    parser.add_argument("--output_dir", type=str, default=None)
     args = parser.parse_args()
-    config = load_config(args.config)
-    
-    stage_key = f"stage{args.stage}"
-    stage_cfg = config["curriculum"][stage_key]
-    data_cfg = config["data_params"]
-    
-    num_mosaics = stage_cfg["mosaic_params"].get("num_mosaics", 100)
-    if args.num is not None: num_mosaics = args.num
-        
-    mosaic_size = stage_cfg["mosaic_params"].get("mosaic_size", 1024)
-    cell_size = stage_cfg.get("cell_size", DEFAULT_CELL_SIZE)
-    
-    if args.output_dir:
-        output_dir = args.output_dir
-    else:
-        output_dir = os.path.join(stage_cfg["data_dir"], "mosaics")
-        
-    os.makedirs(output_dir, exist_ok=True)
-    
-    params = {
-        "min_stars": data_cfg["min_stars"],
-        "max_stars": data_cfg["max_stars"],
-        "image_size": data_cfg["image_size"],
-        "max_capacity_per_cell": data_cfg["max_capacity_per_cell"],
-        "shape_size": data_cfg.get("shape_size", SHAPE_SIZE)
-    }
-    
-    for i in range(num_mosaics):
-        generate_mosaic(i + args.start_idx, output_dir, params, mosaic_size, cell_size)
+    cfg = load_config(args.config)
+    stage_cfg = cfg["curriculum"]["stage0"]
+    num = args.num if args.num else stage_cfg["mosaic_params"]["num_mosaics"]
+    out = args.output_dir if args.output_dir else os.path.join(stage_cfg["data_dir"], "mosaics")
+    os.makedirs(out, exist_ok=True)
+    params = {"min_stars": cfg["data_params"]["min_stars"], "max_stars": cfg["data_params"]["max_stars"], "image_size": cfg["data_params"]["image_size"]}
+    for i in range(num): generate_mosaic(i, out, params, stage_cfg["mosaic_params"]["mosaic_size"], stage_cfg["cell_size"])
 
 if __name__ == "__main__":
     main()
