@@ -5,43 +5,43 @@ from castor.data.stage0_gaussian import GaussianPretrainingProvider
 
 def check_pca_variance():
     print("Generating 100 PSFs and computing PCA...")
-    # Initialize the provider (this automatically builds the library)
-    provider = GaussianPretrainingProvider(image_size=256)
+    # Initializing provider to get access to library generation logic
+    provider = GaussianPretrainingProvider(num_samples=1)
     
-    # Generate the raw library of 100 elliptical Gaussians
-    raw_library = provider._generate_elliptical_library(100, provider.render_kernel_size)
+    # Generate a fresh batch of 100 PSFs using the new optical-only logic
+    raw_library = provider._generate_optical_library(100, provider.S)
     
+    # Flatten for PCA
     N, H, W = raw_library.shape
     data = torch.from_numpy(raw_library).float().view(N, H * W)
-    centered_data = data - data.mean(dim=0)
     
-    # Run full-rank PCA (q=100) to see the entire spectrum of variance
-    U, S, V = torch.pca_lowrank(centered_data, q=100)
+    # Compute Mean
+    mean_psf = data.mean(dim=0)
+    centered_data = data - mean_psf
     
-    # Calculate Explained Variance
-    # Variance is proportional to the square of the singular values (S)
-    eigenvalues = (S ** 2).numpy()
-    total_variance = np.sum(eigenvalues)
+    # SVD
+    U, S, V = torch.pca_lowrank(centered_data, q=50) # Check up to 50 components
     
-    explained_variance_ratio = eigenvalues / total_variance
-    cumulative_variance = np.cumsum(explained_variance_ratio)
+    # Variance Explained
+    total_var = torch.sum(S**2)
+    var_explained = torch.cumsum(S**2, dim=0) / total_var
     
-    # Find how many components are needed for 99% and 99.9% variance
-    n_99 = np.argmax(cumulative_variance >= 0.99) + 1
-    n_999 = np.argmax(cumulative_variance >= 0.999) + 1
+    # Find thresholds
+    n99 = torch.where(var_explained >= 0.99)[0][0].item() + 1
+    n999 = torch.where(var_explained >= 0.999)[0][0].item() + 1
     
-    print(f"Components for 99.0% variance: {n_99}")
-    print(f"Components for 99.9% variance: {n_999}")
+    print(f"Components for 99.0% variance: {n99}")
+    print(f"Components for 99.9% variance: {n999}")
     
-    # Plot the Elbow Curve
-    plt.figure(figsize=(10, 5))
-    plt.plot(range(1, 101), cumulative_variance, marker='o', markersize=4, linestyle='-')
-    plt.axvline(x=20, color='r', linestyle='--', label=f'Current N_PCA = 20 ({cumulative_variance[19]*100:.2f}%)')
-    plt.axvline(x=n_99, color='g', linestyle='--', label=f'99% Variance (N = {n_99})')
+    plt.figure(figsize=(10, 6))
+    plt.plot(np.arange(1, 51), var_explained.numpy(), 'o-', label="Cumulative Variance")
+    plt.axhline(y=0.99, color='r', linestyle='--', alpha=0.5, label="99%")
+    plt.axhline(y=0.999, color='g', linestyle='--', alpha=0.5, label="99.9%")
+    plt.axvline(x=10, color='k', linestyle=':', label="Current Limit (10)")
     
-    plt.title("Cumulative Explained Variance of PSF Shapes")
     plt.xlabel("Number of PCA Components")
-    plt.ylabel("Cumulative Variance Retained")
+    plt.ylabel("Fraction of Variance Explained")
+    plt.title("PCA Variance Analysis (Optical-Only Library)")
     plt.xlim(0, 30) # Zoom in on the first 30 components
     plt.grid(True, alpha=0.3)
     plt.legend()
