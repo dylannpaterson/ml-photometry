@@ -30,29 +30,47 @@ STAGE_IDX=$(echo $TARGET_STAGE | sed 's/stage//')
 NUM_TRAIN=$(python3 -c "import yaml; c=yaml.safe_load(open('config/config.yaml')); print(c['data_params']['num_train_samples'])")
 NUM_VAL=$(python3 -c "import yaml; c=yaml.safe_load(open('config/config.yaml')); print(c['data_params']['num_val_samples'])")
 NUM_MOSAICS=$(python3 -c "import yaml; c=yaml.safe_load(open('config/config.yaml')); print(c['curriculum']['$TARGET_STAGE']['mosaic_params']['num_mosaics'])")
+NUM_VAL_MOSAICS=$(python3 -c "import yaml; c=yaml.safe_load(open('config/config.yaml')); print(c['curriculum']['$TARGET_STAGE']['mosaic_params']['val_mosaics'])")
 
 if [ -z "$FINAL_DIR" ]; then
     echo "❌ Error: Could not find $TARGET_STAGE in config/config.yaml curriculum."
     exit 1
 fi
 
+TRAIN_MOS_DIR="$FINAL_DIR/mosaics_train"
+VAL_MOS_DIR="$FINAL_DIR/mosaics_val"
+
 echo "📂 Target Directory: $FINAL_DIR"
-echo "🧩 Generating $NUM_MOSAICS mosaics..."
+echo "🧩 Generating $NUM_MOSAICS train and $NUM_VAL_MOSAICS val mosaics..."
 
 # 3. Data Generation
-# Fixed: Uses dynamic STAGE_IDX and standard config path
-echo "1️⃣ Generating raw mosaics..."
+echo "1️⃣ Generating raw TRAINING mosaics..."
+mkdir -p "$TRAIN_MOS_DIR"
 srun python -u scripts/generate_mosaics.py \
     --config config/config.yaml \
     --stage $STAGE_IDX \
-    --num $NUM_MOSAICS
+    --num $NUM_MOSAICS \
+    --output_dir "$TRAIN_MOS_DIR"
 
-# Fixed: Removed RAW_DIR mismatch; now points to directory containing /mosaics
-# Fixed: Added required sample count arguments from config
-echo "2️⃣ Converting to HDF5..."
+echo "2️⃣ Generating raw VALIDATION mosaics..."
+mkdir -p "$VAL_MOS_DIR"
+srun python -u scripts/generate_mosaics.py \
+    --config config/config.yaml \
+    --stage $STAGE_IDX \
+    --num $NUM_VAL_MOSAICS \
+    --output_dir "$VAL_MOS_DIR"
+
+echo "3️⃣ Converting to HDF5 (Separate Splits)..."
 srun python -u scripts/convert_to_hdf5.py \
-    --data_dir "$FINAL_DIR" \
+    --train_dir "$TRAIN_MOS_DIR" \
+    --val_dir "$VAL_MOS_DIR" \
+    --output_dir "$FINAL_DIR" \
     --train_samples $NUM_TRAIN \
     --val_samples $NUM_VAL
+
+# Cleanup raw directories
+echo "🧹 Cleaning up raw mosaic directories..."
+rm -rf "$TRAIN_MOS_DIR"
+rm -rf "$VAL_MOS_DIR"
 
 echo "✅ Generation Complete."

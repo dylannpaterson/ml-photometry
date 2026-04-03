@@ -369,7 +369,7 @@ def run_infer(stage_idx, config, device, checkpoint=None):
             print("\n--- Normalization Diagnostic ---")
             for i in range(len(matches)):
                 t_idx, p_idx, _ = matches[i]
-                t_flux = true_stars[t_idx][2]
+                t_flux = true_stars[t_idx][3]
                 p_flux = predicted_stars[p_idx][2]
                 ratios.append(p_flux / t_flux)
                 if i < 5:

@@ -85,9 +85,11 @@ class InferenceEngine:
                             shape_flat = (weights @ psf_basis) + mean_psf
                             predicted_shapes.append(shape_flat.reshape(S, S))
                         else:
-                            # Fallback or raw weight visualization
-                            S_fallback = int(np.sqrt(len(weights)))
-                            predicted_shapes.append(weights.reshape(S_fallback, S_fallback))
+                            # FIX: Safe fallback - Create a simple 9x9 Gaussian instead of crashing on weights.reshape
+                            sy, sx = np.meshgrid(np.arange(9)-4, np.arange(9)-4)
+                            fallback_psf = np.exp(-(sx**2 + sy**2) / (2 * 1.5**2))
+                            fallback_psf /= fallback_psf.sum()
+                            predicted_shapes.append(fallback_psf)
                             
         return predicted_stars, predicted_shapes, bg_map
 
@@ -102,15 +104,40 @@ class InferenceEngine:
         full_residual_bg_stretched = upsample_background(bg_map.squeeze(), (H, W))
         full_gt_residual_bg_stretched = upsample_background(gt_bg_map.squeeze(), (H, W))
         
+        # --- SUB-PIXEL ACCURATE RECONSTRUCTION ---
+        # We scatter the PSF shape across the 4 nearest integer pixels based on predicted offsets
         reconstruction_stars_linear = np.zeros_like(img_stretched)
         for (x, y, flux, p), shape in zip(predicted_stars, predicted_shapes):
-            ix, iy, S = int(round(x)), int(round(y)), shape.shape[0]
+            S = shape.shape[0]
             half = S // 2
-            y0, y1 = max(0, iy - half), min(H, iy + half + 1)
-            x0, x1 = max(0, ix - half), min(W, ix + half + 1)
-            sy0, sy1 = half - (iy - y0), half + (y1 - iy)
-            sx0, sx1 = half - (ix - x0), half + (x1 - ix)
-            reconstruction_stars_linear[y0:y1, x0:x1] += flux * shape[sy0:sy1, sx0:sx1]
+            
+            # Sub-pixel coordinate decomposition
+            x0, y0 = int(np.floor(x)), int(np.floor(y))
+            dx, dy = x - x0, y - y0
+            
+            # Bilinear weights
+            w00 = (1.0 - dx) * (1.0 - dy)
+            w10 = dx * (1.0 - dy)
+            w01 = (1.0 - dx) * dy
+            w11 = dx * dy
+            
+            # Scattering logic for 4 neighboring 31x31 stamps
+            for j, i, w in [(0, 0, w00), (1, 0, w10), (0, 1, w01), (1, 1, w11)]:
+                if w <= 0: continue
+                
+                # Offset stamp position by (j, i)
+                iy, ix = y0 + i, x0 + j
+                
+                # Bounds
+                y_min, y_max = max(0, iy - half), min(H, iy + half + 1)
+                x_min, x_max = max(0, ix - half), min(W, ix + half + 1)
+                
+                # Stamp indices
+                sy0, sy1 = half - (iy - y_min), half + (y_max - iy)
+                sx0, sx1 = half - (ix - x_min), half + (x_max - ix)
+                
+                if sy1 > sy0 and sx1 > sx0:
+                    reconstruction_stars_linear[y_min:y_max, x_min:x_max] += (flux * w) * shape[sy0:sy1, sx0:sx1]
 
         # 2. Linear Reconstruction (Residual Space)
         full_residual_bg_linear = self.transform.network_to_bg(full_residual_bg_stretched)
@@ -139,14 +166,19 @@ class InferenceEngine:
         print(f"FITS data saved to {fits_path}")
 
         # Statistics & Matching for Visualization
-        matches, unmatched_true, unmatched_pred = match_stars(true_catalogue, predicted_stars, distance_threshold=2.0)
+        # FIX: match_stars expects (x, y, flux) format
+        match_true = [(s[1], s[2], s[3]) for s in true_catalogue]
+        match_pred = [(s[0], s[1], s[2]) for s in predicted_stars]
+        matches, unmatched_true, unmatched_pred = match_stars(match_true, match_pred, distance_threshold=2.0)
         
         matched_true_mags, matched_pred_mags = [], []
         for t_idx, p_idx, _ in matches:
-            matched_true_mags.append(np.log10(true_catalogue[t_idx][2] + 1e-9))
+            # true_catalogue: (p, x, y, flux) -> index 3
+            # predicted_stars: (x, y, flux, p) -> index 2
+            matched_true_mags.append(np.log10(true_catalogue[t_idx][3] + 1e-9))
             matched_pred_mags.append(np.log10(predicted_stars[p_idx][2] + 1e-9))
 
-        all_true_mags = [np.log10(s[2] + 1e-9) for s in true_catalogue]
+        all_true_mags = [np.log10(s[3] + 1e-9) for s in true_catalogue]
         all_pred_mags = [np.log10(s[2] + 1e-9) for s in predicted_stars]
 
         # 6. Figure Layout
@@ -185,10 +217,15 @@ class InferenceEngine:
         matched_true_indices = [m[0] for m in matches]
         for i, s in enumerate(true_catalogue):
             if i in matched_true_indices:
-                ax2.plot(s[0], s[1], color='lime', marker='+', linestyle='None', markersize=10, alpha=0.8)
+                ax2.plot(s[1], s[2], color='lime', marker='+', linestyle='None', markersize=10, alpha=0.8)
             else:
-                ax1.plot(s[0], s[1], color='cyan', marker='+', linestyle='None', markersize=10, alpha=0.8)
+                ax1.plot(s[1], s[2], color='cyan', marker='+', linestyle='None', markersize=10, alpha=0.8)
         
+        # Plot predicted stars as small red dots to see over-prediction
+        pred_x = [s[0] for s in predicted_stars]
+        pred_y = [s[1] for s in predicted_stars]
+        ax2.scatter(pred_x, pred_y, color='red', s=1, alpha=0.5, label='Predicted')
+
         add_colorbar(im2, ax2)
         
         ax3 = fig.add_subplot(gs[0:2, 2], sharex=ax1, sharey=ax1)
@@ -199,7 +236,7 @@ class InferenceEngine:
         
         for i, s in enumerate(true_catalogue):
             if i not in matched_true_indices:
-                ax3.plot(s[0], s[1], 'k+', markersize=10, alpha=0.8)
+                ax3.plot(s[1], s[2], 'k+', markersize=10, alpha=0.8)
         
         add_colorbar(im3, ax3)
 
@@ -271,33 +308,6 @@ class InferenceEngine:
             ax9.set_title("Detection Success vs. Target Objectness")
             ax9.legend()
             ax9.grid(True, alpha=0.2)
-
-        # PSF Profile Plots
-        if predicted_shapes:
-            ax_psf_x = fig.add_subplot(gs[3:, 2])
-            ax_psf_y = fig.add_subplot(gs[3:, 3])
-            
-            shapes_clean = [s for s in predicted_shapes if np.all(np.isfinite(s))]
-            if shapes_clean:
-                num_to_plot = min(100, len(shapes_clean))
-                for i in range(num_to_plot):
-                    shape = shapes_clean[i]
-                    prof_x = np.mean(shape, axis=0)
-                    prof_y = np.mean(shape, axis=1)
-                    ax_psf_x.plot(prof_x, color='C0', alpha=0.1, linewidth=1)
-                    ax_psf_y.plot(prof_y, color='C1', alpha=0.1, linewidth=1)
-                
-                all_shapes = np.stack(shapes_clean[:100])
-                ax_psf_x.plot(np.mean(all_shapes, axis=(0, 1)), color='black', linewidth=2, label='Mean')
-                ax_psf_y.plot(np.mean(all_shapes, axis=(0, 2)), color='black', linewidth=2, label='Mean')
-                
-                ax_psf_x.set_title("PSF X-Profiles (Y-avg)")
-                ax_psf_y.set_title("PSF Y-Profiles (X-avg)")
-                ax_psf_x.set_xlabel("Pixels"); ax_psf_y.set_xlabel("Pixels")
-                ax_psf_x.grid(True, alpha=0.2); ax_psf_y.grid(True, alpha=0.2)
-
-        plt.suptitle(f"Generative Diagnostic (Scale={self.stretch_scale}) | Predicted Stars: {len(predicted_stars)}", fontsize=24)
-        plt.savefig(output_path); print(f"Comparison saved to {output_path}")
 
         # PSF Profile Plots
         if predicted_shapes:

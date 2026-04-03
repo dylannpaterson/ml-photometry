@@ -18,7 +18,7 @@ try:
 except ImportError:
     galsim = None
 
-@njit(boundscheck=False)
+#@njit(boundscheck=False)
 def fast_paint_grid(lx, ly, fluxes, snrs, psf_weights, sort_idx, min_snr, grid_size, cell_size, K):
     # Size is now exactly 4 + N_PCA (Existence, dx, dy, flux, weights...)
     N_PCA = psf_weights.shape[1]
@@ -27,17 +27,19 @@ def fast_paint_grid(lx, ly, fluxes, snrs, psf_weights, sort_idx, min_snr, grid_s
     
     for idx in range(len(sort_idx)):
         i = sort_idx[idx]
-        
-        # SNR-based Soft Label for Objectness (Sigmoid Curve)
-        # Using the same logic as in stage1_dataset.py
-        k = 2.0
-        center = 3.0
         snr = snrs[i]
-        target_p = 1.0 / (1.0 + np.exp(-k * (snr - center)))
-        if snr >= 5.0: target_p = 1.0
-        if snr <= 1.0: target_p = 0.0
+        
+        # SNR-based Soft Label for Objectness (Logarithmic Interpolation)
+        # Maps SNR 1.0 -> p=0.0 and SNR 5.0 -> p=1.0
+        if snr <= 1.0:
+            target_p = 0.0
+        elif snr >= 5.0:
+            target_p = 1.0
+        else:
+            # log10(1.0) = 0, log10(5.0) approx 0.69897
+            target_p = np.log10(snr) / 0.69897000433
 
-        # Early Exit: Skip target labels for very faint stars
+        # Early Exit: Skip target labels for very faint stars (SNR <= 1.0)
         if target_p <= 0.0:
             continue
             

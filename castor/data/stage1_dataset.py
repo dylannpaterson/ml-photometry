@@ -129,12 +129,15 @@ class Stage1MacroSparseDataset(Dataset):
                 # Physical SNR
                 snr = star['flux'] / np.sqrt(star['flux'] + sky_level + params['read_noise']**2)
                 
-                # SNR-based Soft Label for Objectness (Sigmoid Curve)
-                k = 2.0
-                center = 3.0
-                target_p = 1.0 / (1.0 + np.exp(-k * (snr - center)))
-                if snr >= 5.0: target_p = 1.0
-                if snr <= 1.0: target_p = 0.0
+                # SNR-based Soft Label for Objectness (Logarithmic Interpolation)
+                # Maps SNR 1.0 -> p=0.0 and SNR 5.0 -> p=1.0
+                if snr <= 1.0:
+                    target_p = 0.0
+                elif snr >= 5.0:
+                    target_p = 1.0
+                else:
+                    # log10(1.0) = 0, log10(5.0) approx 0.69897
+                    target_p = np.log10(max(1e-9, snr)) / 0.69897000433
                 
                 # [p, dx, dy, flux, shape...]
                 grid_stars[cy, cx, slot, 0] = float(target_p)

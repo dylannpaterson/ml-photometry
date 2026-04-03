@@ -230,6 +230,8 @@ def main():
     parser.add_argument("--config", default="config/config.yaml")
     parser.add_argument("--stage", type=int, default=0)
     parser.add_argument("--num", type=int, default=None)
+    parser.add_argument("--output_dir", type=str, default=None, help="Specific directory to save mosaics")
+    parser.add_argument("--start_idx", type=int, default=0, help="Starting index for mosaic filenames")
     
     args = parser.parse_args()
     config = load_config(args.config)
@@ -244,7 +246,11 @@ def main():
     mosaic_size = stage_cfg["mosaic_params"].get("mosaic_size", 1024)
     cell_size = stage_cfg.get("cell_size", DEFAULT_CELL_SIZE)
     
-    output_dir = os.path.join(stage_cfg["data_dir"], "mosaics")
+    if args.output_dir:
+        output_dir = args.output_dir
+    else:
+        output_dir = os.path.join(stage_cfg["data_dir"], "mosaics")
+        
     os.makedirs(output_dir, exist_ok=True)
     
     params = {
@@ -256,7 +262,7 @@ def main():
     }
     
     for i in range(num_mosaics):
-        generate_mosaic(i, output_dir, params, mosaic_size, cell_size)
+        generate_mosaic(i + args.start_idx, output_dir, params, mosaic_size, cell_size)
 
 if __name__ == "__main__":
     main()

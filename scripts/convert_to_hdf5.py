@@ -9,21 +9,12 @@ from castor.data.stage0_gaussian import fast_paint_grid
 from castor.data.transforms import AstroSpaceTransform
 from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE, N_PCA_COMPONENTS
 
-def create_hdf5_datasets_combined(data_dir, train_path, val_path, train_samples=50000, val_samples=2000, img_size=256):
-    cell_size = DEFAULT_CELL_SIZE
-    grid_size = img_size // cell_size
-    K = MAX_CAPACITY_PER_CELL
-    N_PCA = N_PCA_COMPONENTS
-    transform = AstroSpaceTransform(stretch_scale=GLOBAL_STRETCH_SCALE)
-    
-    target_shape = (grid_size, grid_size, K * (5 + N_PCA) + 1)
-    
-    # Discover mosaics
+def discover_mosaics(mosaic_dir):
+    """Discovers and metadata-loads mosaics in a directory."""
     mosaics = []
-    mosaic_dir = os.path.join(data_dir, "mosaics")
     if not os.path.exists(mosaic_dir):
-        print(f"❌ Error: Mosaic directory {mosaic_dir} not found.")
-        return False
+        print(f"⚠️ Warning: Mosaic directory {mosaic_dir} not found.")
+        return mosaics
 
     for f in sorted(os.listdir(mosaic_dir)):
         if f.endswith("_img.npy"):
@@ -42,12 +33,29 @@ def create_hdf5_datasets_combined(data_dir, train_path, val_path, train_samples=
                 'lib': lib_path if os.path.exists(lib_path) else None,
                 'exp_time': meta[0], 'zp': meta[1], 'sky_mag': meta[2]
             })
+    return mosaics
 
-    if not mosaics:
-        print(f"❌ Error: No mosaics found in {mosaic_dir}")
+def create_hdf5_datasets_combined(train_mosaic_dir, val_mosaic_dir, train_path, val_path, train_samples=50000, val_samples=2000, img_size=256):
+    cell_size = DEFAULT_CELL_SIZE
+    grid_size = img_size // cell_size
+    K = MAX_CAPACITY_PER_CELL
+    N_PCA = N_PCA_COMPONENTS
+    transform = AstroSpaceTransform(stretch_scale=GLOBAL_STRETCH_SCALE)
+    
+    target_shape = (grid_size, grid_size, K * (4 + N_PCA) + 1)
+    
+    # Discover mosaics for each split
+    train_mosaics = discover_mosaics(train_mosaic_dir)
+    val_mosaics = discover_mosaics(val_mosaic_dir)
+
+    if not train_mosaics:
+        print(f"❌ Error: No training mosaics found in {train_mosaic_dir}")
+        return False
+    if not val_mosaics:
+        print(f"❌ Error: No validation mosaics found in {val_mosaic_dir}")
         return False
 
-    print(f"Found {len(mosaics)} mosaics. Creating combined HDF5 databases...")
+    print(f"Found {len(train_mosaics)} train and {len(val_mosaics)} val mosaics. Creating HDF5 databases...")
     os.makedirs(os.path.dirname(train_path), exist_ok=True)
 
     with h5py.File(train_path, 'w') as h5_train, h5py.File(val_path, 'w') as h5_val:
@@ -63,41 +71,37 @@ def create_hdf5_datasets_combined(data_dir, train_path, val_path, train_samples=
         val_meds = h5_val.create_dataset("chunk_medians", (val_samples,), dtype='float32')
         val_psfs = None
 
-        tr_per_mos = train_samples // len(mosaics)
-        val_per_mos = val_samples // len(mosaics)
-        
-        tr_idx, v_idx = 0, 0
-        
-        for m_idx, mosaic in enumerate(mosaics):
-            print(f"Processing mosaic {m_idx + 1}/{len(mosaics)}: {os.path.basename(mosaic['img'])}")
+        # --- PROCESS EACH SPLIT INDEPENDENTLY ---
+        for split_name, mosaics, split_samples, ds_imgs, ds_tgts, ds_meds, is_val in [
+            ("Train", train_mosaics, train_samples, tr_imgs, tr_tgts, tr_meds, False),
+            ("Val", val_mosaics, val_samples, val_imgs, val_tgts, val_meds, True)
+        ]:
+            print(f"\n🚀 Processing {split_name} Split ({len(mosaics)} mosaics)...")
+            samples_per_mos = split_samples // len(mosaics)
+            global_idx = 0
             
-            img_data = np.load(mosaic['img'])
-            cat_data = np.load(mosaic['cat'])
-            psf_lib = np.load(mosaic['lib']) if mosaic['lib'] else np.zeros((N_PCA + 1, SHAPE_SIZE * SHAPE_SIZE), dtype=np.float32)
-
-            if tr_psfs is None:
-                tr_psfs = h5_train.create_dataset("psf_libraries", (train_samples, *psf_lib.shape), dtype='float32', chunks=(1, *psf_lib.shape), compression="lzf")
-                val_psfs = h5_val.create_dataset("psf_libraries", (val_samples, *psf_lib.shape), dtype='float32', chunks=(1, *psf_lib.shape), compression="lzf")
-
-            pixel_scale = 0.11
-            sky_level = (10 ** (-0.4 * (mosaic['sky_mag'] - mosaic['zp']))) * (pixel_scale**2) * mosaic['exp_time']
-            my, mx = img_data.shape
-            snrs, comps = cat_data['snr'], cat_data['comp']
-
-            # Determine number of samples for this mosaic
-            this_tr = tr_per_mos if m_idx < len(mosaics)-1 else (train_samples - tr_idx)
-            this_val = val_per_mos if m_idx < len(mosaics)-1 else (val_samples - v_idx)
-
-            # --- Unified Sampling Loop ---
-            for is_val, num_samples in [(False, this_tr), (True, this_val)]:
-                ds_imgs = val_imgs if is_val else tr_imgs
-                ds_tgts = val_tgts if is_val else tr_tgts
-                ds_meds = val_meds if is_val else tr_meds
-                ds_psfs = val_psfs if is_val else tr_psfs
+            for m_idx, mosaic in enumerate(mosaics):
+                this_mos_samples = samples_per_mos if m_idx < len(mosaics)-1 else (split_samples - global_idx)
+                print(f"  [{m_idx+1}/{len(mosaics)}] {os.path.basename(mosaic['img'])} -> {this_mos_samples} samples")
                 
-                for _ in range(num_samples):
-                    curr = v_idx if is_val else tr_idx
-                    
+                img_data = np.load(mosaic['img'])
+                cat_data = np.load(mosaic['cat'])
+                psf_lib = np.load(mosaic['lib']) if mosaic['lib'] else np.zeros((N_PCA + 1, SHAPE_SIZE * SHAPE_SIZE), dtype=np.float32)
+
+                # Dynamic PSF library allocation
+                if is_val and val_psfs is None:
+                    val_psfs = h5_val.create_dataset("psf_libraries", (val_samples, *psf_lib.shape), dtype='float32', chunks=(1, *psf_lib.shape), compression="lzf")
+                elif not is_val and tr_psfs is None:
+                    tr_psfs = h5_train.create_dataset("psf_libraries", (train_samples, *psf_lib.shape), dtype='float32', chunks=(1, *psf_lib.shape), compression="lzf")
+
+                pixel_scale = 0.11
+                sky_level = (10 ** (-0.4 * (mosaic['sky_mag'] - mosaic['zp']))) * (pixel_scale**2) * mosaic['exp_time']
+                my, mx = img_data.shape
+                snrs = cat_data['snr']
+                
+                ds_psfs_current = val_psfs if is_val else tr_psfs
+
+                for _ in range(this_mos_samples):
                     py = np.random.randint(0, my - img_size)
                     px = np.random.randint(0, mx - img_size)
                     
@@ -116,49 +120,50 @@ def create_hdf5_datasets_combined(data_dir, train_path, val_path, train_samples=
                     if mask_x.any():
                         local_cat = band_cat[mask_x]
                         lx, ly = local_cat['x'] - px, local_cat['y'] - py
-                        local_snrs, local_comps = snrs[y_start:y_end][mask_x], comps[y_start:y_end][mask_x]
-                        # Extract continuous PCA weights from catalog
+                        local_snrs = snrs[y_start:y_end][mask_x]
                         psf_weights = np.column_stack([local_cat[f'w{i}'] for i in range(N_PCA)])
-
                         sort_idx = np.argsort(local_cat['flux'])[::-1]
-                        # NUMBA FIX: Cast weights to float32 for computation (Numba doesn't support float16)
-                        grid_stars = fast_paint_grid(lx, ly, local_cat['flux'], local_snrs, local_comps, psf_weights.astype(np.float32), sort_idx, 5.0, grid_size, cell_size, K)
+                        
+                        grid_stars = fast_paint_grid(lx, ly, local_cat['flux'], local_snrs, psf_weights.astype(np.float32), sort_idx, 5.0, grid_size, cell_size, K)
                         target_buffer[:, :, :-1] = grid_stars.reshape(grid_size, grid_size, -1)
 
                     target_buffer[:, :, -1] = transform.target_bg_to_network(sky_level - chunk_median)
                     
                     # 3. Write
-                    ds_imgs[curr] = signal_tensor
-                    ds_tgts[curr] = target_buffer
-                    ds_meds[curr] = chunk_median
-                    ds_psfs[curr] = psf_lib
-                    
-                    if is_val: v_idx += 1
-                    else: tr_idx += 1
+                    ds_imgs[global_idx] = signal_tensor
+                    ds_tgts[global_idx] = target_buffer
+                    ds_meds[global_idx] = chunk_median
+                    ds_psfs_current[global_idx] = psf_lib
+                    global_idx += 1
 
-            # --- CLEANUP THIS MOSAIC ---
-            for f_path in [mosaic['img'], mosaic['cat'], mosaic['lib']]:
-                if f_path and os.path.exists(f_path): os.remove(f_path)
-            meta_f = mosaic['img'].replace("_img.npy", "_meta.npy")
-            if os.path.exists(meta_f): os.remove(meta_f)
-            
-            del img_data, cat_data
-            gc.collect()
+                # --- CLEANUP THIS MOSAIC ---
+                for f_path in [mosaic['img'], mosaic['cat'], mosaic['lib']]:
+                    if f_path and os.path.exists(f_path): os.remove(f_path)
+                meta_f = mosaic['img'].replace("_img.npy", "_meta.npy")
+                if os.path.exists(meta_f): os.remove(meta_f)
+                
+                del img_data, cat_data
+                gc.collect()
 
     print(f"✅ Combined HDF5 datasets complete!")
-    if os.path.exists(mosaic_dir):
-        shutil.rmtree(mosaic_dir)
     return True
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Convert .npy mosaics to HDF5 database (Combined Pass)")
-    parser.add_argument("--data_dir", default="data/bulge_stage0_full", help="Directory containing mosaics")
+    parser = argparse.ArgumentParser(description="Convert .npy mosaics to HDF5 database (Separate Pass)")
+    parser.add_argument("--train_dir", required=True, help="Directory containing training mosaics")
+    parser.add_argument("--val_dir", required=True, help="Directory containing validation mosaics")
+    parser.add_argument("--output_dir", required=True, help="Where to save HDF5 files")
     parser.add_argument("--train_samples", type=int, default=50000, help="Number of training samples")
-    parser.add_argument("--val_samples", type=int, default=2000, help="Number of validation samples")
+    parser.add_argument("--val_samples", type=int, default=5000, help="Number of validation samples")
     args = parser.parse_args()
 
-    train_h5 = os.path.join(args.data_dir, "stage0_train.h5")
-    val_h5 = os.path.join(args.data_dir, "stage0_val.h5")
+    train_h5 = os.path.join(args.output_dir, "stage0_train.h5")
+    val_h5 = os.path.join(args.output_dir, "stage0_val.h5")
     
-    create_hdf5_datasets_combined(args.data_dir, train_h5, val_h5, train_samples=args.train_samples, val_samples=args.val_samples)
+    create_hdf5_datasets_combined(
+        args.train_dir, args.val_dir, 
+        train_h5, val_h5, 
+        train_samples=args.train_samples, 
+        val_samples=args.val_samples
+    )
