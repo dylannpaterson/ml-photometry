@@ -250,17 +250,18 @@ class InferenceEngine:
         ax5.set_title("Truth Background (Linear)")
         add_colorbar(im5, ax5)
 
-        # Plots Row
+        # Row 4-5: PSF & Mag Plots & Missed Stats
         if matched_true_mags:
-            ax8 = fig.add_subplot(gs[3:, 0])
+            ax8 = fig.add_subplot(gs[3, 0]) # FIX: Only Row 3
             ax8.scatter(matched_true_mags, matched_pred_mags, alpha=0.5, s=10)
-            mmin, mmax = min(matched_true_mags+matched_pred_mags), max(matched_true_mags+matched_pred_mags)
+            m_all = matched_true_mags + matched_pred_mags
+            mmin, mmax = min(m_all), max(m_all)
             ax8.plot([mmin, mmax], [mmin, mmax], 'r--', alpha=0.8)
             ax8.set_xlabel("True log10(Flux)"); ax8.set_ylabel("Predicted log10(Flux)")
             ax8.set_title("Magnitude Recovery Accuracy"); ax8.set_aspect('equal'); ax8.grid(True, alpha=0.3)
 
         if all_true_mags:
-            ax_hist = fig.add_subplot(gs[3, 1])
+            ax_hist = fig.add_subplot(gs[3, 1]) # FIX: Only Row 3
             m_p90 = [np.log10(s[2] + 1e-9) for s in predicted_stars if s[3] >= 0.9]
             m_p50 = [np.log10(s[2] + 1e-9) for s in predicted_stars if s[3] >= 0.5]
             m_p10 = [np.log10(s[2] + 1e-9) for s in predicted_stars if s[3] >= 0.1]
@@ -272,59 +273,40 @@ class InferenceEngine:
             ax_hist.hist(m_p90, bins=bins, alpha=1.0, label='p >= 0.9', histtype='step')
             ax_hist.set_xlabel("log10(Flux)"); ax_hist.set_title("LF vs. Confidence"); ax_hist.legend(); ax_hist.grid(True, alpha=0.2)
 
-        # NEW: Error Rates (FP/FN %) vs. Signal Strength
-        if true_catalogue and detected_stars:
+        # --- THRESHOLD TRADE-OFF PLOT ---
+        if true_catalogue and predicted_stars:
             ax_err = fig.add_subplot(gs[4, 0])
-            matched_pred_indices = [m[1] for m in matches]
-            matched_true_indices = [m[0] for m in matches]
+            # We vary the threshold and calculate aggregate error rates for the whole scene
+            thresholds = np.linspace(0.01, 0.99, 50)
+            fpr_list, fnr_rates = [], []
             
-            # 1. Define Bins for Objectness/Confidence (0.0 to 1.0)
-            err_bins = np.linspace(0.0, 1.0, 21)
-            bin_centers = (err_bins[:-1] + err_bins[1:]) / 2.0
+            t_list = [(s[1], s[2], s[3]) for s in true_catalogue]
             
-            # 2. Calculate False Negative Rate (relative to Truth Objectness)
-            true_obj = np.array([s[0] for s in true_catalogue])
-            fn_rates = []
-            for j in range(len(err_bins)-1):
-                in_bin = (true_obj >= err_bins[j]) & (true_obj < err_bins[j+1])
-                if in_bin.any():
-                    total_in_bin = in_bin.sum()
-                    missed_in_bin = sum(1 for i in np.where(in_bin)[0] if i not in matched_true_indices)
-                    fn_rates.append(100.0 * missed_in_bin / total_in_bin)
-                else:
-                    fn_rates.append(0.0)
+            for thr in thresholds:
+                p_list = [(s[0], s[1], s[2]) for s in predicted_stars if s[3] >= thr]
+                if not p_list:
+                    fpr_list.append(0.0)
+                    fnr_rates.append(100.0)
+                    continue
+                
+                _, ut, up = match_stars(t_list, p_list, distance_threshold=2.0)
+                fpr_list.append(100.0 * len(up) / len(p_list))
+                fnr_rates.append(100.0 * len(ut) / len(t_list))
             
-            # 3. Calculate False Positive Rate (relative to Predicted Confidence)
-            pred_conf = np.array([s[3] for s in detected_stars])
-            fp_rates = []
-            for j in range(len(err_bins)-1):
-                in_bin = (pred_conf >= err_bins[j]) & (pred_conf < err_bins[j+1])
-                if in_bin.any():
-                    total_in_bin = in_bin.sum()
-                    spurious_in_bin = sum(1 for i in np.where(in_bin)[0] if i not in matched_pred_indices)
-                    fp_rates.append(100.0 * spurious_in_bin / total_in_bin)
-                else:
-                    fp_rates.append(0.0)
-            
-            ax_err.plot(bin_centers, fn_rates, 'r-o', label='False Negative Rate (%)', linewidth=2)
-            ax_err.plot(bin_centers, fp_rates, 'o-', color='orange', label='False Positive Rate (%)', linewidth=2)
-            ax_err.set_xlabel("Strength (Target Objectness / Pred Confidence)")
+            ax_err.plot(thresholds, fnr_rates, 'r-', label='False Neg (Missed Truth %)', linewidth=3)
+            ax_err.plot(thresholds, fpr_list, '-', color='orange', label='False Pos (Spurious Detections %)', linewidth=3)
+            ax_err.set_xlabel("Confidence Threshold (p_cut)")
             ax_err.set_ylabel("Error Rate (%)")
-            ax_err.set_title("Classification Reliability")
-            ax_err.set_ylim(-5, 105)
-            ax_err.grid(True, alpha=0.3)
-            ax_err.legend()
+            ax_err.set_title("Detection Trade-off (Global Threshold)")
+            ax_err.set_ylim(-5, 105); ax_err.grid(True, alpha=0.3); ax_err.legend()
 
         # NEW: Matched vs Missed Histogram (Detection Completeness)
         if all_true_mags:
-            ax_comp = fig.add_subplot(gs[4, 1])
+            ax_comp = fig.add_subplot(gs[4, 1]) # FIX: Row 4
             ax_comp.hist([matched_true_mags, missed_true_mags], bins=bins, stacked=True, 
                          label=['Detected', 'Missed'], color=['green', 'red'], alpha=0.7)
-            ax_comp.set_xlabel("True log10(Flux)")
-            ax_comp.set_ylabel("Count")
-            ax_comp.set_title("Detection Completeness (Matched vs Missed)")
-            ax_comp.legend()
-            ax_comp.grid(True, alpha=0.2)
+            ax_comp.set_xlabel("True log10(Flux)"); ax_comp.set_ylabel("Count")
+            ax_comp.set_title("Detection Completeness"); ax_comp.legend(); ax_comp.grid(True, alpha=0.2)
 
         if detected_shapes:
             ax_psf_x, ax_psf_y = fig.add_subplot(gs[3:, 2]), fig.add_subplot(gs[3:, 3])
