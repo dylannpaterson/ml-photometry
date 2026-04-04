@@ -53,23 +53,27 @@ class DiffractionAwareFilter(nn.Module):
                 # Robust extraction of mean_psf
                 if isinstance(master_data, dict):
                     m_psf = torch.from_numpy(master_data['mean_psf']).float()
-                elif isinstance(master_data, torch.Tensor):
+                elif torch.is_tensor(master_data):
                     # Check for [Batch, N_PCA+1, H*W] or [N_PCA+1, H*W]
                     if master_data.dim() == 3:
                         m_psf = master_data[0, -1].float()
                     else:
                         m_psf = master_data[-1].float()
-                else:
+                elif isinstance(master_data, (list, tuple)):
                     # Assume tuple (eigen, weights, mean)
                     m_psf = torch.from_numpy(master_data[2]).float()
+                else:
+                    print(f"⚠️ Unknown master library format: {type(master_data)}")
+                    m_psf = None
                 
-                # Reshape to 2D if needed (assume square)
-                if m_psf.dim() == 1:
-                    s = int(m_psf.shape[0]**0.5)
-                    m_psf = m_psf.view(s, s)
-                
-                kernel = self._fit_to_kernel_size(m_psf, kernel_size)
-                print(f"🛰️ DiffractionAwareFilter: Initialized with Master Library Mean ({psf_library_path})")
+                if m_psf is not None:
+                    # Reshape to 2D if needed (assume square)
+                    if m_psf.dim() == 1:
+                        s = int(m_psf.shape[0]**0.5)
+                        m_psf = m_psf.view(s, s)
+                    
+                    kernel = self._fit_to_kernel_size(m_psf, kernel_size)
+                    print(f"🛰️ DiffractionAwareFilter: Initialized with Master Library Mean ({psf_library_path})")
             except Exception as e:
                 print(f"⚠️ Failed to load master library for prior: {e}")
 
