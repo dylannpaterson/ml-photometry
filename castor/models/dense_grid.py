@@ -49,11 +49,19 @@ class DiffractionAwareFilter(nn.Module):
         if os.path.exists(psf_library_path):
             try:
                 master_data = torch.load(psf_library_path, map_location='cpu', weights_only=True)
-                # Reconstruct mean_psf (stored as flattened in psf_lib or dict)
+                
+                # Robust extraction of mean_psf
                 if isinstance(master_data, dict):
                     m_psf = torch.from_numpy(master_data['mean_psf']).float()
+                elif isinstance(master_data, torch.Tensor):
+                    # Check for [Batch, N_PCA+1, H*W] or [N_PCA+1, H*W]
+                    if master_data.dim() == 3:
+                        m_psf = master_data[0, -1].float()
+                    else:
+                        m_psf = master_data[-1].float()
                 else:
-                    m_psf = torch.from_numpy(master_data[2]).float() # (eigen, weights, mean)
+                    # Assume tuple (eigen, weights, mean)
+                    m_psf = torch.from_numpy(master_data[2]).float()
                 
                 # Reshape to 2D if needed (assume square)
                 if m_psf.dim() == 1:

@@ -69,7 +69,10 @@ class InferenceEngine:
         cell_size = self.img_size // grid_h
         
         # Determine S from basis if available, else fallback
-        S = 31 if psf_basis is not None else 9 
+        if psf_basis is not None:
+            S = int(psf_basis.shape[1]**0.5)
+        else:
+            S = 9
         
         for y in range(grid_h):
             for x in range(grid_w):
