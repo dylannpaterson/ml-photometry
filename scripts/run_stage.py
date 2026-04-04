@@ -373,6 +373,24 @@ def run_infer(stage_idx, config, device, checkpoint=None):
             mean_psf=mean_psf.numpy()
         )
         
+        # --- THE FIX: Extract Jitter for Visualization ---
+        # Metadata: [exp_time, zp, sky_mag, s_jit, q_jit, theta_jit]
+        # We need the last 3 values for the reconstruction to not look "blocky" (sharp)
+        try:
+            with h5py.File(val_h5, 'r') as f:
+                # Get the metadata for the specific mosaic index
+                # We need a way to link sample index to mosaic index
+                # For now, we assume the dataset returns metadata or we check common filenames
+                # Fallback: Check if metadata is available in the sample
+                if "meta" in sample:
+                    meta = sample["meta"]
+                    jitter_params = (meta[3], meta[4], meta[5])
+                else:
+                    jitter_params = None
+        except:
+            jitter_params = None
+        # -------------------------------------------------
+        
         # DEBUG: Print normalization stats
         # Note: predicted_stars elements are (x, y, flux, p)
         # match_stars expects (x, y, flux) for matching
@@ -396,7 +414,17 @@ def run_infer(stage_idx, config, device, checkpoint=None):
         else:
             print("\n--- Normalization Diagnostic: No matches found ---")
             
-        engine.visualize(img_stretched, true_stars, predicted_stars, predicted_shapes, bg_map, gt_bg_map, threshold=0.5, chunk_median=noisy_median)
+        engine.visualize(
+            img_stretched, 
+            true_stars, 
+            predicted_stars, 
+            predicted_shapes, 
+            bg_map, 
+            gt_bg_map, 
+            threshold=0.5, 
+            chunk_median=noisy_median,
+            jitter_params=jitter_params
+        )
     else:
         print(f"⚠️ Specialized inference for stage {stage_idx} not yet implemented.")
 
