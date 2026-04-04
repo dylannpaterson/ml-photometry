@@ -97,7 +97,7 @@ class InferenceEngine:
                             
         return predicted_stars, predicted_shapes, bg_map
 
-    def visualize(self, image_tensor, true_catalogue, predicted_stars, predicted_shapes, bg_map, gt_bg_map, threshold, chunk_median=0.0, jitter_params=None, output_path="inference_comparison.png"):
+    def visualize(self, image_tensor, true_catalogue, predicted_stars, predicted_shapes, bg_map, gt_bg_map, threshold, chunk_median=0.0, jitter_params=None, output_path="inference_comparison.png", psf_basis=None, mean_psf=None):
         """
         Visualizes inference results.
         jitter_params: (s_jit, q_jit, theta_jit) to match input image smear.
@@ -108,55 +108,74 @@ class InferenceEngine:
         img_stretched = image_tensor.squeeze().numpy()
         H, W = img_stretched.shape
         
-        # 1. Component Preparation (Network Space: Stretched)
+        # 1. MATCHING (Done early to fix UnboundLocalError and support reconstructions)
+        detected_stars = [s for s in predicted_stars if s[3] >= 0.5]
+        detected_shapes = [shp for s, shp in zip(predicted_stars, predicted_shapes) if s[3] >= 0.5]
+        
+        match_true = [(s[1], s[2], s[3]) for s in true_catalogue]
+        match_pred = [(s[0], s[1], s[2]) for s in detected_stars]
+        matches, unmatched_true, unmatched_pred = match_stars(match_true, match_pred, distance_threshold=2.0)
+        matched_true_indices = [m[0] for m in matches]
+        matched_pred_indices = [m[1] for m in matches]
+
+        # 2. COMPONENT PREPARATION
         full_residual_bg_stretched = upsample_background(bg_map.squeeze(), (H, W))
         full_gt_residual_bg_stretched = upsample_background(gt_bg_map.squeeze(), (H, W))
         
-        # --- DEFINITION: DETECTED = p >= 0.5 ---
-        detected_stars = []
-        detected_shapes = []
-        for s, shp in zip(predicted_stars, predicted_shapes):
-            if s[3] >= 0.5:
-                detected_stars.append(s)
-                detected_shapes.append(shp)
-
-        # --- SUB-PIXEL ACCURATE RECONSTRUCTION ---
+        # --- SUB-PIXEL ACCURATE RECONSTRUCTION (Detected Only) ---
         reconstruction_stars_linear = np.zeros_like(img_stretched)
         for (x, y, flux, p), shape in zip(detected_stars, detected_shapes):
-            S = shape.shape[0]
-            half = S // 2
+            S_s = shape.shape[0]; half_s = S_s // 2
             x0, y0 = int(np.floor(x)), int(np.floor(y))
             dx, dy = x - x0, y - y0
             w00, w10, w01, w11 = (1.0-dx)*(1.0-dy), dx*(1.0-dy), (1.0-dx)*dy, dx*dy
-            
             for j, i, w in [(0, 0, w00), (1, 0, w10), (0, 1, w01), (1, 1, w11)]:
                 if w <= 0: continue
                 iy, ix = y0 + i, x0 + j
-                y_min, y_max = max(0, iy-half), min(H, iy+half+1)
-                x_min, x_max = max(0, ix-half), min(W, ix+half+1)
-                sy0, sy1 = half - (iy-y_min), half + (y_max-iy)
-                sx0, sx1 = half - (ix-x_min), half + (x_max-ix)
+                y_min, y_max = max(0, iy-half_s), min(H, iy+half_s+1)
+                x_min, x_max = max(0, ix-half_s), min(W, ix+half_s+1)
+                sy0, sy1 = half_s - (iy-y_min), half_s + (y_max-iy)
+                sx0, sx1 = half_s - (ix-x_min), half_s + (x_max-ix)
                 if sy1 > sy0 and sx1 > sx0:
                     reconstruction_stars_linear[y_min:y_max, x_min:x_max] += (flux * w) * shape[sy0:sy1, sx0:sx1]
 
-        # --- APPLY GLOBAL JITTER TO RECONSTRUCTION ---
+        # --- RECONSTRUCT MISSED SOURCES ---
+        reconstruction_missed_linear = np.zeros_like(img_stretched)
+        if mean_psf is not None:
+            S_m = int(len(mean_psf)**0.5); half_m = S_m // 2
+            mean_psf_2d = mean_psf.reshape(S_m, S_m)
+            for i in range(len(true_catalogue)):
+                if i not in matched_true_indices:
+                    p_t, x_t, y_t, flux_t = true_catalogue[i]
+                    if p_t < 0.1: continue # Skip ultra-faint
+                    x0, y0 = int(np.floor(x_t)), int(np.floor(y_t))
+                    dx, dy = x_t - x0, y_t - y0
+                    w00, w10, w01, w11 = (1.0-dx)*(1.0-dy), dx*(1.0-dy), (1.0-dx)*dy, dx*dy
+                    for j, i_off, w in [(0, 0, w00), (1, 0, w10), (0, 1, w01), (1, 1, w11)]:
+                        if w <= 0: continue
+                        iy, ix = y0 + i_off, x0 + j
+                        ym, yM = max(0, iy-half_m), min(H, iy+half_m+1)
+                        xm, xM = max(0, ix-half_m), min(W, ix+half_m+1)
+                        sy0, sy1 = half_m - (iy-ym), half_m + (yM-iy)
+                        sx0, sx1 = half_m - (ix-xm), half_m + (xM-ix)
+                        if sy1 > sy0 and sx1 > sx0:
+                            reconstruction_missed_linear[ym:yM, xm:xM] += (flux_t * w) * mean_psf_2d[sy0:sy1, sx0:sx1]
+
+        # --- APPLY GLOBAL JITTER TO BOTH RECONSTRUCTIONS ---
         if jitter_params is not None:
             s_j, q_j, t_j = jitter_params
-            kh = S // 2
-            gy, gx = np.meshgrid(np.arange(S) - kh, np.arange(S) - kh, indexing='ij')
+            kj = 63; gy, gx = np.meshgrid(np.arange(127) - kj, np.arange(127) - kj, indexing='ij')
             cos, sin = np.cos(t_j), np.sin(t_j)
             gxp, gyp = gx * cos + gy * sin, -gx * sin + gy * cos
             j_kernel = np.exp(-(gxp**2 / (2 * s_j**2) + gyp**2 / (2 * (s_j * q_j)**2)))
             j_kernel /= (j_kernel.sum() + 1e-9)
             reconstruction_stars_linear = fftconvolve(reconstruction_stars_linear, j_kernel, mode='same')
+            reconstruction_missed_linear = fftconvolve(reconstruction_missed_linear, j_kernel, mode='same')
 
-        # 2. Linear Reconstruction (Residual Space)
+        # 3. ABSOLUTE SPACE CONVERSION
         full_residual_bg_linear = self.transform.network_to_bg(full_residual_bg_stretched)
-        full_reconstruction_linear = reconstruction_stars_linear + full_residual_bg_linear
-        
-        # 3. Absolute Space Conversion (Raw Physical Photons)
+        full_reconstruction_linear_abs = reconstruction_stars_linear + full_residual_bg_linear + chunk_median
         img_linear_abs = self.transform.network_to_image(img_stretched, chunk_median)
-        full_reconstruction_linear_abs = full_reconstruction_linear + chunk_median
         residual_linear = img_linear_abs - full_reconstruction_linear_abs
         full_bg_abs = full_residual_bg_linear + chunk_median
         full_gt_bg_abs = self.transform.network_to_bg(full_gt_residual_bg_stretched) + chunk_median
@@ -167,23 +186,17 @@ class InferenceEngine:
             fits.ImageHDU(img_linear_abs, name="INPUT_LINEAR"),
             fits.ImageHDU(full_reconstruction_linear_abs, name="MODEL_LINEAR"),
             fits.ImageHDU(residual_linear, name="RESIDUAL_LINEAR"),
+            fits.ImageHDU(reconstruction_missed_linear, name="MISSED_LINEAR"),
             fits.ImageHDU(full_bg_abs, name="BG_PRED_LINEAR"),
             fits.ImageHDU(full_gt_bg_abs, name="BG_TRUE_LINEAR")
         ])
         fits_path = output_path.replace(".png", ".fits")
         hdul.writeto(fits_path, overwrite=True)
 
-        # Matching
-        match_true = [(s[1], s[2], s[3]) for s in true_catalogue]
-        match_pred = [(s[0], s[1], s[2]) for s in detected_stars]
-        matches, unmatched_true, unmatched_pred = match_stars(match_true, match_pred, distance_threshold=2.0)
-        
+        # Statistics
         matched_true_mags = [np.log10(true_catalogue[m[0]][3] + 1e-9) for m in matches]
         matched_pred_mags = [np.log10(detected_stars[m[1]][2] + 1e-9) for m in matches]
         all_true_mags = [np.log10(s[3] + 1e-9) for s in true_catalogue]
-        
-        # Extract missed true mags
-        matched_true_indices = [m[0] for m in matches]
         missed_true_mags = [np.log10(true_catalogue[i][3] + 1e-9) for i in range(len(true_catalogue)) if i not in matched_true_indices]
 
         # Figure Layout
@@ -196,8 +209,7 @@ class InferenceEngine:
             fig.colorbar(im, cax=cax)
 
         def sanitize_for_plot(data, fill_val=0.0):
-            d = data.copy()
-            mask = ~np.isfinite(d); d[mask] = fill_val
+            d = data.copy(); d[~np.isfinite(d)] = fill_val
             return np.clip(d, -1e15, 1e15)
 
         img_linear_abs = sanitize_for_plot(img_linear_abs, fill_val=chunk_median)
@@ -205,8 +217,7 @@ class InferenceEngine:
         residual_linear = sanitize_for_plot(residual_linear, fill_val=0.0)
 
         l_vmin, l_vmax = np.percentile(img_linear_abs, [10, 99.9])
-        l_vmin, l_vmax = max(1.0, l_vmin), max(l_vmin + 1.0, l_vmax)
-        norm = LogNorm(vmin=l_vmin, vmax=l_vmax, clip=True)
+        norm = LogNorm(vmin=max(1.0, l_vmin), vmax=max(l_vmin+1.0, l_vmax), clip=True)
         
         ax1 = fig.add_subplot(gs[0:2, 0])
         ax1.imshow(img_linear_abs, cmap='inferno', origin='lower', norm=norm, aspect='equal')
@@ -219,19 +230,16 @@ class InferenceEngine:
         visible_true_indices = [i for i, s in enumerate(true_catalogue) if s[0] >= 0.1]
         for i in visible_true_indices:
             s = true_catalogue[i]
-            if i in matched_true_indices:
-                ax2.plot(s[1], s[2], color='lime', marker='+', linestyle='None', markersize=10, alpha=0.8)
-            else:
-                ax1.plot(s[1], s[2], color='cyan', marker='+', linestyle='None', markersize=10, alpha=0.8)
+            if i in matched_true_indices: ax2.plot(s[1], s[2], 'lime+', markersize=10, alpha=0.8)
+            else: ax1.plot(s[1], s[2], 'cyan+', markersize=10, alpha=0.8)
         
         pred_x, pred_y = [s[0] for s in detected_stars], [s[1] for s in detected_stars]
-        ax2.scatter(pred_x, pred_y, color='red', s=1, alpha=0.5, label='Detected')
+        ax2.scatter(pred_x, pred_y, color='red', s=1, alpha=0.5)
         add_colorbar(im2, ax2)
         
         ax3 = fig.add_subplot(gs[0:2, 2], sharex=ax1, sharey=ax1)
-        r_limit = np.percentile(np.abs(residual_linear), 99)
-        if r_limit <= 0 or not np.isfinite(r_limit): r_limit = 1.0
-        im3 = ax3.imshow(residual_linear, cmap='bwr', origin='lower', vmin=-r_limit, vmax=r_limit, aspect='equal')
+        r_lim = np.percentile(np.abs(residual_linear), 99)
+        im3 = ax3.imshow(residual_linear, cmap='bwr', origin='lower', vmin=-r_lim, vmax=r_lim, aspect='equal')
         ax3.set_title("Linear Residual (Missed = Black)")
         for i in visible_true_indices:
             if i not in matched_true_indices:
@@ -241,73 +249,49 @@ class InferenceEngine:
         # Background Row
         full_bg_abs, full_gt_bg_abs = sanitize_for_plot(full_bg_abs, fill_val=chunk_median), sanitize_for_plot(full_gt_bg_abs, fill_val=chunk_median)
         bg_vmin, bg_vmax = min(full_bg_abs.min(), full_gt_bg_abs.min()), max(full_bg_abs.max(), full_gt_bg_abs.max())
-        if bg_vmax <= bg_vmin: bg_vmax = bg_vmin + 1.0
         ax4 = fig.add_subplot(gs[2, 0], sharex=ax1, sharey=ax1)
         ax4.imshow(full_bg_abs, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax, aspect='equal')
-        ax4.set_title("Predicted Background (Linear)")
+        ax4.set_title("Predicted Background")
         ax5 = fig.add_subplot(gs[2, 1], sharex=ax1, sharey=ax1)
         im5 = ax5.imshow(full_gt_bg_abs, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax, aspect='equal')
-        ax5.set_title("Truth Background (Linear)")
+        ax5.set_title("Truth Background")
         add_colorbar(im5, ax5)
 
-        # Row 4-5: PSF & Mag Plots & Missed Stats
+        # Statistics Row
         if matched_true_mags:
-            ax8 = fig.add_subplot(gs[3, 0]) # FIX: Only Row 3
+            ax8 = fig.add_subplot(gs[3, 0])
             ax8.scatter(matched_true_mags, matched_pred_mags, alpha=0.5, s=10)
             m_all = matched_true_mags + matched_pred_mags
-            mmin, mmax = min(m_all), max(m_all)
-            ax8.plot([mmin, mmax], [mmin, mmax], 'r--', alpha=0.8)
-            ax8.set_xlabel("True log10(Flux)"); ax8.set_ylabel("Predicted log10(Flux)")
-            ax8.set_title("Magnitude Recovery Accuracy"); ax8.set_aspect('equal'); ax8.grid(True, alpha=0.3)
+            ax8.plot([min(m_all), max(m_all)], [min(m_all), max(m_all)], 'r--', alpha=0.8)
+            ax8.set_title("Photometry Accuracy"); ax8.set_xlabel("True log10(Flux)"); ax8.set_ylabel("Pred log10(Flux)"); ax8.grid(True, alpha=0.3)
 
         if all_true_mags:
-            ax_hist = fig.add_subplot(gs[3, 1]) # FIX: Only Row 3
-            m_p90 = [np.log10(s[2] + 1e-9) for s in predicted_stars if s[3] >= 0.9]
-            m_p50 = [np.log10(s[2] + 1e-9) for s in predicted_stars if s[3] >= 0.5]
+            ax_hist = fig.add_subplot(gs[3, 1])
             m_p10 = [np.log10(s[2] + 1e-9) for s in predicted_stars if s[3] >= 0.1]
-            mmin_h, mmax_h = min(all_true_mags+m_p10), max(all_true_mags+m_p10)
-            bins = np.linspace(mmin_h, mmax_h, 30)
-            ax_hist.hist(all_true_mags, bins=bins, alpha=0.2, label='Truth', color='black')
-            ax_hist.hist(m_p10, bins=bins, alpha=0.4, label='p >= 0.1', histtype='step', linestyle=':')
-            ax_hist.hist(m_p50, bins=bins, alpha=0.7, label='p >= 0.5', histtype='step', linestyle='--')
-            ax_hist.hist(m_p90, bins=bins, alpha=1.0, label='p >= 0.9', histtype='step')
-            ax_hist.set_xlabel("log10(Flux)"); ax_hist.set_title("LF vs. Confidence"); ax_hist.legend(); ax_hist.grid(True, alpha=0.2)
+            ax_hist.hist(all_true_mags, bins=30, alpha=0.2, label='Truth', color='black')
+            ax_hist.hist(m_p10, bins=30, alpha=0.4, label='p >= 0.1', histtype='step'); ax_hist.set_title("LF Recovery"); ax_hist.legend(); ax_hist.grid(True, alpha=0.2)
 
-        # --- THRESHOLD TRADE-OFF PLOT ---
+        # Threshold Trade-off
         if true_catalogue and predicted_stars:
             ax_err = fig.add_subplot(gs[4, 0])
-            # We vary the threshold and calculate aggregate error rates for the whole scene
             thresholds = np.linspace(0.01, 0.99, 50)
             fpr_list, fnr_rates = [], []
-            
             t_list = [(s[1], s[2], s[3]) for s in true_catalogue]
-            
             for thr in thresholds:
                 p_list = [(s[0], s[1], s[2]) for s in predicted_stars if s[3] >= thr]
-                if not p_list:
-                    fpr_list.append(0.0)
-                    fnr_rates.append(100.0)
-                    continue
-                
+                if not p_list: fpr_list.append(0.0); fnr_rates.append(100.0); continue
                 _, ut, up = match_stars(t_list, p_list, distance_threshold=2.0)
-                fpr_list.append(100.0 * len(up) / len(p_list))
-                fnr_rates.append(100.0 * len(ut) / len(t_list))
-            
-            ax_err.plot(thresholds, fnr_rates, 'r-', label='False Neg (Missed Truth %)', linewidth=3)
-            ax_err.plot(thresholds, fpr_list, '-', color='orange', label='False Pos (Spurious Detections %)', linewidth=3)
-            ax_err.set_xlabel("Confidence Threshold (p_cut)")
-            ax_err.set_ylabel("Error Rate (%)")
-            ax_err.set_title("Detection Trade-off (Global Threshold)")
-            ax_err.set_ylim(-5, 105); ax_err.grid(True, alpha=0.3); ax_err.legend()
+                fpr_list.append(100.0 * len(up) / len(p_list)); fnr_rates.append(100.0 * len(ut) / len(t_list))
+            ax_err.plot(thresholds, fnr_rates, 'r-', label='False Neg %', linewidth=3)
+            ax_err.plot(thresholds, fpr_list, '-', color='orange', label='False Pos %', linewidth=3)
+            ax_err.set_title("Detection Trade-off"); ax_err.set_ylim(-5, 105); ax_err.grid(True, alpha=0.3); ax_err.legend()
 
-        # NEW: Matched vs Missed Histogram (Detection Completeness)
         if all_true_mags:
-            ax_comp = fig.add_subplot(gs[4, 1]) # FIX: Row 4
-            ax_comp.hist([matched_true_mags, missed_true_mags], bins=bins, stacked=True, 
-                         label=['Detected', 'Missed'], color=['green', 'red'], alpha=0.7)
-            ax_comp.set_xlabel("True log10(Flux)"); ax_comp.set_ylabel("Count")
-            ax_comp.set_title("Detection Completeness"); ax_comp.legend(); ax_comp.grid(True, alpha=0.2)
+            ax_comp = fig.add_subplot(gs[4, 1])
+            ax_comp.hist([matched_true_mags, missed_true_mags], bins=30, stacked=True, label=['Detected', 'Missed'], color=['green', 'red'], alpha=0.7)
+            ax_comp.set_title("Completeness by Magnitude"); ax_comp.legend(); ax_comp.grid(True, alpha=0.2)
 
+        # PSF Profiles
         if detected_shapes:
             ax_psf_x, ax_psf_y = fig.add_subplot(gs[3:, 2]), fig.add_subplot(gs[3:, 3])
             for i in range(min(100, len(detected_shapes))):
@@ -316,5 +300,5 @@ class InferenceEngine:
                 ax_psf_y.plot(np.mean(shape, axis=1), color='C1', alpha=0.1)
             ax_psf_x.set_title("PSF X-Profiles"); ax_psf_y.set_title("PSF Y-Profiles")
 
-        plt.suptitle(f"Generative Diagnostic (Scale={self.stretch_scale}) | Predicted Stars (p>=0.5): {len(detected_stars)}", fontsize=24)
+        plt.suptitle(f"Generative Diagnostic | Predicted Stars (p>=0.5): {len(detected_stars)}", fontsize=24)
         plt.savefig(output_path); print(f"Comparison saved to {output_path}")
