@@ -140,10 +140,8 @@ class InferenceEngine:
                     reconstruction_stars_linear[y_min:y_max, x_min:x_max] += (flux * w) * shape[sy0:sy1, sx0:sx1]
 
         # --- APPLY GLOBAL JITTER TO RECONSTRUCTION ---
-        # If we have jitter params from the exposure metadata, apply them to the model
         if jitter_params is not None:
             s_j, q_j, t_j = jitter_params
-            # Build the same jitter kernel used in generation
             kh = S // 2
             gy, gx = np.meshgrid(np.arange(S) - kh, np.arange(S) - kh, indexing='ij')
             cos, sin = np.cos(t_j), np.sin(t_j)
@@ -163,7 +161,7 @@ class InferenceEngine:
         full_bg_abs = full_residual_bg_linear + chunk_median
         full_gt_bg_abs = self.transform.network_to_bg(full_gt_residual_bg_stretched) + chunk_median
 
-        # --- FITS OUTPUT ---
+        # FITS Output
         hdul = fits.HDUList([
             fits.PrimaryHDU(),
             fits.ImageHDU(img_linear_abs, name="INPUT_LINEAR"),
@@ -175,7 +173,7 @@ class InferenceEngine:
         fits_path = output_path.replace(".png", ".fits")
         hdul.writeto(fits_path, overwrite=True)
 
-        # Statistics & Matching
+        # Matching
         match_true = [(s[1], s[2], s[3]) for s in true_catalogue]
         match_pred = [(s[0], s[1], s[2]) for s in detected_stars]
         matches, unmatched_true, unmatched_pred = match_stars(match_true, match_pred, distance_threshold=2.0)
@@ -183,8 +181,12 @@ class InferenceEngine:
         matched_true_mags = [np.log10(true_catalogue[m[0]][3] + 1e-9) for m in matches]
         matched_pred_mags = [np.log10(detected_stars[m[1]][2] + 1e-9) for m in matches]
         all_true_mags = [np.log10(s[3] + 1e-9) for s in true_catalogue]
+        
+        # Extract missed true mags
+        matched_true_indices = [m[0] for m in matches]
+        missed_true_mags = [np.log10(true_catalogue[i][3] + 1e-9) for i in range(len(true_catalogue)) if i not in matched_true_indices]
 
-        # 6. Figure Layout
+        # Figure Layout
         fig = plt.figure(figsize=(30, 24))
         gs = fig.add_gridspec(5, 4, hspace=0.3, wspace=0.3)
         
@@ -215,7 +217,6 @@ class InferenceEngine:
         ax2.set_title("Model (Matched Sources = Lime)")
         
         visible_true_indices = [i for i, s in enumerate(true_catalogue) if s[0] >= 0.1]
-        matched_true_indices = [m[0] for m in matches]
         for i in visible_true_indices:
             s = true_catalogue[i]
             if i in matched_true_indices:
@@ -270,6 +271,17 @@ class InferenceEngine:
             ax_hist.hist(m_p50, bins=bins, alpha=0.7, label='p >= 0.5', histtype='step', linestyle='--')
             ax_hist.hist(m_p90, bins=bins, alpha=1.0, label='p >= 0.9', histtype='step')
             ax_hist.set_xlabel("log10(Flux)"); ax_hist.set_title("LF vs. Confidence"); ax_hist.legend(); ax_hist.grid(True, alpha=0.2)
+
+        # NEW: Matched vs Missed Histogram (Detection Completeness)
+        if all_true_mags:
+            ax_comp = fig.add_subplot(gs[4, 1])
+            ax_comp.hist([matched_true_mags, missed_true_mags], bins=bins, stacked=True, 
+                         label=['Detected', 'Missed'], color=['green', 'red'], alpha=0.7)
+            ax_comp.set_xlabel("True log10(Flux)")
+            ax_comp.set_ylabel("Count")
+            ax_comp.set_title("Detection Completeness (Matched vs Missed)")
+            ax_comp.legend()
+            ax_comp.grid(True, alpha=0.2)
 
         if detected_shapes:
             ax_psf_x, ax_psf_y = fig.add_subplot(gs[3:, 2]), fig.add_subplot(gs[3:, 3])
