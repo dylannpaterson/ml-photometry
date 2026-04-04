@@ -261,11 +261,14 @@ class InferenceEngine:
         if all_true_mags:
             ax_hist = fig.add_subplot(gs[3, 1])
             m_p90 = [np.log10(s[2] + 1e-9) for s in predicted_stars if s[3] >= 0.9]
+            m_p50 = [np.log10(s[2] + 1e-9) for s in predicted_stars if s[3] >= 0.5]
             m_p10 = [np.log10(s[2] + 1e-9) for s in predicted_stars if s[3] >= 0.1]
             mmin_h, mmax_h = min(all_true_mags+m_p10), max(all_true_mags+m_p10)
             bins = np.linspace(mmin_h, mmax_h, 30)
             ax_hist.hist(all_true_mags, bins=bins, alpha=0.2, label='Truth', color='black')
-            ax_hist.hist(m_p10, bins=bins, alpha=0.4, label='p >= 0.1', histtype='step'); ax_hist.hist(m_p90, bins=bins, alpha=1.0, label='p >= 0.9', histtype='step')
+            ax_hist.hist(m_p10, bins=bins, alpha=0.4, label='p >= 0.1', histtype='step', linestyle=':')
+            ax_hist.hist(m_p50, bins=bins, alpha=0.7, label='p >= 0.5', histtype='step', linestyle='--')
+            ax_hist.hist(m_p90, bins=bins, alpha=1.0, label='p >= 0.9', histtype='step')
             ax_hist.set_xlabel("log10(Flux)"); ax_hist.set_title("LF vs. Confidence"); ax_hist.legend(); ax_hist.grid(True, alpha=0.2)
 
         if detected_shapes:
