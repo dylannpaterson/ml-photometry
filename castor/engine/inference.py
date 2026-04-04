@@ -272,6 +272,22 @@ class InferenceEngine:
             ax_hist.hist(m_p90, bins=bins, alpha=1.0, label='p >= 0.9', histtype='step')
             ax_hist.set_xlabel("log10(Flux)"); ax_hist.set_title("LF vs. Confidence"); ax_hist.legend(); ax_hist.grid(True, alpha=0.2)
 
+        # NEW: Classification Errors (False +/-) Histogram
+        if true_catalogue:
+            ax_err = fig.add_subplot(gs[4, 0])
+            matched_pred_indices = [m[1] for m in matches]
+            fn_objectness = [true_catalogue[i][0] for i in range(len(true_catalogue)) if i not in matched_true_indices]
+            fp_confidences = [detected_stars[i][3] for i in range(len(detected_stars)) if i not in matched_pred_indices]
+            
+            ax_err.hist([fn_objectness, fp_confidences], bins=20, stacked=True,
+                        label=['False Neg (by Target Obj)', 'False Pos (by Pred Conf)'], 
+                        color=['red', 'orange'], alpha=0.7)
+            ax_err.set_xlabel("Target Objectness / Pred Confidence")
+            ax_err.set_ylabel("Count")
+            ax_err.set_title("Classification Errors (False +/-)")
+            ax_err.legend()
+            ax_err.grid(True, alpha=0.2)
+
         # NEW: Matched vs Missed Histogram (Detection Completeness)
         if all_true_mags:
             ax_comp = fig.add_subplot(gs[4, 1])
