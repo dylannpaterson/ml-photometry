@@ -272,21 +272,48 @@ class InferenceEngine:
             ax_hist.hist(m_p90, bins=bins, alpha=1.0, label='p >= 0.9', histtype='step')
             ax_hist.set_xlabel("log10(Flux)"); ax_hist.set_title("LF vs. Confidence"); ax_hist.legend(); ax_hist.grid(True, alpha=0.2)
 
-        # NEW: Classification Errors (False +/-) Histogram
-        if true_catalogue:
+        # NEW: Error Rates (FP/FN %) vs. Signal Strength
+        if true_catalogue and detected_stars:
             ax_err = fig.add_subplot(gs[4, 0])
             matched_pred_indices = [m[1] for m in matches]
-            fn_objectness = [true_catalogue[i][0] for i in range(len(true_catalogue)) if i not in matched_true_indices]
-            fp_confidences = [detected_stars[i][3] for i in range(len(detected_stars)) if i not in matched_pred_indices]
+            matched_true_indices = [m[0] for m in matches]
             
-            ax_err.hist([fn_objectness, fp_confidences], bins=20, stacked=True,
-                        label=['False Neg (by Target Obj)', 'False Pos (by Pred Conf)'], 
-                        color=['red', 'orange'], alpha=0.7)
-            ax_err.set_xlabel("Target Objectness / Pred Confidence")
-            ax_err.set_ylabel("Count")
-            ax_err.set_title("Classification Errors (False +/-)")
+            # 1. Define Bins for Objectness/Confidence (0.0 to 1.0)
+            err_bins = np.linspace(0.0, 1.0, 21)
+            bin_centers = (err_bins[:-1] + err_bins[1:]) / 2.0
+            
+            # 2. Calculate False Negative Rate (relative to Truth Objectness)
+            true_obj = np.array([s[0] for s in true_catalogue])
+            fn_rates = []
+            for j in range(len(err_bins)-1):
+                in_bin = (true_obj >= err_bins[j]) & (true_obj < err_bins[j+1])
+                if in_bin.any():
+                    total_in_bin = in_bin.sum()
+                    missed_in_bin = sum(1 for i in np.where(in_bin)[0] if i not in matched_true_indices)
+                    fn_rates.append(100.0 * missed_in_bin / total_in_bin)
+                else:
+                    fn_rates.append(0.0)
+            
+            # 3. Calculate False Positive Rate (relative to Predicted Confidence)
+            pred_conf = np.array([s[3] for s in detected_stars])
+            fp_rates = []
+            for j in range(len(err_bins)-1):
+                in_bin = (pred_conf >= err_bins[j]) & (pred_conf < err_bins[j+1])
+                if in_bin.any():
+                    total_in_bin = in_bin.sum()
+                    spurious_in_bin = sum(1 for i in np.where(in_bin)[0] if i not in matched_pred_indices)
+                    fp_rates.append(100.0 * spurious_in_bin / total_in_bin)
+                else:
+                    fp_rates.append(0.0)
+            
+            ax_err.plot(bin_centers, fn_rates, 'r-o', label='False Negative Rate (%)', linewidth=2)
+            ax_err.plot(bin_centers, fp_rates, 'o-', color='orange', label='False Positive Rate (%)', linewidth=2)
+            ax_err.set_xlabel("Strength (Target Objectness / Pred Confidence)")
+            ax_err.set_ylabel("Error Rate (%)")
+            ax_err.set_title("Classification Reliability")
+            ax_err.set_ylim(-5, 105)
+            ax_err.grid(True, alpha=0.3)
             ax_err.legend()
-            ax_err.grid(True, alpha=0.2)
 
         # NEW: Matched vs Missed Histogram (Detection Completeness)
         if all_true_mags:
