@@ -304,6 +304,7 @@ class HDF5MosaicDataset(Dataset):
     def __init__(self, h5_path, image_size=256):
         self.h5_path, self.file, self.img_size = h5_path, None, image_size
         self.cell_size, self.grid_size, self.K = DEFAULT_CELL_SIZE, image_size // DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL
+        self.n_pca = N_PCA_COMPONENTS
         if not os.path.exists(self.h5_path): raise FileNotFoundError(f"HDF5 file not found: {self.h5_path}")
         
         # Open briefly to get length and ensure PSF library consistency
@@ -314,6 +315,19 @@ class HDF5MosaicDataset(Dataset):
                 self.psf_library = torch.from_numpy(f['psf_libraries'][0]).float()
             else:
                 self.psf_library = None
+
+            # FIX: Calculate standard deviation across a sample of targets to expose to Trainer.py
+            # This ensures pre-generated datasets align with the new standardization strategy
+            sample_size = min(1000, self.length)
+            sample_targets = f['targets'][:sample_size]
+            # Target format: [p, dx, dy, flux, w0, w1, ...]
+            obj_mask = sample_targets[..., 0] > 0
+            
+            if np.any(obj_mask):
+                raw_pca_weights = sample_targets[obj_mask][..., 4:4+self.n_pca]
+                self.global_weights_std = np.std(raw_pca_weights, axis=0) + 1e-8
+            else:
+                self.global_weights_std = np.ones(self.n_pca, dtype=np.float32)
 
     def __len__(self): return self.length
 
@@ -327,6 +341,12 @@ class HDF5MosaicDataset(Dataset):
         
         # Metadata: [exp_time, zp, sky_mag, s_jit, q_jit, theta_jit]
         meta = self.file['metas'][idx] if 'metas' in self.file else np.zeros(6, dtype=np.float32)
+
+        # FIX: Dynamically standardize targets so they fit inside the tanh([-4.0, 4.0]) bound
+        obj_mask = target[..., 0] > 0
+        if obj_mask.any():
+            std_tensor = torch.from_numpy(self.global_weights_std).float()
+            target[obj_mask, 4:4+self.n_pca] = target[obj_mask, 4:4+self.n_pca] / std_tensor
 
         return {
             "image": img,
