@@ -131,7 +131,7 @@ class Trainer:
                 preds_fp32 = {k: v.float() for k, v in preds.items()}
                 
                 loss, p_loss, po_loss, f_loss, s_loss, b_loss = compute_grid_loss(
-                    preds_fp32, targets, psf_library=psf_library, **self.loss_params
+                    preds_fp32, targets, pca_std=self.model.pca_std, psf_library=psf_library, **self.loss_params
                 )
                 
                 # --- DIFFRACTION FILTER REGULARIZATION ---

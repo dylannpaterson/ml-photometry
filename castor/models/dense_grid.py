@@ -230,27 +230,31 @@ class DenseGridModel(nn.Module):
         
         # CHANGED: Shape weights are linear (Eigen-PSF weights)
         # FIX: Expand the bounds to comfortably cover a standard normal distribution (e.g., +/- 4.0)
+        # We return both standardized (for loss stability) and physical (for inference) weights.
         raw_shape_weights = star_out[..., 4:]
-        shape_weights = torch.tanh(raw_shape_weights) * 4.0
+        std_shape_weights = torch.tanh(raw_shape_weights) * 4.0
+        shape_weights = std_shape_weights * self.pca_std.view(1, 1, 1, 1, self.S2)
         
         # Background residuals can be negative
         bg = bg_out.permute(0, 2, 3, 1)
         
         return {
             "stars": torch.cat([p, dx, dy, flux, shape_weights], dim=-1),
+            "std_stars": torch.cat([p, dx, dy, flux, std_shape_weights], dim=-1),
             "p_logits": p_logits, # NEW: Pass raw logits to the loss function
             "raw_log_flux": raw_log_flux, # Logit Bypass
             "background": bg
         }
 
-def compute_grid_loss(preds, targets, psf_library=None, lambda_prob=5.0, lambda_pos=50.0, lambda_flux=5.0, lambda_shape=1.0, lambda_bg=0.1, focal_alpha=0.75, focal_gamma=2.0, stretch_scale=GLOBAL_STRETCH_SCALE):
+def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=5.0, lambda_pos=50.0, lambda_flux=5.0, lambda_shape=1.0, lambda_bg=0.1, focal_alpha=0.75, focal_gamma=2.0, stretch_scale=GLOBAL_STRETCH_SCALE):
     """
     Latent (Weight-Wise) Loss:
-    Calculates shape loss directly in PCA weight space. This is faster,
-    more memory efficient, and ensures that structural details (diffraction spikes)
-    are treated with equal importance to the core photometry.
+    Calculates shape loss in physical weight space even though the network 
+    outputs standardized values. This ensures PC1 (high variance) is prioritized 
+    over PC20 (noise).
     """
     star_preds = preds["stars"]
+    std_star_preds = preds["std_stars"]
     bg_preds = preds["background"]
     
     # 1. Unpack Target Grid
@@ -289,20 +293,29 @@ def compute_grid_loss(preds, targets, psf_library=None, lambda_prob=5.0, lambda_
         log_flux_target = torch.log(flux_target + 1e-6)
         flux_loss = F.smooth_l1_loss(log_flux_pred, log_flux_target, reduction='mean')
         
-        # --- LATENT WEIGHT LOSS ---
-        # Predict the 20 PCA weights directly
-        weights_pred = star_preds[..., 4:][obj_mask]
-        weights_target = star_targets[..., 4:][obj_mask]
+        # --- LATENT WEIGHT LOSS (Physical Priority) ---
+        # Targets from the dataset are STANDARDIZED (N(0, 1))
+        # Predictions 'std_stars' are also STANDARDIZED.
+        std_weights_pred = std_star_preds[..., 4:][obj_mask]
+        std_weights_target = star_targets[..., 4:][obj_mask]
         
-        # FIX: Use flux weights but remove batch-wise standardization
-        # (Targets are now globally standardized in the dataset)
+        # We multiply both by pca_std to calculate the loss in physical units.
+        # This makes the loss for PC1 (large std) much higher than PC20 (tiny std).
+        if pca_std is not None:
+            # Scale both pred and target by physical importance
+            weights_pred_phys = std_weights_pred * pca_std.view(1, -1)
+            weights_target_phys = std_weights_target * pca_std.view(1, -1)
+        else:
+            weights_pred_phys = std_weights_pred
+            weights_target_phys = std_weights_target
+        
+        # Apply flux weight
         flux_weight = torch.log1p(flux_target)
         flux_weight = flux_weight / (flux_weight.mean() + 1e-6)
         
-        # Apply flux weight to the globally standardized targets
         shape_loss = F.smooth_l1_loss(
-            weights_pred * flux_weight, 
-            weights_target * flux_weight, 
+            weights_pred_phys * flux_weight, 
+            weights_target_phys * flux_weight, 
             reduction='mean'
         )
     else:

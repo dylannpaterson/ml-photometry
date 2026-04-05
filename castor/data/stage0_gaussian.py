@@ -316,21 +316,26 @@ class HDF5MosaicDataset(Dataset):
             else:
                 self.psf_library = None
 
-            # FIX: Calculate standard deviation across a sample of targets to expose to Trainer.py
-            sample_size = min(1000, self.length)
-            sample_targets = f['targets'][:sample_size]
-            
-            # CRITICAL FIX: Reshape to expose K slots before standardizing
-            # sample_targets is [Batch, H, W, flattened_channels]
-            B_channels = sample_targets.shape[-1] - 1
-            star_targets_sampled = sample_targets[..., :-1].reshape(-1, self.grid_size, self.grid_size, self.K, B_channels // self.K)
-            
-            obj_mask = star_targets_sampled[..., 0] > 0
-            if np.any(obj_mask):
-                raw_pca_weights = star_targets_sampled[obj_mask][..., 4:4+self.n_pca]
-                self.global_weights_std = np.std(raw_pca_weights, axis=0) + 1e-8
+            # FIX: Load the exact global standard deviation from the HDF5 attributes
+            if 'global_weights_std' in f.attrs:
+                self.global_weights_std = f.attrs['global_weights_std'].astype(np.float32)
+                print(f"🛰️ HDF5MosaicDataset: Loaded Global PCA StdDev from HDF5 attributes.")
             else:
-                self.global_weights_std = np.ones(self.n_pca, dtype=np.float32)
+                # Fallback: Calculate standard deviation across a sample of targets if not in attributes
+                sample_size = min(1000, self.length)
+                sample_targets = f['targets'][:sample_size]
+                
+                # CRITICAL FIX: Reshape to expose K slots before standardizing
+                B_channels = sample_targets.shape[-1] - 1
+                star_targets_sampled = sample_targets[..., :-1].reshape(-1, self.grid_size, self.grid_size, self.K, B_channels // self.K)
+                
+                obj_mask = star_targets_sampled[..., 0] > 0
+                if np.any(obj_mask):
+                    # We assume these are PHYSICAL weights if we are calculating std here
+                    raw_pca_weights = star_targets_sampled[obj_mask][..., 4:4+self.n_pca]
+                    self.global_weights_std = np.std(raw_pca_weights, axis=0) + 1e-8
+                else:
+                    self.global_weights_std = np.ones(self.n_pca, dtype=np.float32)
 
     def __len__(self): return self.length
 
@@ -345,18 +350,8 @@ class HDF5MosaicDataset(Dataset):
         # Metadata: [exp_time, zp, sky_mag, s_jit, q_jit, theta_jit]
         meta = self.file['metas'][idx] if 'metas' in self.file else np.zeros(6, dtype=np.float32)
 
-        # FIX: Dynamically standardize targets so they fit inside the tanh([-4.0, 4.0]) bound
-        # CRITICAL FIX: Reshape to expose K slots
-        B_channels = target.shape[-1] - 1
-        star_targets = target[..., :-1].view(self.grid_size, self.grid_size, self.K, B_channels // self.K)
-        
-        obj_mask = star_targets[..., 0] > 0
-        if obj_mask.any():
-            std_tensor = torch.from_numpy(self.global_weights_std).float()
-            star_targets[obj_mask, 4:4+self.n_pca] /= std_tensor
-            
-        # Put back into the flat target
-        target[..., :-1] = star_targets.view(self.grid_size, self.grid_size, B_channels)
+        # NOTE: Targets in the HDF5 are now assumed to be PRE-STANDARDIZED (N(0, 1))
+        # to aid training stability. We no longer divide by std_tensor here.
 
         return {
             "image": img,

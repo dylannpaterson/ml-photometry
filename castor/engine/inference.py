@@ -65,12 +65,9 @@ class InferenceEngine:
             # Star shape: [Batch, H, W, K, 4 + N_PCA]
             prediction_tensor = prediction_dict["stars"].squeeze(0).float()
             
-            # --- FIX: Explicitly un-standardize PCA weights ---
-            # The model outputs standardized weights (mean 0, std 1)
-            # We multiply by the model's stored pca_std buffer to get back to physical units
-            pca_std = self.model.pca_std.cpu()
-            prediction_tensor[..., 4:] = prediction_tensor[..., 4:] * pca_std
-            # --------------------------------------------------
+            # --- REMOVED: Explicit un-standardization ---
+            # The model now returns physical weights directly in prediction_dict["stars"]
+            # ---------------------------------------------
             
             prediction = prediction_tensor.cpu().numpy()
             bg_map = prediction_dict["background"].squeeze(0).float().cpu().numpy()

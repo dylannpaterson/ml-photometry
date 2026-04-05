@@ -58,7 +58,22 @@ def create_hdf5_datasets_combined(train_mosaic_dir, val_mosaic_dir, train_path, 
     print(f"Found {len(train_mosaics)} train and {len(val_mosaics)} val mosaics. Creating HDF5 databases...")
     os.makedirs(os.path.dirname(train_path), exist_ok=True)
 
+    # --- NEW: CALCULATE GLOBAL PCA STD FROM TRAIN SPLIT ---
+    print("🛰️ Calculating Global PCA StdDev from training catalogs...")
+    all_weights = []
+    for mosaic in train_mosaics:
+        cat = np.load(mosaic['cat'])
+        weights = np.column_stack([cat[f'w{i}'] for i in range(N_PCA)])
+        all_weights.append(weights)
+    global_weights_std = np.std(np.concatenate(all_weights, axis=0), axis=0) + 1e-8
+    print(f"🛰️ Global PCA StdDev: {global_weights_std}")
+    # -----------------------------------------------------
+
     with h5py.File(train_path, 'w') as h5_train, h5py.File(val_path, 'w') as h5_val:
+        # Save standard deviation as attribute
+        h5_train.attrs['global_weights_std'] = global_weights_std
+        h5_val.attrs['global_weights_std'] = global_weights_std
+
         # 1. Setup Train Datasets
         tr_imgs = h5_train.create_dataset("images", (train_samples, 1, img_size, img_size), dtype='float32', chunks=(1, 1, img_size, img_size), compression="lzf")
         tr_tgts = h5_train.create_dataset("targets", (train_samples, *target_shape), dtype='float32', chunks=(1, *target_shape), compression="lzf")
