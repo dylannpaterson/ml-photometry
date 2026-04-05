@@ -317,14 +317,17 @@ class HDF5MosaicDataset(Dataset):
                 self.psf_library = None
 
             # FIX: Calculate standard deviation across a sample of targets to expose to Trainer.py
-            # This ensures pre-generated datasets align with the new standardization strategy
             sample_size = min(1000, self.length)
             sample_targets = f['targets'][:sample_size]
-            # Target format: [p, dx, dy, flux, w0, w1, ...]
-            obj_mask = sample_targets[..., 0] > 0
             
+            # CRITICAL FIX: Reshape to expose K slots before standardizing
+            # sample_targets is [Batch, H, W, flattened_channels]
+            B_channels = sample_targets.shape[-1] - 1
+            star_targets_sampled = sample_targets[..., :-1].reshape(-1, self.grid_size, self.grid_size, self.K, B_channels // self.K)
+            
+            obj_mask = star_targets_sampled[..., 0] > 0
             if np.any(obj_mask):
-                raw_pca_weights = sample_targets[obj_mask][..., 4:4+self.n_pca]
+                raw_pca_weights = star_targets_sampled[obj_mask][..., 4:4+self.n_pca]
                 self.global_weights_std = np.std(raw_pca_weights, axis=0) + 1e-8
             else:
                 self.global_weights_std = np.ones(self.n_pca, dtype=np.float32)
@@ -343,10 +346,17 @@ class HDF5MosaicDataset(Dataset):
         meta = self.file['metas'][idx] if 'metas' in self.file else np.zeros(6, dtype=np.float32)
 
         # FIX: Dynamically standardize targets so they fit inside the tanh([-4.0, 4.0]) bound
-        obj_mask = target[..., 0] > 0
+        # CRITICAL FIX: Reshape to expose K slots
+        B_channels = target.shape[-1] - 1
+        star_targets = target[..., :-1].view(self.grid_size, self.grid_size, self.K, B_channels // self.K)
+        
+        obj_mask = star_targets[..., 0] > 0
         if obj_mask.any():
             std_tensor = torch.from_numpy(self.global_weights_std).float()
-            target[obj_mask, 4:4+self.n_pca] = target[obj_mask, 4:4+self.n_pca] / std_tensor
+            star_targets[obj_mask, 4:4+self.n_pca] /= std_tensor
+            
+        # Put back into the flat target
+        target[..., :-1] = star_targets.view(self.grid_size, self.grid_size, B_channels)
 
         return {
             "image": img,

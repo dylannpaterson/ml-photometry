@@ -233,10 +233,6 @@ class DenseGridModel(nn.Module):
         raw_shape_weights = star_out[..., 4:]
         shape_weights = torch.tanh(raw_shape_weights) * 4.0
         
-        # If we are not training, un-standardize back to physical weights automatically!
-        if not self.training:
-            shape_weights = shape_weights * self.pca_std
-
         # Background residuals can be negative
         bg = bg_out.permute(0, 2, 3, 1)
         

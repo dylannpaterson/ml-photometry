@@ -62,7 +62,17 @@ class InferenceEngine:
                 prediction_dict = self.model(input_tensor)
             
             # Note: Unpack predictions and convert to float32 for stable CPU processing
-            prediction = prediction_dict["stars"].squeeze(0).float().cpu().numpy()
+            # Star shape: [Batch, H, W, K, 4 + N_PCA]
+            prediction_tensor = prediction_dict["stars"].squeeze(0).float()
+            
+            # --- FIX: Explicitly un-standardize PCA weights ---
+            # The model outputs standardized weights (mean 0, std 1)
+            # We multiply by the model's stored pca_std buffer to get back to physical units
+            pca_std = self.model.pca_std.cpu()
+            prediction_tensor[..., 4:] = prediction_tensor[..., 4:] * pca_std
+            # --------------------------------------------------
+            
+            prediction = prediction_tensor.cpu().numpy()
             bg_map = prediction_dict["background"].squeeze(0).float().cpu().numpy()
             
         predicted_stars, predicted_shapes = [], []
@@ -80,7 +90,7 @@ class InferenceEngine:
                 for k in range(K):
                     p, dx, dy, physical_flux = prediction[y, x, k, :4]
                     if p > threshold:
-                        # NEW: Extract weights
+                        # NEW: Extract weights (now un-standardized)
                         weights = prediction[y, x, k, 4:]
                         predicted_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, float(physical_flux), p, weights))
                         
