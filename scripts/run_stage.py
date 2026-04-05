@@ -423,7 +423,9 @@ def run_infer(stage_idx, config, device, checkpoint=None):
             gt_bg_map, 
             threshold=0.5, 
             chunk_median=noisy_median,
-            jitter_params=jitter_params
+            jitter_params=jitter_params,
+            psf_basis=psf_basis.numpy(),
+            mean_psf=mean_psf.numpy()
         )
     else:
         print(f"⚠️ Specialized inference for stage {stage_idx} not yet implemented.")

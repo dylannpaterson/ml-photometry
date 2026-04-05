@@ -230,8 +230,8 @@ class InferenceEngine:
         visible_true_indices = [i for i, s in enumerate(true_catalogue) if s[0] >= 0.1]
         for i in visible_true_indices:
             s = true_catalogue[i]
-            if i in matched_true_indices: ax2.plot(s[1], s[2], 'lime+', markersize=10, alpha=0.8)
-            else: ax1.plot(s[1], s[2], 'cyan+', markersize=10, alpha=0.8)
+            if i in matched_true_indices: ax2.plot(s[1], s[2], color='lime', marker='+', markersize=10, alpha=0.8)
+            else: ax1.plot(s[1], s[2], color='cyan', marker='+', markersize=10, alpha=0.8)
         
         pred_x, pred_y = [s[0] for s in detected_stars], [s[1] for s in detected_stars]
         ax2.scatter(pred_x, pred_y, color='red', s=1, alpha=0.5)

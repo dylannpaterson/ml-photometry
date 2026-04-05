@@ -225,7 +225,9 @@ class DenseGridModel(nn.Module):
         flux = torch.exp(raw_log_flux.float())
         
         # CHANGED: Shape weights are linear (Eigen-PSF weights)
-        shape_weights = star_out[..., 4:]
+        # FIX: Constrain the chaos by bounding the raw linear outputs
+        raw_shape_weights = star_out[..., 4:]
+        shape_weights = torch.tanh(raw_shape_weights) * 0.5
         
         # Background residuals can be negative
         bg = bg_out.permute(0, 2, 3, 1)
@@ -288,9 +290,21 @@ def compute_grid_loss(preds, targets, psf_library=None, lambda_prob=5.0, lambda_
         weights_pred = star_preds[..., 4:][obj_mask]
         weights_target = star_targets[..., 4:][obj_mask]
         
-        # Direct Latent Space Loss
-        # We use Smooth L1 for robust convergence
-        shape_loss = F.smooth_l1_loss(weights_pred, weights_target, reduction='mean')
+        # FIX 1: Flux-Weighted Shape Loss (Prioritize bright stars for visual stability)
+        # Using log1p to dampen the massive range of astronomical fluxes
+        flux_weight = torch.log1p(flux_target)
+        flux_weight = flux_weight / (flux_weight.mean() + 1e-6)
+        
+        # FIX 3: Target Standardization (Treat all PCA components with equal importance)
+        # Standardize weights_target to have unit variance across the batch for each component
+        weights_std = torch.std(weights_target, dim=0, keepdim=True) + 1e-6
+        
+        # Apply standardizing weight and flux weight
+        shape_loss = F.smooth_l1_loss(
+            (weights_pred / weights_std) * flux_weight, 
+            (weights_target / weights_std) * flux_weight, 
+            reduction='mean'
+        )
     else:
         pos_loss = torch.tensor(0.0, device=star_preds.device)
         flux_loss = torch.tensor(0.0, device=star_preds.device)

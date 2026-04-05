@@ -43,8 +43,8 @@ def match_stars(true_stars, pred_stars, distance_threshold=2.0, flux_threshold_d
         p_indices = tree.query_ball_point(true_coords[t_idx], r=distance_threshold)
         
         best_p_idx = -1
-        min_cost = 2.0 # Maximum allowed cost (1.0 from dist + 1.0 from flux)
-        
+        min_cost = float('inf') 
+
         for p_idx in p_indices:
             if p_idx in matched_pred:
                 continue

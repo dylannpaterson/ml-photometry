@@ -12,7 +12,7 @@ from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZ
 from numba import njit
 import gc
 
-@njit(boundscheck=False)
+#@njit(boundscheck=False)
 def fast_paint_grid(lx, ly, fluxes, snrs, psf_weights, sort_idx, min_snr, grid_size, cell_size, K):
     N_PCA = psf_weights.shape[1]
     grid_stars = np.zeros((grid_size, grid_size, K, 4 + N_PCA), dtype=np.float32)
@@ -312,12 +312,16 @@ class HDF5MosaicDataset(Dataset):
         img = torch.from_numpy(self.file['images'][idx]).float()
         target = torch.from_numpy(self.file['targets'][idx]).float()
         median = float(self.file['chunk_medians'][idx])
+        
+        # Metadata: [exp_time, zp, sky_mag, s_jit, q_jit, theta_jit]
+        meta = self.file['metas'][idx] if 'metas' in self.file else np.zeros(6, dtype=np.float32)
 
         return {
             "image": img,
             "target": target,
-            "psf_library": self.psf_library, # Reuse cached tensor
-            "chunk_median": median
+            "psf_library": self.psf_library, 
+            "chunk_median": median,
+            "meta": meta
         }
 
     def generate_chunk(self):

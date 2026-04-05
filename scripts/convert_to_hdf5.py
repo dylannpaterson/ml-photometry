@@ -63,18 +63,20 @@ def create_hdf5_datasets_combined(train_mosaic_dir, val_mosaic_dir, train_path, 
         tr_imgs = h5_train.create_dataset("images", (train_samples, 1, img_size, img_size), dtype='float32', chunks=(1, 1, img_size, img_size), compression="lzf")
         tr_tgts = h5_train.create_dataset("targets", (train_samples, *target_shape), dtype='float32', chunks=(1, *target_shape), compression="lzf")
         tr_meds = h5_train.create_dataset("chunk_medians", (train_samples,), dtype='float32')
+        tr_meta = h5_train.create_dataset("metas", (train_samples, 6), dtype='float32')
         tr_psfs = None # Allocated dynamically
         
         # 2. Setup Val Datasets
         val_imgs = h5_val.create_dataset("images", (val_samples, 1, img_size, img_size), dtype='float32', chunks=(1, 1, img_size, img_size), compression="lzf")
         val_tgts = h5_val.create_dataset("targets", (val_samples, *target_shape), dtype='float32', chunks=(1, *target_shape), compression="lzf")
         val_meds = h5_val.create_dataset("chunk_medians", (val_samples,), dtype='float32')
+        val_meta = h5_val.create_dataset("metas", (val_samples, 6), dtype='float32')
         val_psfs = None
 
         # --- PROCESS EACH SPLIT INDEPENDENTLY ---
-        for split_name, mosaics, split_samples, ds_imgs, ds_tgts, ds_meds, is_val in [
-            ("Train", train_mosaics, train_samples, tr_imgs, tr_tgts, tr_meds, False),
-            ("Val", val_mosaics, val_samples, val_imgs, val_tgts, val_meds, True)
+        for split_name, mosaics, split_samples, ds_imgs, ds_tgts, ds_meds, ds_meta, is_val in [
+            ("Train", train_mosaics, train_samples, tr_imgs, tr_tgts, tr_meds, tr_meta, False),
+            ("Val", val_mosaics, val_samples, val_imgs, val_tgts, val_meds, val_meta, True)
         ]:
             print(f"\n🚀 Processing {split_name} Split ({len(mosaics)} mosaics)...")
             samples_per_mos = split_samples // len(mosaics)
@@ -86,6 +88,8 @@ def create_hdf5_datasets_combined(train_mosaic_dir, val_mosaic_dir, train_path, 
                 
                 img_data = np.load(mosaic['img'])
                 cat_data = np.load(mosaic['cat'])
+                meta_path = mosaic['img'].replace("_img.npy", "_meta.npy")
+                meta_data = np.load(meta_path) if os.path.exists(meta_path) else np.zeros(6, dtype=np.float32)
                 psf_lib = np.load(mosaic['lib']) if mosaic['lib'] else np.zeros((N_PCA + 1, SHAPE_SIZE * SHAPE_SIZE), dtype=np.float32)
 
                 # Dynamic PSF library allocation
@@ -134,6 +138,7 @@ def create_hdf5_datasets_combined(train_mosaic_dir, val_mosaic_dir, train_path, 
                     ds_tgts[global_idx] = target_buffer
                     ds_meds[global_idx] = chunk_median
                     ds_psfs_current[global_idx] = psf_lib
+                    ds_meta[global_idx] = meta_data
                     global_idx += 1
 
                 # --- CLEANUP THIS MOSAIC ---
