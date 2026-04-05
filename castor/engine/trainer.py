@@ -53,6 +53,13 @@ class Trainer:
         self.loss_params = config["data_params"].get("loss_params", {}).copy()
         self.loss_params["stretch_scale"] = GLOBAL_STRETCH_SCALE
 
+        # FIX: Inject global standardization scale into the model buffer
+        # This allows the model to un-standardize its own outputs during eval()
+        dataset = self.train_loader.dataset
+        if hasattr(dataset, 'global_weights_std'):
+            print(f"🛰️ Trainer: Injecting Global PCA StdDev into model buffer...")
+            self.model.pca_std.data = torch.from_numpy(dataset.global_weights_std).float().to(self.device)
+
     def resume(self, checkpoint_path=None):
         if checkpoint_path is None:
             checkpoint_path, self.start_epoch = find_latest_checkpoint(prefix=self.checkpoint_prefix)

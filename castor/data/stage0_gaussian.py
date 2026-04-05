@@ -101,6 +101,12 @@ class GaussianPretrainingProvider(Dataset):
             # 2. Extract Eigen-PSFs
             self.eigen_psfs, self.psf_weights_lib, self.mean_psf = self._compute_eigen_psfs(raw_library, n_components=self.n_pca)
         
+        # FIX: Global Standardization at the source
+        # Calculate the global standard deviation of the PCA library
+        self.global_weights_std = np.std(self.psf_weights_lib, axis=0) + 1e-8
+        # Create a pre-standardized version of the library for the network targets
+        self.target_weights_lib = self.psf_weights_lib / self.global_weights_std
+
         self.psf_library_tensor = torch.cat([
             torch.from_numpy(self.eigen_psfs).view(self.n_pca, -1),
             torch.from_numpy(self.mean_psf).view(1, -1)
@@ -170,8 +176,13 @@ class GaussianPretrainingProvider(Dataset):
         sort_idx = np.argsort(fluxes)[::-1]
         fluxes, mags = fluxes[sort_idx], mags[sort_idx]
         x_centers, y_centers = np.random.uniform(0, self.img_size, len(mags)), np.random.uniform(0, self.img_size, len(mags))
+        
+        # FIX 2: Split Weights for Rendering vs Targets
         psf_indices = np.random.randint(0, 100, size=len(mags))
-        psf_weights = self.psf_weights_lib[psf_indices]
+        # Use physical weights to render the image
+        physical_weights = self.psf_weights_lib[psf_indices]
+        # Use standardized weights for the neural network target
+        target_weights = self.target_weights_lib[psf_indices]
 
         # Hybrid Fast Rendering (NumPy Optimized)
         x0, y0 = np.floor(x_centers).astype(int), np.floor(y_centers).astype(int)
@@ -192,7 +203,7 @@ class GaussianPretrainingProvider(Dataset):
         # We simplify here: pretraining only corrects stars likely to be in target
         is_significant = fluxes > (5.0 * np.sqrt(fluxes + 100)) # Heuristic SNR cutoff
         if is_significant.any():
-            sig_weights = psf_weights[is_significant]
+            sig_weights = physical_weights[is_significant]
             correction_stamps = (sig_weights @ self.eigen_psfs.reshape(self.n_pca, -1)).reshape(-1, self.S, self.S)
             # Use simple stamp painting
             half = self.S // 2
@@ -227,12 +238,13 @@ class GaussianPretrainingProvider(Dataset):
 
         # Calculate SNR under Jitter
         eff_area_jit = 1.0 / np.sum(fftconvolve(self.mean_psf, jitter_kernel, mode='same')**2)
-        lib_peaks_jit = (self.mean_psf[k_half, k_half] + psf_weights @ self.eigen_psfs[:, k_half, k_half]) * (1.0 / (np.sum(self.mean_psf**2) * eff_area_jit))
+        lib_peaks_jit = (self.mean_psf[k_half, k_half] + physical_weights @ self.eigen_psfs[:, k_half, k_half]) * (1.0 / (np.sum(self.mean_psf**2) * eff_area_jit))
         total_local_light = map_coordinates(star_signal, [y_centers, x_centers], order=1, mode='nearest')
         noise_variance = fluxes + eff_area_jit * (sky_level + np.maximum(0, total_local_light - fluxes * lib_peaks_jit) + 25.0)
         snrs = fluxes / np.sqrt(noise_variance)
 
-        base_grid = fast_paint_grid(x_centers, y_centers, fluxes, snrs, psf_weights, sort_idx, self.min_snr, self.grid_size, self.cell_size, self.K)
+        # FIX 3: Pass target_weights to the target grid
+        base_grid = fast_paint_grid(x_centers, y_centers, fluxes, snrs, target_weights, sort_idx, self.min_snr, self.grid_size, self.cell_size, self.K)
         target = torch.cat([torch.from_numpy(base_grid).view(self.grid_size, self.grid_size, -1), 
                             torch.from_numpy(np.full((self.grid_size, self.grid_size, 1), self.transform.target_bg_to_network(sky_level - chunk_median), dtype=np.float32))], dim=-1)
 
