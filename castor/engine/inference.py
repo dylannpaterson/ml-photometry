@@ -80,10 +80,11 @@ class InferenceEngine:
                 for k in range(K):
                     p, dx, dy, physical_flux = prediction[y, x, k, :4]
                     if p > threshold:
-                        predicted_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, float(physical_flux), p))
+                        # NEW: Extract weights
+                        weights = prediction[y, x, k, 4:]
+                        predicted_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, float(physical_flux), p, weights))
                         
                         # Reconstruct PSF from PCA weights
-                        weights = prediction[y, x, k, 4:]
                         if psf_basis is not None and mean_psf is not None:
                             # weights: [20], basis: [20, 961], mean: [961]
                             shape_flat = (weights @ psf_basis) + mean_psf
@@ -124,7 +125,7 @@ class InferenceEngine:
         
         # --- SUB-PIXEL ACCURATE RECONSTRUCTION (Detected Only) ---
         reconstruction_stars_linear = np.zeros_like(img_stretched)
-        for (x, y, flux, p), shape in zip(detected_stars, detected_shapes):
+        for (x, y, flux, p, p_weights), shape in zip(detected_stars, detected_shapes):
             S_s = shape.shape[0]; half_s = S_s // 2
             x0, y0 = int(np.floor(x)), int(np.floor(y))
             dx, dy = x - x0, y - y0
@@ -146,7 +147,7 @@ class InferenceEngine:
             mean_psf_2d = mean_psf.reshape(S_m, S_m)
             for i in range(len(true_catalogue)):
                 if i not in matched_true_indices:
-                    p_t, x_t, y_t, flux_t = true_catalogue[i]
+                    p_t, x_t, y_t, flux_t = true_catalogue[i][:4]
                     if p_t < 0.1: continue # Skip ultra-faint
                     x0, y0 = int(np.floor(x_t)), int(np.floor(y_t))
                     dx, dy = x_t - x0, y_t - y0
@@ -291,14 +292,32 @@ class InferenceEngine:
             ax_comp.hist([matched_true_mags, missed_true_mags], bins=30, stacked=True, label=['Detected', 'Missed'], color=['green', 'red'], alpha=0.7)
             ax_comp.set_title("Completeness by Magnitude"); ax_comp.legend(); ax_comp.grid(True, alpha=0.2)
 
-        # PSF Profiles
-        if detected_shapes:
-            ax_psf_x, ax_psf_y = fig.add_subplot(gs[3:, 2]), fig.add_subplot(gs[3:, 3])
-            for i in range(min(100, len(detected_shapes))):
-                shape = detected_shapes[i]
-                ax_psf_x.plot(np.mean(shape, axis=0), color='C0', alpha=0.1)
-                ax_psf_y.plot(np.mean(shape, axis=1), color='C1', alpha=0.1)
-            ax_psf_x.set_title("PSF X-Profiles"); ax_psf_y.set_title("PSF Y-Profiles")
+        # PCA Weight Recovery
+        if matches:
+            # Extract weights for the matched pairs
+            # true_catalogue[m[0]] is (tp, tgx, tgy, flux, true_weights)
+            # detected_stars[m[1]] is (x, y, flux, p, weights)
+            matched_t_weights = np.array([true_catalogue[m[0]][4] for m in matches])
+            matched_p_weights = np.array([detected_stars[m[1]][4] for m in matches])
+            
+            # Create subplots for the first 4 Principal Components
+            ax_pc0 = fig.add_subplot(gs[3, 2])
+            ax_pc1 = fig.add_subplot(gs[3, 3])
+            ax_pc2 = fig.add_subplot(gs[4, 2])
+            ax_pc3 = fig.add_subplot(gs[4, 3])
+            
+            pcs = [ax_pc0, ax_pc1, ax_pc2, ax_pc3]
+            for i, ax in enumerate(pcs):
+                ax.scatter(matched_t_weights[:, i], matched_p_weights[:, i], alpha=0.5, color=f'C{i}')
+                # 1:1 Reference Line
+                w_min = min(matched_t_weights[:, i].min(), matched_p_weights[:, i].min())
+                w_max = max(matched_t_weights[:, i].max(), matched_p_weights[:, i].max())
+                ax.plot([w_min, w_max], [w_min, w_max], 'r--', alpha=0.8)
+                
+                ax.set_title(f"PC{i} Weight Recovery")
+                ax.set_xlabel("True Weight")
+                ax.set_ylabel("Predicted Weight")
+                ax.grid(True, alpha=0.3)
 
         plt.suptitle(f"Generative Diagnostic | Predicted Stars (p>=0.5): {len(detected_stars)}", fontsize=24)
         plt.savefig(output_path); print(f"Comparison saved to {output_path}")

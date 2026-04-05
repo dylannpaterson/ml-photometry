@@ -359,10 +359,11 @@ def run_infer(stage_idx, config, device, checkpoint=None):
                     # NEW: For visualization, we keep stars with visible labels
                     if tp > 0.0:
                         tdx, tdy, raw_flux = slot[1], slot[2], slot[3]
+                        true_weights = slot[4:]
                         tgx = (x * cell_size) + tdx
                         tgy = (y * cell_size) + tdy
-                        # [p, dx, dy, flux]
-                        true_stars.append((tp, tgx, tgy, float(raw_flux)))
+                        # [p, dx, dy, flux, weights]
+                        true_stars.append((tp, tgx, tgy, float(raw_flux), true_weights))
         
         print(f"DEBUG: Found {len(true_stars)} stars with non-zero objectness labels in the chunk.")
         # Pass PCA reconstruction components to predict
