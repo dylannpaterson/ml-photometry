@@ -359,7 +359,14 @@ def run_infer(stage_idx, config, device, checkpoint=None):
                     # NEW: For visualization, we keep stars with visible labels
                     if tp > 0.0:
                         tdx, tdy, raw_flux = slot[1], slot[2], slot[3]
-                        true_weights = slot[4:]
+                        
+                        # FIX: true_weights in the HDF5 target grid are STANDARDIZED (N(0,1)).
+                        # We must un-standardize them using the model's buffer to match 
+                        # the physical predicted weights for the diagnostic scatter plots.
+                        raw_true_weights = slot[4:]
+                        pca_std_numpy = model.pca_std.detach().cpu().numpy()
+                        true_weights = raw_true_weights * pca_std_numpy
+                        
                         tgx = (x * cell_size) + tdx
                         tgy = (y * cell_size) + tdy
                         # [p, dx, dy, flux, weights]
