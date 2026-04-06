@@ -296,18 +296,24 @@ class InferenceEngine:
             ax_comp.hist([matched_true_mags, missed_true_mags], bins=30, stacked=True, label=['Detected', 'Missed'], color=['green', 'red'], alpha=0.7)
             ax_comp.set_title("Completeness by Magnitude"); ax_comp.legend(); ax_comp.grid(True, alpha=0.2)
 
-        # --- ALEATORIC UNCERTAINTY VISUALIZATION ---
+        # --- ALEATORIC UNCERTAINTY & ASTROMETRY VISUALIZATION ---
         if matches:
             # detected_stars[m[1]] is (x, y, flux, p, sigmas)
-            # sigmas: (sigma_x, sigma_y, sigma_flux)
+            # true_catalogue[m[0]] is (p, x, y, flux)
             matched_sigmas = np.array([detected_stars[m[1]][4] for m in matches])
             matched_fluxes = np.array([detected_stars[m[1]][2] for m in matches])
             
+            # Position Residuals
+            matched_true_coords = np.array([(true_catalogue[m[0]][1], true_catalogue[m[0]][2]) for m in matches])
+            matched_pred_coords = np.array([(detected_stars[m[1]][0], detected_stars[m[1]][1]) for m in matches])
+            pos_residuals = matched_pred_coords - matched_true_coords # [N, 2] -> (dx, dy)
+
             ax_sig_x = fig.add_subplot(gs[3, 2])
             ax_sig_y = fig.add_subplot(gs[3, 3])
             ax_sig_f = fig.add_subplot(gs[4, 2])
+            ax_ast_2d = fig.add_subplot(gs[4, 3])
             
-            # Plot Sigma vs Flux (Higher flux should generally have lower relative uncertainty)
+            # 1. Sigma vs Flux plots
             ax_sig_x.scatter(matched_fluxes, matched_sigmas[:, 0], alpha=0.5, color='C0')
             ax_sig_x.set_xscale('log'); ax_sig_x.set_yscale('log')
             ax_sig_x.set_title("Astrometric Uncertainty (X)"); ax_sig_x.set_xlabel("Flux"); ax_sig_x.set_ylabel("sigma_x (pixels)")
@@ -316,15 +322,27 @@ class InferenceEngine:
             ax_sig_y.set_xscale('log'); ax_sig_y.set_yscale('log')
             ax_sig_y.set_title("Astrometric Uncertainty (Y)"); ax_sig_y.set_xlabel("Flux"); ax_sig_y.set_ylabel("sigma_y (pixels)")
             
-            # Relative flux uncertainty (sigma_m is in log-space, so it roughly corresponds to fractional flux error)
             ax_sig_f.scatter(matched_fluxes, matched_sigmas[:, 2], alpha=0.5, color='C2')
             ax_sig_f.set_xscale('log'); ax_sig_f.set_yscale('log')
             ax_sig_f.set_title("Photometric Uncertainty"); ax_sig_f.set_xlabel("Flux"); ax_sig_f.set_ylabel("sigma_log_flux")
             
-            for ax in [ax_sig_x, ax_sig_y, ax_sig_f]: ax.grid(True, alpha=0.3, which="both")
+            # 2. 2D Astrometry Error Point Cloud
+            # Color by log-flux to see if brighter stars are tighter
+            scatter = ax_ast_2d.scatter(pos_residuals[:, 0], pos_residuals[:, 1], c=np.log10(matched_fluxes), cmap='viridis', alpha=0.6, s=20)
+            ax_ast_2d.axhline(0, color='black', lw=1, alpha=0.3)
+            ax_ast_2d.axvline(0, color='black', lw=1, alpha=0.3)
+            
+            # Determine plot limits (Zoom in on the error cloud)
+            r_limit = np.percentile(np.sqrt(np.sum(pos_residuals**2, axis=1)), 95) * 1.5
+            r_limit = max(0.1, min(2.0, r_limit)) # Clamp to reasonable bounds
+            ax_ast_2d.set_xlim(-r_limit, r_limit); ax_ast_2d.set_ylim(-r_limit, r_limit)
+            
+            ax_ast_2d.set_aspect('equal', 'box')
+            ax_ast_2d.set_title("2D Astrometric Residuals")
+            ax_ast_2d.set_xlabel("dx (pixels)"); ax_ast_2d.set_ylabel("dy (pixels)")
+            add_colorbar(scatter, ax_ast_2d)
+            
+            for ax in [ax_sig_x, ax_sig_y, ax_sig_f, ax_ast_2d]: ax.grid(True, alpha=0.3, which="both")
 
-        plt.suptitle(f"Aleatoric Uncertainty Diagnostic | Predicted Stars (p>=0.5): {len(detected_stars)}", fontsize=24)
-        plt.savefig(output_path); print(f"Comparison saved to {output_path}")
-
-        plt.suptitle(f"Generative Diagnostic | Predicted Stars (p>=0.5): {len(detected_stars)}", fontsize=24)
+        plt.suptitle(f"Aleatoric Uncertainty & Precision Diagnostic | Predicted Stars (p>=0.5): {len(detected_stars)}", fontsize=24)
         plt.savefig(output_path); print(f"Comparison saved to {output_path}")
