@@ -130,8 +130,9 @@ class Trainer:
                 # 2. Force FP32 before numerically sensitive loss calculation
                 preds_fp32 = {k: v.float() for k, v in preds.items()}
                 
+                # FIX: Remove 'psf_library' argument which is no longer supported by compute_grid_loss
                 loss, p_loss, po_loss, f_loss, s_loss, b_loss = compute_grid_loss(
-                    preds_fp32, targets, pca_std=self.model.pca_std, psf_library=psf_library, **self.loss_params
+                    preds_fp32, targets, pca_std=self.model.pca_std, **self.loss_params
                 )
                 
                 # --- DIFFRACTION FILTER REGULARIZATION ---
@@ -251,6 +252,10 @@ class Trainer:
                     preds = self.model(images_final)
                 
                 preds_fp32 = {k: v.float() for k, v in preds.items()}
-                loss, _, _, _, _, _ = compute_grid_loss(preds_fp32, targets, psf_library=psf_library, **self.loss_params)
+                
+                # FIX: Remove 'psf_library' argument and add 'pca_std'
+                loss, _, _, _, _, _ = compute_grid_loss(
+                    preds_fp32, targets, pca_std=self.model.pca_std, **self.loss_params
+                )
                 val_loss += loss.item()
         return val_loss / num_batches
