@@ -49,9 +49,12 @@ class Trainer:
         # Add the AMP GradScaler
         self.scaler = torch.amp.GradScaler('cuda' if device.type == 'cuda' else 'cpu')
         
-        # Extract loss parameters from config
-        self.loss_params = config["data_params"].get("loss_params", {}).copy()
+        # FIX: Extract loss parameters from root of config instead of data_params
+        self.loss_params = config.get("loss_params", {}).copy()
         self.loss_params["stretch_scale"] = GLOBAL_STRETCH_SCALE
+        
+        # Pop lambda_diffraction_reg so it doesn't collide with compute_grid_loss kwargs
+        self.lambda_diffraction = self.loss_params.pop("lambda_diffraction_reg", 10.0)
 
         # FIX: Inject global standardization scale into the model buffer
         # This allows the model to un-standardize its own outputs during eval()
@@ -69,10 +72,27 @@ class Trainer:
             ckpt = torch.load(checkpoint_path, map_location=self.device)
             if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
                 self.model.load_state_dict(ckpt['model_state_dict'])
+                
+                # Restore optimizer and scheduler states
+                if 'optimizer_state_dict' in ckpt:
+                    self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                    print("✅ Restored optimizer state.")
+                
+                if 'scheduler_state_dict' in ckpt:
+                    self.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+                    print("✅ Restored scheduler state.")
+                
+                if 'scaler_state_dict' in ckpt:
+                    self.scaler.load_state_dict(ckpt['scaler_state_dict'])
+                    print("✅ Restored GradScaler state.")
+
                 # Restore psf_library if it exists in the checkpoint
                 if 'psf_library' in ckpt:
                     self.psf_library = ckpt['psf_library']
                     print("✅ Restored PSF library from checkpoint.")
+                
+                # Resume from next epoch
+                self.start_epoch = ckpt.get('epoch', self.start_epoch - 1) + 1
             else:
                 self.model.load_state_dict(ckpt)
 
@@ -139,9 +159,8 @@ class Trainer:
                 # This prevents the physics prior from drifting too far from initialization
                 # and becoming a random convolutional layer.
                 diffraction_reg = self.model.diffraction_filter.get_regularization_loss()
-                lambda_diffraction = self.loss_params.get("lambda_diffraction_reg", 10.0)
                 reg_loss_val = diffraction_reg.item() # Raw L2 Distance
-                reg_loss = lambda_diffraction * diffraction_reg
+                reg_loss = self.lambda_diffraction * diffraction_reg
                 loss += reg_loss
                 # ------------------------------------------
 
@@ -154,6 +173,8 @@ class Trainer:
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 
+                # Only step scheduler if scaler didn't skip the optimizer step
+                scale_before = self.scaler.get_scale()
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 
@@ -163,8 +184,9 @@ class Trainer:
                     current_lr = self.optimizer.param_groups[0]['lr']
                     print(f"Epoch [{epoch+1}/{self.epochs}], Step [{i}/{len(self.train_loader)}], LR: {current_lr:.6f}, Loss: {loss.item():.4f} (P:{p_loss.item():.4f}, Pos:{po_loss.item():.4f}, F:{f_loss.item():.4f}, S:{s_loss.item():.4f}, B:{b_loss.item():.4f}, DReg:{reg_loss_val:.6f})")
 
-                # 4. FIX: Step scheduler at the very end of the batch processing
-                self.scheduler.step()
+                # 4. FIX: Step scheduler if the optimizer was actually stepped
+                if self.scaler.get_scale() >= scale_before:
+                    self.scheduler.step()
             
             avg_epoch_loss = epoch_loss/len(self.train_loader)
             print(f"==> Epoch {epoch+1} Complete | Avg Loss: {avg_epoch_loss:.4f} | Time: {time.time()-start_time:.1f}s")
@@ -182,6 +204,8 @@ class Trainer:
                 'epoch': epoch,
                 'model_state_dict': self.model.state_dict(),
                 'optimizer_state_dict': self.optimizer.state_dict(),
+                'scheduler_state_dict': self.scheduler.state_dict(),
+                'scaler_state_dict': self.scaler.state_dict(),
                 'val_loss': val_loss,
                 'psf_library': self.psf_library # Save PSF library
             }

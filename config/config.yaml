@@ -92,7 +92,7 @@ loss_params:
   lambda_prob: 25.0
   lambda_pos: 15.0      
   lambda_flux: 5.0
-  lambda_shape: 2.0
+  lambda_shape: 20000.0
   lambda_bg: 0.5
   lambda_diffraction_reg: 10.0 # NEW: Regularization for Physics Filter
   focal_alpha: 0.25
