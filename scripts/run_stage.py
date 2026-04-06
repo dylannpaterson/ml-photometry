@@ -347,7 +347,7 @@ def run_infer(stage_idx, config, device, checkpoint=None):
         grid_size = dataset.grid_size
         K = dataset.K
         
-        # target shape is (grid_size, grid_size, K*25 + 1)
+        # target shape is (grid_size, grid_size, K*4 + 1)
         target_grid = target[:, :, :-1].view(grid_size, grid_size, K, -1).numpy()
         gt_bg_map = target[:, :, -1:].numpy()
         
@@ -360,17 +360,10 @@ def run_infer(stage_idx, config, device, checkpoint=None):
                     if tp > 0.0:
                         tdx, tdy, raw_flux = slot[1], slot[2], slot[3]
                         
-                        # FIX: true_weights in the HDF5 target grid are STANDARDIZED (N(0,1)).
-                        # We must un-standardize them using the model's buffer to match 
-                        # the physical predicted weights for the diagnostic scatter plots.
-                        raw_true_weights = slot[4:]
-                        pca_std_numpy = model.pca_std.detach().cpu().numpy()
-                        true_weights = raw_true_weights * pca_std_numpy
-                        
                         tgx = (x * cell_size) + tdx
                         tgy = (y * cell_size) + tdy
-                        # [p, dx, dy, flux, weights]
-                        true_stars.append((tp, tgx, tgy, float(raw_flux), true_weights))
+                        # [p, dx, dy, flux]
+                        true_stars.append((tp, tgx, tgy, float(raw_flux)))
         
         print(f"DEBUG: Found {len(true_stars)} stars with non-zero objectness labels in the chunk.")
         # Pass PCA reconstruction components to predict
@@ -400,7 +393,7 @@ def run_infer(stage_idx, config, device, checkpoint=None):
         # -------------------------------------------------
         
         # DEBUG: Print normalization stats
-        # Note: predicted_stars elements are (x, y, flux, p)
+        # Note: predicted_stars elements are (x, y, flux, p, sigmas)
         # match_stars expects (x, y, flux) for matching
         match_true = [(s[1], s[2], s[3]) for s in true_stars]
         match_pred = [(s[0], s[1], s[2]) for s in predicted_stars]

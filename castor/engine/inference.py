@@ -62,12 +62,8 @@ class InferenceEngine:
                 prediction_dict = self.model(input_tensor)
             
             # Note: Unpack predictions and convert to float32 for stable CPU processing
-            # Star shape: [Batch, H, W, K, 4 + N_PCA]
+            # Star shape: [Batch, H, W, K, 7]
             prediction_tensor = prediction_dict["stars"].squeeze(0).float()
-            
-            # --- REMOVED: Explicit un-standardization ---
-            # The model now returns physical weights directly in prediction_dict["stars"]
-            # ---------------------------------------------
             
             prediction = prediction_tensor.cpu().numpy()
             bg_map = prediction_dict["background"].squeeze(0).float().cpu().numpy()
@@ -77,8 +73,8 @@ class InferenceEngine:
         cell_size = self.img_size // grid_h
         
         # Determine S from basis if available, else fallback
-        if psf_basis is not None:
-            S = int(psf_basis.shape[1]**0.5)
+        if mean_psf is not None:
+            S = int(mean_psf.shape[0]**0.5)
         else:
             S = 9
         
@@ -87,27 +83,28 @@ class InferenceEngine:
                 for k in range(K):
                     p, dx, dy, physical_flux = prediction[y, x, k, :4]
                     if p > threshold:
-                        # NEW: Extract weights (now un-standardized)
-                        weights = prediction[y, x, k, 4:]
-                        predicted_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, float(physical_flux), p, weights))
+                        # NEW: Extract log_vars and convert to sigma (standard deviation)
+                        # log_var_x (4), log_var_y (5), log_var_m (6)
+                        log_vars = prediction[y, x, k, 4:7]
+                        sigmas = np.exp(0.5 * log_vars)
                         
-                        # Reconstruct PSF from PCA weights
-                        if psf_basis is not None and mean_psf is not None:
-                            # weights: [20], basis: [20, 961], mean: [961]
-                            shape_flat = (weights @ psf_basis) + mean_psf
-                            predicted_shapes.append(shape_flat.reshape(S, S))
+                        predicted_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, float(physical_flux), p, sigmas))
+                        
+                        # Use Mean PSF for reconstruction (Shape recovery dropped in favor of uncertainty)
+                        if mean_psf is not None:
+                            predicted_shapes.append(mean_psf.reshape(S, S))
                         else:
-                            # FIX: Safe fallback - Create a simple 9x9 Gaussian instead of crashing on weights.reshape
+                            # Safe fallback - Create a simple 9x9 Gaussian
                             sy, sx = np.meshgrid(np.arange(9)-4, np.arange(9)-4)
                             fallback_psf = np.exp(-(sx**2 + sy**2) / (2 * 1.5**2))
-                            fallback_psf /= fallback_psf.sum()
+                            fallback_psf /= (fallback_psf.sum() + 1e-9)
                             predicted_shapes.append(fallback_psf)
                             
         return predicted_stars, predicted_shapes, bg_map
 
     def visualize(self, image_tensor, true_catalogue, predicted_stars, predicted_shapes, bg_map, gt_bg_map, threshold, chunk_median=0.0, jitter_params=None, output_path="inference_comparison.png", psf_basis=None, mean_psf=None):
         """
-        Visualizes inference results.
+        Visualizes inference results with Aleatoric Uncertainty.
         jitter_params: (s_jit, q_jit, theta_jit) to match input image smear.
         """
         from castor.engine.evaluator import match_stars
@@ -116,7 +113,7 @@ class InferenceEngine:
         img_stretched = image_tensor.squeeze().numpy()
         H, W = img_stretched.shape
         
-        # 1. MATCHING (Done early to fix UnboundLocalError and support reconstructions)
+        # 1. MATCHING
         detected_stars = [s for s in predicted_stars if s[3] >= 0.5]
         detected_shapes = [shp for s, shp in zip(predicted_stars, predicted_shapes) if s[3] >= 0.5]
         
@@ -130,9 +127,9 @@ class InferenceEngine:
         full_residual_bg_stretched = upsample_background(bg_map.squeeze(), (H, W))
         full_gt_residual_bg_stretched = upsample_background(gt_bg_map.squeeze(), (H, W))
         
-        # --- SUB-PIXEL ACCURATE RECONSTRUCTION (Detected Only) ---
+        # --- SUB-PIXEL ACCURATE RECONSTRUCTION ---
         reconstruction_stars_linear = np.zeros_like(img_stretched)
-        for (x, y, flux, p, p_weights), shape in zip(detected_stars, detected_shapes):
+        for (x, y, flux, p, sigmas), shape in zip(detected_stars, detected_shapes):
             S_s = shape.shape[0]; half_s = S_s // 2
             x0, y0 = int(np.floor(x)), int(np.floor(y))
             dx, dy = x - x0, y - y0
@@ -155,7 +152,7 @@ class InferenceEngine:
             for i in range(len(true_catalogue)):
                 if i not in matched_true_indices:
                     p_t, x_t, y_t, flux_t = true_catalogue[i][:4]
-                    if p_t < 0.1: continue # Skip ultra-faint
+                    if p_t < 0.1: continue 
                     x0, y0 = int(np.floor(x_t)), int(np.floor(y_t))
                     dx, dy = x_t - x0, y_t - y0
                     w00, w10, w01, w11 = (1.0-dx)*(1.0-dy), dx*(1.0-dy), (1.0-dx)*dy, dx*dy
@@ -169,7 +166,7 @@ class InferenceEngine:
                         if sy1 > sy0 and sx1 > sx0:
                             reconstruction_missed_linear[ym:yM, xm:xM] += (flux_t * w) * mean_psf_2d[sy0:sy1, sx0:sx1]
 
-        # --- APPLY GLOBAL JITTER TO BOTH RECONSTRUCTIONS ---
+        # --- APPLY GLOBAL JITTER ---
         if jitter_params is not None:
             s_j, q_j, t_j = jitter_params
             kj = 63; gy, gx = np.meshgrid(np.arange(127) - kj, np.arange(127) - kj, indexing='ij')
@@ -299,32 +296,35 @@ class InferenceEngine:
             ax_comp.hist([matched_true_mags, missed_true_mags], bins=30, stacked=True, label=['Detected', 'Missed'], color=['green', 'red'], alpha=0.7)
             ax_comp.set_title("Completeness by Magnitude"); ax_comp.legend(); ax_comp.grid(True, alpha=0.2)
 
-        # PCA Weight Recovery
+        # --- ALEATORIC UNCERTAINTY VISUALIZATION ---
         if matches:
-            # Extract weights for the matched pairs
-            # true_catalogue[m[0]] is (tp, tgx, tgy, flux, true_weights)
-            # detected_stars[m[1]] is (x, y, flux, p, weights)
-            matched_t_weights = np.array([true_catalogue[m[0]][4] for m in matches])
-            matched_p_weights = np.array([detected_stars[m[1]][4] for m in matches])
+            # detected_stars[m[1]] is (x, y, flux, p, sigmas)
+            # sigmas: (sigma_x, sigma_y, sigma_flux)
+            matched_sigmas = np.array([detected_stars[m[1]][4] for m in matches])
+            matched_fluxes = np.array([detected_stars[m[1]][2] for m in matches])
             
-            # Create subplots for the first 4 Principal Components
-            ax_pc0 = fig.add_subplot(gs[3, 2])
-            ax_pc1 = fig.add_subplot(gs[3, 3])
-            ax_pc2 = fig.add_subplot(gs[4, 2])
-            ax_pc3 = fig.add_subplot(gs[4, 3])
+            ax_sig_x = fig.add_subplot(gs[3, 2])
+            ax_sig_y = fig.add_subplot(gs[3, 3])
+            ax_sig_f = fig.add_subplot(gs[4, 2])
             
-            pcs = [ax_pc0, ax_pc1, ax_pc2, ax_pc3]
-            for i, ax in enumerate(pcs):
-                ax.scatter(matched_t_weights[:, i], matched_p_weights[:, i], alpha=0.5, color=f'C{i}')
-                # 1:1 Reference Line
-                w_min = min(matched_t_weights[:, i].min(), matched_p_weights[:, i].min())
-                w_max = max(matched_t_weights[:, i].max(), matched_p_weights[:, i].max())
-                ax.plot([w_min, w_max], [w_min, w_max], 'r--', alpha=0.8)
-                
-                ax.set_title(f"PC{i} Weight Recovery")
-                ax.set_xlabel("True Weight")
-                ax.set_ylabel("Predicted Weight")
-                ax.grid(True, alpha=0.3)
+            # Plot Sigma vs Flux (Higher flux should generally have lower relative uncertainty)
+            ax_sig_x.scatter(matched_fluxes, matched_sigmas[:, 0], alpha=0.5, color='C0')
+            ax_sig_x.set_xscale('log'); ax_sig_x.set_yscale('log')
+            ax_sig_x.set_title("Astrometric Uncertainty (X)"); ax_sig_x.set_xlabel("Flux"); ax_sig_x.set_ylabel("sigma_x (pixels)")
+            
+            ax_sig_y.scatter(matched_fluxes, matched_sigmas[:, 1], alpha=0.5, color='C1')
+            ax_sig_y.set_xscale('log'); ax_sig_y.set_yscale('log')
+            ax_sig_y.set_title("Astrometric Uncertainty (Y)"); ax_sig_y.set_xlabel("Flux"); ax_sig_y.set_ylabel("sigma_y (pixels)")
+            
+            # Relative flux uncertainty (sigma_m is in log-space, so it roughly corresponds to fractional flux error)
+            ax_sig_f.scatter(matched_fluxes, matched_sigmas[:, 2], alpha=0.5, color='C2')
+            ax_sig_f.set_xscale('log'); ax_sig_f.set_yscale('log')
+            ax_sig_f.set_title("Photometric Uncertainty"); ax_sig_f.set_xlabel("Flux"); ax_sig_f.set_ylabel("sigma_log_flux")
+            
+            for ax in [ax_sig_x, ax_sig_y, ax_sig_f]: ax.grid(True, alpha=0.3, which="both")
+
+        plt.suptitle(f"Aleatoric Uncertainty Diagnostic | Predicted Stars (p>=0.5): {len(detected_stars)}", fontsize=24)
+        plt.savefig(output_path); print(f"Comparison saved to {output_path}")
 
         plt.suptitle(f"Generative Diagnostic | Predicted Stars (p>=0.5): {len(detected_stars)}", fontsize=24)
         plt.savefig(output_path); print(f"Comparison saved to {output_path}")

@@ -3,6 +3,6 @@
 
 DEFAULT_CELL_SIZE = 4
 MAX_CAPACITY_PER_CELL = 3
-SHAPE_SIZE = 127 # Reconstruction size (PCA Basis)
-N_PCA_COMPONENTS = 20
+SHAPE_SIZE = 127 # Reconstruction size (Physics Prior / Visualize)
+N_PCA_COMPONENTS = 20 # Used for Physics Prior Init (No longer in output grid)
 GLOBAL_STRETCH_SCALE = 10.0

@@ -42,7 +42,9 @@ def create_hdf5_datasets_combined(train_mosaic_dir, val_mosaic_dir, train_path, 
     N_PCA = N_PCA_COMPONENTS
     transform = AstroSpaceTransform(stretch_scale=GLOBAL_STRETCH_SCALE)
     
-    target_shape = (grid_size, grid_size, K * (4 + N_PCA) + 1)
+    # CHANGED: PCA weights are no longer part of the target grid.
+    # Target per slot: [p, dx, dy, flux] = 4 channels
+    target_shape = (grid_size, grid_size, K * 4 + 1)
     
     # Discover mosaics for each split
     train_mosaics = discover_mosaics(train_mosaic_dir)
@@ -143,7 +145,7 @@ def create_hdf5_datasets_combined(train_mosaic_dir, val_mosaic_dir, train_path, 
                         psf_weights = np.column_stack([local_cat[f'w{i}'] for i in range(N_PCA)])
                         sort_idx = np.argsort(local_cat['flux'])[::-1]
                         
-                        grid_stars = fast_paint_grid(lx, ly, local_cat['flux'], local_snrs, psf_weights.astype(np.float32), sort_idx, 5.0, grid_size, cell_size, K)
+                        grid_stars = fast_paint_grid(lx, ly, local_cat['flux'], local_snrs, sort_idx, 5.0, grid_size, cell_size, K)
                         target_buffer[:, :, :-1] = grid_stars.reshape(grid_size, grid_size, -1)
 
                     target_buffer[:, :, -1] = transform.target_bg_to_network(sky_level - chunk_median)

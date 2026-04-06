@@ -1,0 +1,65 @@
+run_config:
+  resume_from_checkpoint: false
+  force_regenerate_data: true
+
+curriculum:
+  # Stage 0: Small local test run
+  stage0:
+    name: "Local Test Run"
+    data_dir: "data/local_test"
+    epochs: 5
+    batch_size: 16
+    learning_rate: 0.0001
+    num_workers: 0 # Faster startup for small local tests
+    resume_from_last_stage: false
+    cell_size: 4
+    mosaic_params:
+      num_mosaics: 2
+      val_mosaics: 1
+      mosaic_size: 512
+
+data_params:
+  num_train_samples: 200 
+  num_val_samples: 50
+  
+  min_stars: 1000
+  max_stars: 5000
+  
+  image_size: 256
+  
+  max_capacity_per_cell: 3
+  shape_size: 31
+  GLOBAL_STRETCH_SCALE: 10.0
+  
+  n_library_psfs: 100
+  min_snr: 5.0
+  
+  physics_params:
+    pixel_scale: 0.11
+    sigma_fixed: 1.5
+    zp: 26.5
+    sky_mag: 22.0
+    read_noise: 5.0
+    exp_time_min: 30.0
+    exp_time_max: 60.0
+    
+  lf_params:
+    m_min: 12.0
+    m_max: 32.0
+    rc_loc_min: 14.5
+    rc_loc_max: 16.5
+    rc_scale_min: 0.2
+    rc_scale_max: 0.5
+    rc_enh_min: 5.0
+    rc_enh_max: 15.0
+    gamma_min: 0.25
+    gamma_max: 0.35
+  
+loss_params:
+  lambda_prob: 25.0
+  lambda_pos: 25.0      
+  lambda_flux: 10.0     
+  lambda_bg: 0.5
+  lambda_diffraction_reg: 10.0
+  focal_alpha: 0.25
+  focal_gamma: 2.0

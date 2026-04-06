@@ -107,8 +107,9 @@ class Stage1MacroSparseDataset(Dataset):
         local_stars['ly'] = local_stars['y'] - py
         
         # 9. Build Target Grid
-        # NEW: Shape size is 81 (9x9) to match generate_stage1_mosaics.py
-        grid_stars = torch.zeros((self.grid_size, self.grid_size, self.K, 4 + 81), dtype=torch.float32)
+        # CHANGED: Shape size is now 0 as we no longer predict PCA weights.
+        # Target per slot: [p, dx, dy, flux]
+        grid_stars = torch.zeros((self.grid_size, self.grid_size, self.K, 4), dtype=torch.float32)
         
         # Assign to slots (Brightest-to-Faint)
         cell_assignments = {}
@@ -130,21 +131,18 @@ class Stage1MacroSparseDataset(Dataset):
                 snr = star['flux'] / np.sqrt(star['flux'] + sky_level + params['read_noise']**2)
                 
                 # SNR-based Soft Label for Objectness (Logarithmic Interpolation)
-                # Maps SNR 1.0 -> p=0.0 and SNR 5.0 -> p=1.0
                 if snr <= 1.0:
                     target_p = 0.0
                 elif snr >= 5.0:
                     target_p = 1.0
                 else:
-                    # log10(1.0) = 0, log10(5.0) approx 0.69897
                     target_p = np.log10(max(1e-9, snr)) / 0.69897000433
                 
-                # [p, dx, dy, flux, shape...]
+                # [p, dx, dy, flux]
                 grid_stars[cy, cx, slot, 0] = float(target_p)
                 grid_stars[cy, cx, slot, 1] = float(star['lx'] % self.cell_size) # dx
                 grid_stars[cy, cx, slot, 2] = float(star['ly'] % self.cell_size) # dy
                 grid_stars[cy, cx, slot, 3] = float(star['flux'])
-                grid_stars[cy, cx, slot, 4:] = torch.from_numpy(star['shape'].copy())
 
         # 10. Background Target
         bg_target_linear = sky_level - chunk_median

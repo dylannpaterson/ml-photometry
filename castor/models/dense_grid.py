@@ -147,10 +147,10 @@ class DenseGridModel(nn.Module):
     def __init__(self, K=MAX_CAPACITY_PER_CELL, shape_size=SHAPE_SIZE, cell_size=DEFAULT_CELL_SIZE):
         super(DenseGridModel, self).__init__()
         self.K = K
-        # CHANGED: Now predict PCA weights instead of independent pixels
-        self.S2 = N_PCA_COMPONENTS 
+        # CHANGED: Dropping PCA shape weights in favor of Aleatoric Uncertainty Estimation
+        # Output per slot: [p, dx, dy, m, log_var_x, log_var_y, log_var_m] = 7 channels
         self.cell_size = float(cell_size)
-        self.num_output_channels = self.K * (4 + self.S2) + 1
+        self.num_output_channels = self.K * 7 + 1
 
         # 1. Physics Prior Filter
         self.diffraction_filter = DiffractionAwareFilter(kernel_size=21)
@@ -182,10 +182,6 @@ class DenseGridModel(nn.Module):
             nn.Conv2d(256, self.num_output_channels, kernel_size=1)
         )
 
-        # Register a buffer for the PCA standard deviation
-        # Initialize it to ones so it defaults to a safe pass-through
-        self.register_buffer("pca_std", torch.ones(self.S2, dtype=torch.float32))
-
     def forward(self, x):
         # Bottom-up
         # 1. Pass through trainable physics prior (Outputs 2 channels)
@@ -210,7 +206,7 @@ class DenseGridModel(nn.Module):
         star_out = out[:, :-1, :, :]
         bg_out = out[:, -1:, :, :]
         
-        star_out = star_out.view(B, self.K, 4 + self.S2, H, W)
+        star_out = star_out.view(B, self.K, 7, H, W)
         star_out = star_out.permute(0, 3, 4, 1, 2)
         
         # --- THE LOGIT BYPASS ---
@@ -228,33 +224,37 @@ class DenseGridModel(nn.Module):
         # FIX: Force float32 evaluation to prevent FP16 overflow on bright stars
         flux = torch.exp(raw_log_flux.float())
         
-        # CHANGED: Shape weights are linear (Eigen-PSF weights)
-        # FIX: Expand the bounds to comfortably cover a standard normal distribution (e.g., +/- 4.0)
-        # We return both standardized (for loss stability) and physical (for inference) weights.
-        raw_shape_weights = star_out[..., 4:]
-        std_shape_weights = torch.tanh(raw_shape_weights) * 4.0
-        shape_weights = std_shape_weights * self.pca_std.view(1, 1, 1, 1, self.S2)
+        # NEW: Uncertainty Estimates (Log-variance)
+        # log_var_x (4), log_var_y (5), log_var_m (6)
+        log_vars = star_out[..., 4:7]
         
         # Background residuals can be negative
         bg = bg_out.permute(0, 2, 3, 1)
         
         return {
-            "stars": torch.cat([p, dx, dy, flux, shape_weights], dim=-1),
-            "std_stars": torch.cat([p, dx, dy, flux, std_shape_weights], dim=-1),
-            "p_logits": p_logits, # NEW: Pass raw logits to the loss function
-            "raw_log_flux": raw_log_flux, # Logit Bypass
+            "stars": torch.cat([p, dx, dy, flux, log_vars], dim=-1),
+            "p_logits": p_logits,
+            "raw_log_flux": raw_log_flux,
+            "log_vars": log_vars,
             "background": bg
         }
 
-def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=5.0, lambda_pos=50.0, lambda_flux=5.0, lambda_shape=1.0, lambda_bg=0.1, focal_alpha=0.75, focal_gamma=2.0, stretch_scale=GLOBAL_STRETCH_SCALE):
+def compute_nll_loss(pred, target, log_var):
     """
-    Latent (Weight-Wise) Loss:
-    Calculates shape loss in physical weight space even though the network 
-    outputs standardized values. This ensures PC1 (high variance) is prioritized 
-    over PC20 (noise).
+    Calculates the Gaussian Negative Log-Likelihood.
+    log_var = ln(sigma^2). We use exp(-log_var) which equals 1/sigma^2
+    """
+    precision = torch.exp(-log_var)
+    # 0.5 * (precision * (pred - target)**2 + log_var)
+    loss = 0.5 * (precision * (pred - target)**2 + log_var)
+    return loss.mean()
+
+def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=5.0, lambda_pos=50.0, lambda_flux=5.0, lambda_bg=0.1, focal_alpha=0.75, focal_gamma=2.0, stretch_scale=GLOBAL_STRETCH_SCALE):
+    """
+    Refactored loss using Aleatoric Uncertainty Estimation (NLL).
+    Drops shape reconstruction loss in favor of calibrated uncertainty.
     """
     star_preds = preds["stars"]
-    std_star_preds = preds["std_stars"]
     bg_preds = preds["background"]
     
     # 1. Unpack Target Grid
@@ -282,46 +282,22 @@ def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=5.0, lambda_pos=
     
     # 3. Regression Losses (Masked)
     if obj_mask.sum() > 0:
-        # Position Loss
+        # Unpack predictions
         pos_pred = star_preds[..., 1:3][obj_mask]
         pos_target = star_targets[..., 1:3][obj_mask]
-        pos_loss = F.smooth_l1_loss(pos_pred, pos_target, reduction='mean')
+        log_var_pos = star_preds[..., 4:6][obj_mask]
         
-        # Flux Loss (Log-space)
         log_flux_pred = preds["raw_log_flux"][obj_mask]
         flux_target = star_targets[..., 3:4][obj_mask]
         log_flux_target = torch.log(flux_target + 1e-6)
-        flux_loss = F.smooth_l1_loss(log_flux_pred, log_flux_target, reduction='mean')
-        
-        # --- LATENT WEIGHT LOSS (Physical Priority) ---
-        # Targets from the dataset are STANDARDIZED (N(0, 1))
-        # Predictions 'std_stars' are also STANDARDIZED.
-        std_weights_pred = std_star_preds[..., 4:][obj_mask]
-        std_weights_target = star_targets[..., 4:][obj_mask]
-        
-        # We multiply both by pca_std to calculate the loss in physical units.
-        # This makes the loss for PC1 (large std) much higher than PC20 (tiny std).
-        if pca_std is not None:
-            # Scale both pred and target by physical importance
-            weights_pred_phys = std_weights_pred * pca_std.view(1, -1)
-            weights_target_phys = std_weights_target * pca_std.view(1, -1)
-        else:
-            weights_pred_phys = std_weights_pred
-            weights_target_phys = std_weights_target
-        
-        # Apply flux weight
-        flux_weight = torch.log1p(flux_target)
-        flux_weight = flux_weight / (flux_weight.mean() + 1e-6)
-        
-        shape_loss = F.smooth_l1_loss(
-            weights_pred_phys * flux_weight, 
-            weights_target_phys * flux_weight, 
-            reduction='mean'
-        )
+        log_var_flux = star_preds[..., 6:7][obj_mask]
+
+        # Calculate NLL Losses
+        pos_loss = compute_nll_loss(pos_pred, pos_target, log_var_pos)
+        flux_loss = compute_nll_loss(log_flux_pred, log_flux_target, log_var_flux)
     else:
         pos_loss = torch.tensor(0.0, device=star_preds.device)
         flux_loss = torch.tensor(0.0, device=star_preds.device)
-        shape_loss = torch.tensor(0.0, device=star_preds.device)
         
     # 4. Background Loss (Global MSE)
     bg_loss = F.mse_loss(bg_preds, bg_targets, reduction='mean')
@@ -329,7 +305,7 @@ def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=5.0, lambda_pos=
     total_loss = (lambda_prob * prob_loss + 
                   lambda_pos * pos_loss + 
                   lambda_flux * flux_loss +
-                  lambda_shape * shape_loss + 
                   lambda_bg * bg_loss)
                   
-    return total_loss, prob_loss, pos_loss, flux_loss, shape_loss, bg_loss
+                  
+    return total_loss, prob_loss, pos_loss, flux_loss, bg_loss

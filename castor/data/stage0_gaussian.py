@@ -13,9 +13,10 @@ from numba import njit
 import gc
 
 #@njit(boundscheck=False)
-def fast_paint_grid(lx, ly, fluxes, snrs, psf_weights, sort_idx, min_snr, grid_size, cell_size, K):
-    N_PCA = psf_weights.shape[1]
-    grid_stars = np.zeros((grid_size, grid_size, K, 4 + N_PCA), dtype=np.float32)
+def fast_paint_grid(lx, ly, fluxes, snrs, sort_idx, min_snr, grid_size, cell_size, K):
+    # CHANGED: Now only 4 channels for targets [p, dx, dy, flux]
+    # The network predicts log_vars as latent variables, we don't need targets for them.
+    grid_stars = np.zeros((grid_size, grid_size, K, 4), dtype=np.float32)
     counts = np.zeros((grid_size, grid_size), dtype=np.int32)
     
     for idx in range(len(sort_idx)):
@@ -42,8 +43,6 @@ def fast_paint_grid(lx, ly, fluxes, snrs, psf_weights, sort_idx, min_snr, grid_s
                 grid_stars[cy, cx, slot, 1] = lx[i] % cell_size
                 grid_stars[cy, cx, slot, 2] = ly[i] % cell_size
                 grid_stars[cy, cx, slot, 3] = fluxes[i]
-                for w_idx in range(N_PCA):
-                    grid_stars[cy, cx, slot, 4 + w_idx] = psf_weights[i, w_idx]
                 counts[cy, cx] += 1
                 
     return grid_stars
@@ -101,12 +100,7 @@ class GaussianPretrainingProvider(Dataset):
             # 2. Extract Eigen-PSFs
             self.eigen_psfs, self.psf_weights_lib, self.mean_psf = self._compute_eigen_psfs(raw_library, n_components=self.n_pca)
         
-        # FIX: Global Standardization at the source
-        # Calculate the global standard deviation of the PCA library
-        self.global_weights_std = np.std(self.psf_weights_lib, axis=0) + 1e-8
-        # Create a pre-standardized version of the library for the network targets
-        self.target_weights_lib = self.psf_weights_lib / self.global_weights_std
-
+        # PCA Weights are no longer used for targets, but we keep them for rendering
         self.psf_library_tensor = torch.cat([
             torch.from_numpy(self.eigen_psfs).view(self.n_pca, -1),
             torch.from_numpy(self.mean_psf).view(1, -1)
@@ -177,12 +171,9 @@ class GaussianPretrainingProvider(Dataset):
         fluxes, mags = fluxes[sort_idx], mags[sort_idx]
         x_centers, y_centers = np.random.uniform(0, self.img_size, len(mags)), np.random.uniform(0, self.img_size, len(mags))
         
-        # FIX 2: Split Weights for Rendering vs Targets
+        # RENDERING ONLY: PCA Weights are still used to render realistic backgrounds
         psf_indices = np.random.randint(0, 100, size=len(mags))
-        # Use physical weights to render the image
         physical_weights = self.psf_weights_lib[psf_indices]
-        # Use standardized weights for the neural network target
-        target_weights = self.target_weights_lib[psf_indices]
 
         # Hybrid Fast Rendering (NumPy Optimized)
         x0, y0 = np.floor(x_centers).astype(int), np.floor(y_centers).astype(int)
@@ -196,30 +187,26 @@ class GaussianPretrainingProvider(Dataset):
                                        (y0[valid]+1) * self.img_size + x0[valid] + 1])
         f_v = fluxes[valid]
         vals = np.concatenate([f_v * (1-dx[valid]) * (1-dy[valid]), f_v * dx[valid] * (1-dy[valid]), f_v * (1-dx[valid]) * dy[valid], f_v * dx[valid] * dy[valid]])
-        base_grid = np.bincount(flat_indices, weights=vals, minlength=self.img_size*self.img_size).reshape(self.img_size, self.img_size)
-        star_signal = fftconvolve(base_grid, self.mean_psf, mode='same')
+        base_grid_render = np.bincount(flat_indices, weights=vals, minlength=self.img_size*self.img_size).reshape(self.img_size, self.img_size)
+        star_signal = fftconvolve(base_grid_render, self.mean_psf, mode='same')
 
-        # 2. Correction pass (Only for visible stars to save time in pretraining)
-        # We simplify here: pretraining only corrects stars likely to be in target
-        is_significant = fluxes > (5.0 * np.sqrt(fluxes + 100)) # Heuristic SNR cutoff
+        # 2. Correction pass
+        is_significant = fluxes > (5.0 * np.sqrt(fluxes + 100)) 
         if is_significant.any():
             sig_weights = physical_weights[is_significant]
             correction_stamps = (sig_weights @ self.eigen_psfs.reshape(self.n_pca, -1)).reshape(-1, self.S, self.S)
-            # Use simple stamp painting
             half = self.S // 2
             for i, idx_sig in enumerate(np.where(is_significant)[0]):
                 ix, iy, f = int(x_centers[idx_sig]), int(y_centers[idx_sig]), fluxes[idx_sig]
                 dx_s, dy_s = x_centers[idx_sig]-ix, y_centers[idx_sig]-iy
                 w00, w10, w01, w11 = (1-dx_s)*(1-dy_s), dx_s*(1-dy_s), (1-dx_s)*dy_s, dx_s*dy_s
                 
-                # Simple clipping stamp paint
                 y0_s, y1_s = max(0, iy-half), min(self.img_size, iy+half+1)
                 x0_s, x1_s = max(0, ix-half), min(self.img_size, ix+half+1)
                 sy0, sy1 = half - (iy - y0_s), half + (y1_s - iy)
                 sx0, sx1 = half - (ix - x0_s), half + (x1_s - ix)
                 
                 stamp = correction_stamps[i][sy0:sy1, sx0:sx1] * f
-                # Bilinear approximated core paint
                 star_signal[y0_s:y1_s, x0_s:x1_s] += stamp * w00 
 
         # 3. Apply Global Jitter
@@ -243,8 +230,8 @@ class GaussianPretrainingProvider(Dataset):
         noise_variance = fluxes + eff_area_jit * (sky_level + np.maximum(0, total_local_light - fluxes * lib_peaks_jit) + 25.0)
         snrs = fluxes / np.sqrt(noise_variance)
 
-        # FIX 3: Pass target_weights to the target grid
-        base_grid = fast_paint_grid(x_centers, y_centers, fluxes, snrs, target_weights, sort_idx, self.min_snr, self.grid_size, self.cell_size, self.K)
+        # TARGET GENERATION: Drop PCA Weights
+        base_grid = fast_paint_grid(x_centers, y_centers, fluxes, snrs, sort_idx, self.min_snr, self.grid_size, self.cell_size, self.K)
         target = torch.cat([torch.from_numpy(base_grid).view(self.grid_size, self.grid_size, -1), 
                             torch.from_numpy(np.full((self.grid_size, self.grid_size, 1), self.transform.target_bg_to_network(sky_level - chunk_median), dtype=np.float32))], dim=-1)
 
@@ -255,8 +242,9 @@ class GaussianMosaicDataset(Dataset):
         self.data_dir, self.num_samples, self.img_size, self.cell_size = data_dir, num_samples, image_size, cell_size
         self.grid_size = image_size // cell_size
         self.transform = AstroSpaceTransform(stretch_scale=global_stretch_scale)
-        self.K, self.N_PCA, self.min_snr = MAX_CAPACITY_PER_CELL, N_PCA_COMPONENTS, 5.0
-        self.target_shape = (self.grid_size, self.grid_size, self.K * (4 + self.N_PCA) + 1)
+        self.K, self.min_snr = MAX_CAPACITY_PER_CELL, 5.0
+        # CHANGED: Target shape is now (grid_size, grid_size, K*4 + 1)
+        self.target_shape = (self.grid_size, self.grid_size, self.K * 4 + 1)
         self.mosaics = []
         image_files = sorted([f for f in os.listdir(data_dir) if f.endswith("_img.npy")])
         for img_f in image_files:
@@ -294,8 +282,8 @@ class GaussianMosaicDataset(Dataset):
         if mask_x.any():
             local_cat = band_cat[mask_x]
             lx, ly, fluxes, snrs = local_cat['x'] - px, local_cat['y'] - py, local_cat['flux'], local_cat['snr']
-            psf_weights = np.column_stack([local_cat[f'w{i}'] for i in range(self.N_PCA)])
-            grid_stars_np = fast_paint_grid(lx, ly, fluxes, snrs, psf_weights, np.argsort(fluxes)[::-1], self.min_snr, self.grid_size, self.cell_size, self.K)
+            # CHANGED: Drop PCA weights from fast_paint_grid call
+            grid_stars_np = fast_paint_grid(lx, ly, fluxes, snrs, np.argsort(fluxes)[::-1], self.min_snr, self.grid_size, self.cell_size, self.K)
             target_buffer[:, :, :-1] = grid_stars_np.reshape(self.grid_size, self.grid_size, -1)
         target_buffer[:, :, -1] = self.transform.target_bg_to_network(sky_level - chunk_median)
         return {"image": signal_tensor, "target": torch.from_numpy(target_buffer), "chunk_median": float(chunk_median), "psf_library": torch.from_numpy(self.active_library).unsqueeze(0)}
@@ -304,38 +292,16 @@ class HDF5MosaicDataset(Dataset):
     def __init__(self, h5_path, image_size=256):
         self.h5_path, self.file, self.img_size = h5_path, None, image_size
         self.cell_size, self.grid_size, self.K = DEFAULT_CELL_SIZE, image_size // DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL
-        self.n_pca = N_PCA_COMPONENTS
         if not os.path.exists(self.h5_path): raise FileNotFoundError(f"HDF5 file not found: {self.h5_path}")
         
-        # Open briefly to get length and ensure PSF library consistency
         with h5py.File(self.h5_path, 'r') as f:
             self.length = len(f['images'])
-            # Cache one copy of the PSF library per dataset to avoid repeated HDF5 reads
             if 'psf_libraries' in f and len(f['psf_libraries']) > 0:
                 self.psf_library = torch.from_numpy(f['psf_libraries'][0]).float()
             else:
                 self.psf_library = None
-
-            # FIX: Load the exact global standard deviation from the HDF5 attributes
-            if 'global_weights_std' in f.attrs:
-                self.global_weights_std = f.attrs['global_weights_std'].astype(np.float32)
-                print(f"🛰️ HDF5MosaicDataset: Loaded Global PCA StdDev from HDF5 attributes.")
-            else:
-                # Fallback: Calculate standard deviation across a sample of targets if not in attributes
-                sample_size = min(1000, self.length)
-                sample_targets = f['targets'][:sample_size]
-                
-                # CRITICAL FIX: Reshape to expose K slots before standardizing
-                B_channels = sample_targets.shape[-1] - 1
-                star_targets_sampled = sample_targets[..., :-1].reshape(-1, self.grid_size, self.grid_size, self.K, B_channels // self.K)
-                
-                obj_mask = star_targets_sampled[..., 0] > 0
-                if np.any(obj_mask):
-                    # We assume these are PHYSICAL weights if we are calculating std here
-                    raw_pca_weights = star_targets_sampled[obj_mask][..., 4:4+self.n_pca]
-                    self.global_weights_std = np.std(raw_pca_weights, axis=0) + 1e-8
-                else:
-                    self.global_weights_std = np.ones(self.n_pca, dtype=np.float32)
+            
+            # Removed PCA Standardization logic as targets no longer contain weights
 
     def __len__(self): return self.length
 
@@ -346,12 +312,7 @@ class HDF5MosaicDataset(Dataset):
         img = torch.from_numpy(self.file['images'][idx]).float()
         target = torch.from_numpy(self.file['targets'][idx]).float()
         median = float(self.file['chunk_medians'][idx])
-        
-        # Metadata: [exp_time, zp, sky_mag, s_jit, q_jit, theta_jit]
         meta = self.file['metas'][idx] if 'metas' in self.file else np.zeros(6, dtype=np.float32)
-
-        # NOTE: Targets in the HDF5 are now assumed to be PRE-STANDARDIZED (N(0, 1))
-        # to aid training stability. We no longer divide by std_tensor here.
 
         return {
             "image": img,

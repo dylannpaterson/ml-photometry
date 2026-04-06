@@ -56,12 +56,7 @@ class Trainer:
         # Pop lambda_diffraction_reg so it doesn't collide with compute_grid_loss kwargs
         self.lambda_diffraction = self.loss_params.pop("lambda_diffraction_reg", 10.0)
 
-        # FIX: Inject global standardization scale into the model buffer
-        # This allows the model to un-standardize its own outputs during eval()
-        dataset = self.train_loader.dataset
-        if hasattr(dataset, 'global_weights_std'):
-            print(f"🛰️ Trainer: Injecting Global PCA StdDev into model buffer...")
-            self.model.pca_std.data = torch.from_numpy(dataset.global_weights_std).float().to(self.device)
+        # Removed: Injection of global_weights_std as PCA weights are no longer predicted
 
     def resume(self, checkpoint_path=None):
         if checkpoint_path is None:
@@ -151,8 +146,8 @@ class Trainer:
                 preds_fp32 = {k: v.float() for k, v in preds.items()}
                 
                 # FIX: Remove 'psf_library' argument which is no longer supported by compute_grid_loss
-                loss, p_loss, po_loss, f_loss, s_loss, b_loss = compute_grid_loss(
-                    preds_fp32, targets, pca_std=self.model.pca_std, **self.loss_params
+                loss, p_loss, po_loss, f_loss, b_loss = compute_grid_loss(
+                    preds_fp32, targets, **self.loss_params
                 )
                 
                 # --- DIFFRACTION FILTER REGULARIZATION ---
@@ -182,7 +177,7 @@ class Trainer:
                 
                 if i % 100 == 0:
                     current_lr = self.optimizer.param_groups[0]['lr']
-                    print(f"Epoch [{epoch+1}/{self.epochs}], Step [{i}/{len(self.train_loader)}], LR: {current_lr:.6f}, Loss: {loss.item():.4f} (P:{p_loss.item():.4f}, Pos:{po_loss.item():.4f}, F:{f_loss.item():.4f}, S:{s_loss.item():.4f}, B:{b_loss.item():.4f}, DReg:{reg_loss_val:.6f})")
+                    print(f"Epoch [{epoch+1}/{self.epochs}], Step [{i}/{len(self.train_loader)}], LR: {current_lr:.6f}, Loss: {loss.item():.4f} (P:{p_loss.item():.4f}, Pos:{po_loss.item():.4f}, F:{f_loss.item():.4f}, B:{b_loss.item():.4f}, DReg:{reg_loss_val:.6f})")
 
                 # 4. FIX: Step scheduler if the optimizer was actually stepped
                 if self.scaler.get_scale() >= scale_before:
@@ -277,9 +272,9 @@ class Trainer:
                 
                 preds_fp32 = {k: v.float() for k, v in preds.items()}
                 
-                # FIX: Remove 'psf_library' argument and add 'pca_std'
-                loss, _, _, _, _, _ = compute_grid_loss(
-                    preds_fp32, targets, pca_std=self.model.pca_std, **self.loss_params
+                # FIX: Remove 'psf_library' and 'pca_std' arguments
+                loss, _, _, _, _ = compute_grid_loss(
+                    preds_fp32, targets, **self.loss_params
                 )
                 val_loss += loss.item()
         return val_loss / num_batches
