@@ -179,6 +179,7 @@ class Trainer:
                     current_lr = self.optimizer.param_groups[0]['lr']
                     print(f"Epoch [{epoch+1}/{self.epochs}], Step [{i}/{len(self.train_loader)}], LR: {current_lr:.6f}, Loss: {loss.item():.4f} (P:{p_loss.item():.4f}, Pos:{po_loss.item():.4f}, F:{f_loss.item():.4f}, B:{b_loss.item():.4f}, DReg:{reg_loss_val:.6f})")
 
+
                 # 4. FIX: Step scheduler if the optimizer was actually stepped
                 if self.scaler.get_scale() >= scale_before:
                     self.scheduler.step()

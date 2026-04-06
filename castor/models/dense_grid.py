@@ -40,8 +40,7 @@ class DiffractionAwareFilter(nn.Module):
         self.conv = nn.Conv2d(1, 1, kernel_size=kernel_size, padding=kernel_size//2, bias=False)
 
         # Priority 1: Master PSF Library (The survey-average blurred PSF)
-        # Priority 2: Realistic Roman Template (The pristine core)
-        # Priority 3: Analytical Mexican Hat (Fallback)
+        # Priority 2: Analytical Mexican Hat (Fallback)
         
         kernel = None
         
@@ -77,13 +76,6 @@ class DiffractionAwareFilter(nn.Module):
             except Exception as e:
                 print(f"⚠️ Failed to load master library for prior: {e}")
 
-        # Try Priority 2: Pristine Template
-        if kernel is None and os.path.exists("roman_psf_prior.pt"):
-            try:
-                realistic_psf = torch.load("roman_psf_prior.pt", map_location='cpu', weights_only=True).float()
-                kernel = self._fit_to_kernel_size(realistic_psf, kernel_size)
-                print("🛰️ DiffractionAwareFilter: Initialized with Realistic Roman Template")
-            except Exception: pass
 
         # Priority 3: Analytical Fallback
         if kernel is None:
