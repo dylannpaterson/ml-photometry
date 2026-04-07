@@ -20,30 +20,32 @@ def visualize_mosaic_optimized(mosaic_idx=0, data_dir="data/bulge_stage0_full/mo
         print(f"Error: Mosaic not found at {img_path}")
         return
 
-    # 1. Load Data (Optimized NumPy path)
+    # 1. Load Data
     star_signal = np.load(img_path)
     structured_cat = np.load(cat_path)
     meta = np.load(meta_path)
     
+    O = 4 # Assume oversampling factor
+    half = SHAPE_SIZE // 2
+
     # Load PSF Library to get actual peak and area
     if os.path.exists(lib_path):
         psf_lib = np.load(lib_path)
-        # psf_lib contains [eigen_psfs_1x, mean_psf_1x], all peak-normalized
+        # psf_lib contains [eigen_psfs_1x, mean_psf_1x], peak-normalized
         mean_psf_1x = psf_lib[-1].reshape(SHAPE_SIZE, SHAPE_SIZE)
-        eigen_psfs_1x = psf_lib[:-1].reshape(N_PCA_COMPONENTS, SHAPE_SIZE, SHAPE_SIZE)
         
-        # N_eff from peak-normalized PSF
-        eff_area = np.sum(mean_psf_1x ** 2)
+        # NEA (N_eff) = 1 / sum(P^2) where sum(P)=1
+        # P = mean_psf_1x / sum(mean_psf_1x)
+        sum_p = np.sum(mean_psf_1x)
+        eff_area = (sum_p**2) / (np.sum(mean_psf_1x**2) + 1e-9)
         print(f"📊 Using PSF from library: eff_area={eff_area:.2f}")
     else:
-        # Fallback
-        eff_area = 5.5
+        eff_area = 12.0
         print(f"⚠️ PSF library not found, using default eff_area.")
 
     exp_time, zp, sky_mag = meta[0], meta[1], meta[2]
     sky_level = (10 ** (-0.4 * (sky_mag - zp))) * (0.11**2) * exp_time
     
-    # Simulate a noisy observation (Match dataset live noise)
     img_noisy = np.random.poisson(np.maximum(star_signal + sky_level, 0)).astype(np.float32)
     img_noisy += np.random.normal(0, 5.0, size=img_noisy.shape)
     
@@ -52,48 +54,26 @@ def visualize_mosaic_optimized(mosaic_idx=0, data_dir="data/bulge_stage0_full/mo
     network_input = transform.image_to_network(img_noisy, chunk_median)
 
     # --- 2. Rigorous SNR Extraction ---
-    fluxes = structured_cat['flux']
-    x, y = structured_cat['x'], structured_cat['y']
-    x0, y0 = np.floor(x).astype(int), np.floor(y).astype(int)
-    
-    # Extract true center-pixel light
-    actual_pixel_values = star_signal[y0, x0]
-    
-    # Approximate phase-dependent peak (using lib values)
-    # For Roman PSF, min_peak/max_peak usually within ~20%
-    # We use lib mean peak as max_peak (it's normalized to 1)
-    max_peak = 1.0
-    min_peak = 0.7 # Approximation
-    
-    dx_sub = x - x0
-    dy_sub = y - y0
-    dist_from_pixel_center = np.sqrt((dx_sub - 0.5)**2 + (dy_sub - 0.5)**2)
-    phase_dependent_peak = max_peak - (max_peak - min_peak) * (dist_from_pixel_center / 0.7071)
-    
-    # Include PCA weights
-    weights = np.column_stack([structured_cat[f'w{i}'] for i in range(N_PCA_COMPONENTS)])
-    half = SHAPE_SIZE // 2
-    
-    # Correct confusion noise subtraction
-    # confusion = total light - star's own light
-    # We need the ACTUAL peak for this star
-    star_own_peak_frac = phase_dependent_peak.copy()
-    if os.path.exists(lib_path):
-        # Add PCA component contribution to peak
-        for i in range(len(fluxes)):
-            star_own_peak_frac[i] += np.dot(weights[i], eigen_psfs_1x[:, half, half])
-
-    confusion_light = np.maximum(0.0, actual_pixel_values - (fluxes * star_own_peak_frac))
-    noise_var = fluxes + eff_area * (sky_level + confusion_light + 25.0)
-    snrs = fluxes / np.sqrt(noise_var)
+    # We use the SNR from the catalog if available
+    if 'snr' in structured_cat.dtype.names:
+        snrs = structured_cat['snr']
+    else:
+        # Fallback to an approximation
+        fluxes = structured_cat['flux']
+        px, py = structured_cat['x'], structured_cat['y']
+        x0, y0 = np.floor(px).astype(int), np.floor(py).astype(int)
+        actual_pixel_values = star_signal[y0, x0]
+        local_background = np.maximum(0, actual_pixel_values - fluxes * 0.2) 
+        noise_var = fluxes + eff_area * (sky_level + local_background + 25.0)
+        snrs = fluxes / np.sqrt(noise_var)
     
     # Identify model targets
+    px, py = structured_cat['x'], structured_cat['y']
     target_mask = snrs >= 5.0
-    targets_x = x[target_mask]
-    targets_y = y[target_mask]
+    targets_x = px[target_mask]
+    targets_y = py[target_mask]
     targets_mag = structured_cat['mag'][target_mask]
     
-    # SNR > 2 mask
     snr2_mask = snrs > 2.0
     snr2_mag = structured_cat['mag'][snr2_mask]
     
@@ -104,13 +84,11 @@ def visualize_mosaic_optimized(mosaic_idx=0, data_dir="data/bulge_stage0_full/mo
     # 3. Create Plot
     fig = plt.figure(figsize=(24, 12))
     
-    # Left: Full Mosaic View (Network Input)
     ax0 = plt.subplot2grid((2, 3), (0, 0), rowspan=2, colspan=2)
     im0 = ax0.imshow(network_input, cmap='magma', vmin=np.percentile(network_input, 1), vmax=np.percentile(network_input, 99.9))
     ax0.set_title(f"Seamless Mosaic (1024x1024)\n{len(targets_x):,} Targets (SNR >= 5) | Median: {chunk_median:.0f}")
     plt.colorbar(im0, ax=ax0, fraction=0.046, pad=0.04)
     
-    # Right-Top: High-Density Zoom (256x256)
     zoom_size = 256
     zx, zy = 400, 400
     ax1 = plt.subplot2grid((2, 3), (0, 2))
@@ -118,12 +96,10 @@ def visualize_mosaic_optimized(mosaic_idx=0, data_dir="data/bulge_stage0_full/mo
     im1 = ax1.imshow(crop, cmap='magma')
     ax1.set_title("Target Selection (SNR >= 5)\nZoomed 256x256")
     
-    # Overlay ONLY correctly identified targets
     zoom_mask = (targets_x >= zx) & (targets_x < zx + zoom_size) & \
                 (targets_y >= zy) & (targets_y < zy + zoom_size)
     ax1.scatter(targets_x[zoom_mask] - zx, targets_y[zoom_mask] - zy, s=30, edgecolors='cyan', facecolors='none', alpha=0.6)
     
-    # Right-Bottom: LF Check
     ax2 = plt.subplot2grid((2, 3), (1, 2))
     hist_range = (12, 30)
     ax2.hist(structured_cat['mag'], bins=50, range=hist_range, color='gray', alpha=0.3, label='Culled Pop')
@@ -145,15 +121,11 @@ def visualize_mosaic_optimized(mosaic_idx=0, data_dir="data/bulge_stage0_full/mo
     from astropy.wcs import WCS
     fits_path = "optimized_mosaic_validation.fits"
     
-    # Create WCS for the Bulge (RA/Dec)
     w = WCS(naxis=2)
-    # Center of 1024x1024 mosaic
     w.wcs.crpix = [512.5, 512.5]
-    # Random Bulge Coordinate (near Galactic Center)
     w.wcs.crval = [266.417, -29.008] 
-    # Roman Pixel Scale: 0.11 arcsec = 0.11/3600 degrees
     scale = 0.11 / 3600.0
-    w.wcs.cdelt = [-scale, scale] # RA increases to the left
+    w.wcs.cdelt = [-scale, scale]
     w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
     
     header = w.to_header()
@@ -163,19 +135,13 @@ def visualize_mosaic_optimized(mosaic_idx=0, data_dir="data/bulge_stage0_full/mo
     header['SKYMAG'] = sky_mag
     header['MEDIAN'] = chunk_median
 
-    # Primary HDU: Noisy observation
     primary_hdu = fits.PrimaryHDU(img_noisy, header=header)
-    
-    # Extension 1: Clean physics
     clean_hdu = fits.ImageHDU(star_signal, name='CLEAN_PHYSICS', header=header)
-    
-    # Extension 2: Network input (Stretched)
     stretched_hdu = fits.ImageHDU(network_input, name='NETWORK_INPUT', header=header)
     
-    # Extension 3: Star density map
     h, w_size = star_signal.shape
     star_map, _, _ = np.histogram2d(
-        y, x, 
+        py, px, 
         bins=[h, w_size], 
         range=[[0, h], [0, w_size]]
     )

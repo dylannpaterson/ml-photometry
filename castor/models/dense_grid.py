@@ -223,9 +223,9 @@ class DenseGridModel(nn.Module):
             # log_var_x (4), log_var_y (5), log_var_m (6)
             log_vars = star_out[..., 4:7]
             # SOLUTION: The Safety Net
-            # We relax the clamp to -15.0 (sigma ~ 0.0005) thanks to Beta-NLL and the FP32 Bypass.
-            # This allows effectively zero variance for high-SNR targets while remaining numerically stable.
-            log_vars = torch.clamp(log_vars, min=-15.0, max=20.0) 
+            # We limit the clamp to -10.0 (sigma ~ 0.006) to ensure numerical stability in FP16 AMP.
+            # This prevents overflow in the error term while still allowing high confidence.
+            log_vars = torch.clamp(log_vars, min=-10.0, max=20.0) 
             
             # Background residuals can be negative
             bg = bg_out.permute(0, 2, 3, 1)

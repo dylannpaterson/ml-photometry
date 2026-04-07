@@ -164,8 +164,7 @@ class GaussianPretrainingProvider(Dataset):
         else: exp_time, zp, sky_mag = exp_params
 
         pixel_scale, sky_level = 0.11, (10 ** (-0.4 * (sky_mag - zp))) * (0.11**2) * exp_time
-        # Adjust star counts for image size if they are meant for a larger area
-        # Assuming min_stars/max_stars are for a 4096x4096 area
+        # Adjust star counts for image size
         area_ratio = (self.img_size / 4096.0)**2
         n_stars_base = int(np.random.uniform(self.min_stars, self.max_stars) * area_ratio)
         if n_stars_base < 100: n_stars_base = 10000 # Fallback for small chunks
@@ -176,10 +175,6 @@ class GaussianPretrainingProvider(Dataset):
         fluxes, mags = fluxes[sort_idx], mags[sort_idx]
         x_centers, y_centers = np.random.uniform(0, self.img_size, len(mags)), np.random.uniform(0, self.img_size, len(mags))
         
-        # 3. Enforce Spatial Correlation for PCA Weights
-        from scripts.generate_mosaics import compute_spatially_correlated_weights
-        physical_weights = compute_spatially_correlated_weights(x_centers, y_centers, self.img_size, self.psf_weights_lib)
-
         # 4. Apply Jitter Before Pixelation
         s_jit, q_jit, theta_jit = np.random.normal(0.127, 0.01), np.random.uniform(0.8, 1.0), np.random.uniform(0, np.pi)
         O = 4 # Oversampling
@@ -192,29 +187,25 @@ class GaussianPretrainingProvider(Dataset):
         jitter_kernel_high = np.exp(-(gxp**2 / (2 * s_jit_high**2) + gyp**2 / (2 * (s_jit_high * q_jit)**2)))
         jitter_kernel_high /= (jitter_kernel_high.sum() + 1e-9)
 
-        # We assume self.mean_psf and self.eigen_psfs are at 1x resolution here
-        # For true oversampling, they should be 4x. 
-        # If they are 1x, we'll upscale them first (simple but better than nothing)
-        # In a real run, the master library would already be 4x.
+        # We assume self.mean_psf is at 1x resolution here
         def get_upsampled(img, scale):
             from scipy.ndimage import zoom
             return zoom(img, scale, order=3)
 
         if self.mean_psf.shape[0] == self.S:
             mean_psf_4x = get_upsampled(self.mean_psf, O)
-            eigen_psfs_4x = np.array([get_upsampled(e, O) for e in self.eigen_psfs])
         else:
             mean_psf_4x = self.mean_psf
-            eigen_psfs_4x = self.eigen_psfs
 
         mean_psf_jit_4x = fftconvolve(mean_psf_4x, jitter_kernel_high, mode='same')
-        eigen_psfs_jit_4x = np.array([fftconvolve(e, jitter_kernel_high, mode='same') for e in eigen_psfs_4x])
 
         # Pre-compute 16 shifted 1x PSFs for the mean component
         mean_psf_library = np.zeros((O, O, self.S, self.S), dtype=np.float32)
         for dy_idx in range(O):
             for dx_idx in range(O):
-                mean_psf_library[dy_idx, dx_idx] = mean_psf_jit_4x[dy_idx::O, dx_idx::O][:self.S, :self.S]
+                # Energy conservation: normalize shifted phases to sum to 1
+                phase = mean_psf_jit_4x[dy_idx::O, dx_idx::O][:self.S, :self.S]
+                mean_psf_library[dy_idx, dx_idx] = phase / (np.sum(phase) + 1e-9)
 
         # Rendering
         x0, y0 = np.floor(x_centers).astype(int), np.floor(y_centers).astype(int)
@@ -222,8 +213,7 @@ class GaussianPretrainingProvider(Dataset):
         dy_idx = np.clip(np.floor((y_centers - y0) * O).astype(int), 0, O-1)
         valid = (x0 >= 0) & (x0 < self.img_size) & (y0 >= 0) & (y0 < self.img_size)
         
-        # 1. Replace Bilinear Grid Scattering with Oversampled PSF Stamping
-        # Fast Rendering using 16 sub-pixel grids
+        # Base Pass using 16 sub-pixel grids (PCA removed for Stage 0 stability)
         star_signal = np.zeros((self.img_size, self.img_size), dtype=np.float32)
         for dyi in range(O):
             for dxi in range(O):
@@ -233,76 +223,31 @@ class GaussianPretrainingProvider(Dataset):
                 grid = np.bincount(flat_indices, weights=fluxes[mask], minlength=self.img_size*self.img_size).reshape(self.img_size, self.img_size)
                 star_signal += fftconvolve(grid, mean_psf_library[dyi, dxi], mode='same')
 
-        # 2. Correction pass for bright stars
-        is_significant = fluxes > (5.0 * np.sqrt(fluxes + 100)) 
-        if is_significant.any():
-            sig_indices = np.where(is_significant)[0]
-            sig_weights = physical_weights[sig_indices]
-            half = self.S // 2
-            for i, idx_sig in enumerate(sig_indices):
-                ix, iy, f = x0[idx_sig], y0[idx_sig], fluxes[idx_sig]
-                dxi, dyi = dx_idx[idx_sig], dy_idx[idx_sig]
-                
-                # Reconstruct oversampled jittered PSF for this star
-                weights = sig_weights[i]
-                high_psf = mean_psf_jit_4x + np.tensordot(weights, eigen_psfs_jit_4x, axes=1)
-                # Bin down with shift
-                stamp = high_psf[dyi::O, dxi::O][:self.S, :self.S]
-                
-                y0_s, y1_s = max(0, iy-half), min(self.img_size, iy+half+1)
-                x0_s, x1_s = max(0, ix-half), min(self.img_size, ix+half+1)
-                sy0, sy1 = half - (iy - y0_s), half + (y1_s - iy)
-                sx0, sx1 = half - (ix - x0_s), half + (x1_s - ix)
-                
-                # We subtract the mean contribution already added
-                star_signal[y0_s:y1_s, x0_s:x1_s] += (stamp[sy0:sy1, sx0:sx1] - mean_psf_library[dyi, dxi, sy0:sy1, sx0:sx1]) * f
-
         star_signal = np.maximum(0, star_signal)
 
         total_photon_flux = star_signal + sky_level
         chunk_median = np.median(star_signal) + sky_level
 
         # Calculate Rigorous SNR
-        # 1. Calculate the true Noise Equivalent Area (N_eff) from the downsampled PSF
-        # Use the most "centered" PSF from our 16 shifts (normalized to peak=1)
         centered_psf = mean_psf_library[O//2, O//2]
-        psf_peak_val = np.max(centered_psf)
-        psf_norm_to_peak = centered_psf / (psf_peak_val + 1e-9)
-        N_eff = np.sum(psf_norm_to_peak ** 2)
+        N_eff = 1.0 / (np.sum(centered_psf ** 2) + 1e-9)
         
-        # 2. Extract true local light using integer pixel indexing
         x0_idx = np.clip(x0, 0, self.img_size - 1)
         y0_idx = np.clip(y0, 0, self.img_size - 1)
         actual_pixel_values = star_signal[y0_idx, x0_idx]
         
-        # 3. Calculate phase-dependent peak fraction dynamically
         k_half = self.S // 2
         peaks = mean_psf_library[:, :, k_half, k_half]
-        max_peak = np.max(peaks)
-        min_peak = np.min(peaks)
-        
-        dx_sub = x_centers - x0
-        dy_sub = y_centers - y0
-        dist_from_pixel_center = np.sqrt((dx_sub - 0.5)**2 + (dy_sub - 0.5)**2)
-        # 0.707 is the max distance from center (0.5, 0.5) to corner (0, 0)
-        phase_dependent_peak = max_peak - (max_peak - min_peak) * (dist_from_pixel_center / 0.7071)
-        
-        # Reconstruct star peaks including PCA (normalized to peak=1)
-        star_peaks = phase_dependent_peak.copy()
-        if is_significant.any():
-            for i, idx_sig in enumerate(sig_indices):
-                dxi, dyi = dx_idx[idx_sig], dy_idx[idx_sig]
-                star_peaks[idx_sig] += np.dot(sig_weights[i], eigen_psfs_jit_4x[:, dyi::O, dxi::O][:, k_half, k_half])
+        star_peaks = peaks[dy_idx, dx_idx]
         
         # 4. Calculate Confusion Noise
-        # The light in the center pixel minus the star's own contribution
         confusion_light = np.maximum(0.0, actual_pixel_values - (fluxes * star_peaks))
         
-        # 5. Calculate Final SNR (Matched Filter Equation)
-        noise_variance = fluxes + N_eff * (sky_level + confusion_light + 25.0)
+        # 5. Calculate Final SNR
+        noise_variance = fluxes + N_eff * (sky_level + confusion_light + self.read_noise**2)
         snrs = fluxes / np.sqrt(noise_variance)
 
-        # TARGET GENERATION: Drop PCA Weights
+        # TARGET GENERATION
         base_grid = fast_paint_grid(x_centers, y_centers, fluxes, snrs, sort_idx, self.min_snr, self.grid_size, self.cell_size, self.K)
         target = torch.cat([torch.from_numpy(base_grid).view(self.grid_size, self.grid_size, -1), 
                             torch.from_numpy(np.full((self.grid_size, self.grid_size, 1), self.transform.target_bg_to_network(sky_level - chunk_median), dtype=np.float32))], dim=-1)
@@ -315,7 +260,6 @@ class GaussianMosaicDataset(Dataset):
         self.grid_size = image_size // cell_size
         self.transform = AstroSpaceTransform(stretch_scale=global_stretch_scale)
         self.K, self.min_snr = MAX_CAPACITY_PER_CELL, 5.0
-        # CHANGED: Target shape is now (grid_size, grid_size, K*4 + 1)
         self.target_shape = (self.grid_size, self.grid_size, self.K * 4 + 1)
         self.mosaics = []
         image_files = sorted([f for f in os.listdir(data_dir) if f.endswith("_img.npy")])
@@ -354,7 +298,6 @@ class GaussianMosaicDataset(Dataset):
         if mask_x.any():
             local_cat = band_cat[mask_x]
             lx, ly, fluxes, snrs = local_cat['x'] - px, local_cat['y'] - py, local_cat['flux'], local_cat['snr']
-            # CHANGED: Drop PCA weights from fast_paint_grid call
             grid_stars_np = fast_paint_grid(lx, ly, fluxes, snrs, np.argsort(fluxes)[::-1], self.min_snr, self.grid_size, self.cell_size, self.K)
             target_buffer[:, :, :-1] = grid_stars_np.reshape(self.grid_size, self.grid_size, -1)
         target_buffer[:, :, -1] = self.transform.target_bg_to_network(sky_level - chunk_median)
@@ -372,8 +315,6 @@ class HDF5MosaicDataset(Dataset):
                 self.psf_library = torch.from_numpy(f['psf_libraries'][0]).float()
             else:
                 self.psf_library = None
-            
-            # Removed PCA Standardization logic as targets no longer contain weights
 
     def __len__(self): return self.length
 
