@@ -219,9 +219,11 @@ class DenseGridModel(nn.Module):
         # NEW: Uncertainty Estimates (Log-variance)
         # log_var_x (4), log_var_y (5), log_var_m (6)
         log_vars = star_out[..., 4:7]
-        # Clamp log_vars to prevent the NLL precision multiplier (exp(-log_var)) from hitting inf.
-        # min=-10 limits precision to ~22k, max=20 allows for large uncertainty on bright stars.
-        log_vars = torch.clamp(log_vars, min=-10.0, max=20.0) 
+        # SOLUTION: The Physical Noise Floor
+        # We clamp log_vars to a physical minimum of -3.0. This restricts the precision 
+        # multiplier exp(-log_var) to ~20.0, preventing gradient explosions in FP16/AMP
+        # while reflecting the inherent instrument read noise floor.
+        log_vars = torch.clamp(log_vars, min=-3.0, max=20.0) 
         
         # Background residuals can be negative
         bg = bg_out.permute(0, 2, 3, 1)

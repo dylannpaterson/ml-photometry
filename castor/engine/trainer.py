@@ -166,7 +166,18 @@ class Trainer:
                 # 3. Scaled Backward Pass
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
+                
+                # FIX: Safely check for Infs before applying gradient clipping
+                # This prevents `clip_grad_norm_` from doing Inf * 0.0 = NaN
+                is_finite = True
+                for param in self.model.parameters():
+                    if param.grad is not None:
+                        if not torch.isfinite(param.grad).all():
+                            is_finite = False
+                            break
+                
+                if is_finite:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
                 
                 # Only step scheduler if scaler didn't skip the optimizer step
                 scale_before = self.scaler.get_scale()
