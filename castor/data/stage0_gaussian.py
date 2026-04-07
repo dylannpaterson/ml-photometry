@@ -112,7 +112,7 @@ class GaussianPretrainingProvider(Dataset):
         optical_template = None
         if os.path.exists("roman_psf_prior.pt"):
             try:
-                optical_template = torch.load("roman_psf_prior.pt", map_location='cpu', weights_only=True).numpy()
+                optical_template = torch.load("roman_psf_prior.pt", map_location='cpu', weights_only=False).numpy()
             except Exception: pass
 
         y, x = np.meshgrid(np.arange(grid_size) - half, np.arange(grid_size) - half, indexing='ij')
@@ -187,25 +187,37 @@ class GaussianPretrainingProvider(Dataset):
         jitter_kernel_high = np.exp(-(gxp**2 / (2 * s_jit_high**2) + gyp**2 / (2 * (s_jit_high * q_jit)**2)))
         jitter_kernel_high /= (jitter_kernel_high.sum() + 1e-9)
 
-        # We assume self.mean_psf is at 1x resolution here
+        # REPRESENTATIVE PSF SELECTION (Sync with mosaics)
+        repr_idx = np.random.randint(0, len(self.psf_weights_lib))
+        repr_weights = self.psf_weights_lib[repr_idx]
+
         def get_upsampled(img, scale):
             from scipy.ndimage import zoom
             return zoom(img, scale, order=3)
 
         if self.mean_psf.shape[0] == self.S:
             mean_psf_4x = get_upsampled(self.mean_psf, O)
+            eigen_psfs_4x = np.array([get_upsampled(e, O) for e in self.eigen_psfs])
         else:
             mean_psf_4x = self.mean_psf
+            eigen_psfs_4x = self.eigen_psfs
 
-        mean_psf_jit_4x = fftconvolve(mean_psf_4x, jitter_kernel_high, mode='same')
+        # Reconstruct the specific representative optical PSF
+        repr_psf_4x = mean_psf_4x + np.tensordot(repr_weights, eigen_psfs_4x, axes=1)
+        repr_psf_4x = np.maximum(0, repr_psf_4x)
+        repr_psf_4x /= (repr_psf_4x.sum() + 1e-9)
 
-        # Pre-compute 16 shifted 1x PSFs for the mean component
-        mean_psf_library = np.zeros((O, O, self.S, self.S), dtype=np.float32)
+        repr_psf_jit_4x = fftconvolve(repr_psf_4x, jitter_kernel_high, mode='same')
+
+        # Pre-compute 16 shifted 1x PSFs using AREA INTEGRATION (Sync with mosaics)
+        psf_library = np.zeros((O, O, self.S, self.S), dtype=np.float32)
+        padded_psf = np.pad(repr_psf_jit_4x, ((0, O), (0, O)))
         for dy_idx in range(O):
             for dx_idx in range(O):
-                # Energy conservation: normalize shifted phases to sum to 1
-                phase = mean_psf_jit_4x[dy_idx::O, dx_idx::O][:self.S, :self.S]
-                mean_psf_library[dy_idx, dx_idx] = phase / (np.sum(phase) + 1e-9)
+                # Binning: Average 4x4 sub-pixels into 1 detector pixel
+                window = padded_psf[dy_idx : dy_idx + self.S*O, dx_idx : dx_idx + self.S*O]
+                binned = window.reshape(self.S, O, self.S, O).mean(axis=(1, 3))
+                psf_library[dy_idx, dx_idx] = binned / (np.sum(binned) + 1e-9)
 
         # Rendering
         x0, y0 = np.floor(x_centers).astype(int), np.floor(y_centers).astype(int)
@@ -213,7 +225,7 @@ class GaussianPretrainingProvider(Dataset):
         dy_idx = np.clip(np.floor((y_centers - y0) * O).astype(int), 0, O-1)
         valid = (x0 >= 0) & (x0 < self.img_size) & (y0 >= 0) & (y0 < self.img_size)
         
-        # Base Pass using 16 sub-pixel grids (PCA removed for Stage 0 stability)
+        # Base Pass using 16 sub-pixel grids
         star_signal = np.zeros((self.img_size, self.img_size), dtype=np.float32)
         for dyi in range(O):
             for dxi in range(O):
@@ -221,7 +233,7 @@ class GaussianPretrainingProvider(Dataset):
                 if not mask.any(): continue
                 flat_indices = y0[mask] * self.img_size + x0[mask]
                 grid = np.bincount(flat_indices, weights=fluxes[mask], minlength=self.img_size*self.img_size).reshape(self.img_size, self.img_size)
-                star_signal += fftconvolve(grid, mean_psf_library[dyi, dxi], mode='same')
+                star_signal += fftconvolve(grid, psf_library[dyi, dxi], mode='same')
 
         star_signal = np.maximum(0, star_signal)
 
@@ -229,7 +241,7 @@ class GaussianPretrainingProvider(Dataset):
         chunk_median = np.median(star_signal) + sky_level
 
         # Calculate Rigorous SNR
-        centered_psf = mean_psf_library[O//2, O//2]
+        centered_psf = psf_library[O//2, O//2]
         N_eff = 1.0 / (np.sum(centered_psf ** 2) + 1e-9)
         
         x0_idx = np.clip(x0, 0, self.img_size - 1)
@@ -237,7 +249,7 @@ class GaussianPretrainingProvider(Dataset):
         actual_pixel_values = star_signal[y0_idx, x0_idx]
         
         k_half = self.S // 2
-        peaks = mean_psf_library[:, :, k_half, k_half]
+        peaks = psf_library[:, :, k_half, k_half]
         star_peaks = peaks[dy_idx, dx_idx]
         
         # 4. Calculate Confusion Noise
