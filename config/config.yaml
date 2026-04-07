@@ -9,14 +9,15 @@ curriculum:
   stage0:
     name: "Roman Bulge Stage 0 (Full)"
     data_dir: "data/bulge_stage0_full"
-    epochs: 200
-    batch_size: 64
+    epochs: 500
+    batch_size: 128
     learning_rate: 0.0001
     num_workers: 2
     resume_from_last_stage: false
     cell_size: 4 # Centralized default: 4
     mosaic_params:
-      num_mosaics: 1000
+      num_mosaics: 2000
+      val_mosaics: 400
       mosaic_size: 1024
 
   # Stage 1: Multi-Telescope Foundation Training (GalSim)
@@ -31,6 +32,7 @@ curriculum:
     resume_from_last_stage: true
     mosaic_params:
       num_mosaics: 200
+      val_mosaics: 20
       mosaic_size: 1024
 
   # Stage 2: Roman-specific High-Fidelity Fine-tuning (Romanisim)
@@ -49,8 +51,8 @@ data_params:
   num_val_samples: 5000
   
   # Massive unified population to hit VVV background levels
-  min_stars: 500000
-  max_stars: 10000000
+  min_stars: 50000
+  max_stars: 300000
   
   image_size: 256
   
@@ -86,12 +88,11 @@ data_params:
     gamma_min: 0.25
     gamma_max: 0.35
   
-  loss_params:
-    lambda_prob: 50.0
-    lambda_pos: 1.0
-    lambda_flux: 5.0
-    lambda_comp: 1.0
-    lambda_shape: 1.0
-    lambda_bg: 1.0
-    focal_alpha: 0.25
-    focal_gamma: 2.0
+loss_params:
+  lambda_prob: 25.0
+  lambda_pos: 25.0      # Increased: NLL scales differently than Smooth L1
+  lambda_flux: 10.0     # Increased: Balancing astrometry vs photometry
+  lambda_bg: 0.5
+  lambda_diffraction_reg: 10.0
+  focal_alpha: 0.25
+  focal_gamma: 2.0

@@ -26,8 +26,21 @@ class Trainer:
         self.model, self.train_loader, self.val_loader = model, train_loader, val_loader
         self.config, self.device, self.checkpoint_prefix = config, device, checkpoint_prefix
         self.epochs, self.lr = epochs, lr
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=5)
+        
+        # 1. Transition to AdamW for better weight decay handling
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=1e-4)
+        
+        # 2. Transition to OneCycleLR for faster convergence and local minima escape
+        self.scheduler = optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=self.lr * 5,
+            steps_per_epoch=len(self.train_loader),
+            epochs=self.epochs,
+            pct_start=0.1, # 10% warmup
+            div_factor=25.0,
+            final_div_factor=10000.0
+        )
+        
         self.start_epoch = 0
         
         # New: Track psf_library for checkpointing
@@ -36,9 +49,14 @@ class Trainer:
         # Add the AMP GradScaler
         self.scaler = torch.amp.GradScaler('cuda' if device.type == 'cuda' else 'cpu')
         
-        # Extract loss parameters from config
-        self.loss_params = config["data_params"].get("loss_params", {}).copy()
+        # FIX: Extract loss parameters from root of config instead of data_params
+        self.loss_params = config.get("loss_params", {}).copy()
         self.loss_params["stretch_scale"] = GLOBAL_STRETCH_SCALE
+        
+        # Pop lambda_diffraction_reg so it doesn't collide with compute_grid_loss kwargs
+        self.lambda_diffraction = self.loss_params.pop("lambda_diffraction_reg", 10.0)
+
+        # Removed: Injection of global_weights_std as PCA weights are no longer predicted
 
     def resume(self, checkpoint_path=None):
         if checkpoint_path is None:
@@ -49,10 +67,27 @@ class Trainer:
             ckpt = torch.load(checkpoint_path, map_location=self.device)
             if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
                 self.model.load_state_dict(ckpt['model_state_dict'])
+                
+                # Restore optimizer and scheduler states
+                if 'optimizer_state_dict' in ckpt:
+                    self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                    print("✅ Restored optimizer state.")
+                
+                if 'scheduler_state_dict' in ckpt:
+                    self.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+                    print("✅ Restored scheduler state.")
+                
+                if 'scaler_state_dict' in ckpt:
+                    self.scaler.load_state_dict(ckpt['scaler_state_dict'])
+                    print("✅ Restored GradScaler state.")
+
                 # Restore psf_library if it exists in the checkpoint
                 if 'psf_library' in ckpt:
                     self.psf_library = ckpt['psf_library']
                     print("✅ Restored PSF library from checkpoint.")
+                
+                # Resume from next epoch
+                self.start_epoch = ckpt.get('epoch', self.start_epoch - 1) + 1
             else:
                 self.model.load_state_dict(ckpt)
 
@@ -110,10 +145,20 @@ class Trainer:
                 # 2. Force FP32 before numerically sensitive loss calculation
                 preds_fp32 = {k: v.float() for k, v in preds.items()}
                 
-                loss, p_loss, po_loss, f_loss, s_loss, b_loss = compute_grid_loss(
-                    preds_fp32, targets, psf_library=psf_library, **self.loss_params
+                # FIX: Remove 'psf_library' argument which is no longer supported by compute_grid_loss
+                loss, p_loss, po_loss, f_loss, b_loss = compute_grid_loss(
+                    preds_fp32, targets, **self.loss_params
                 )
                 
+                # --- DIFFRACTION FILTER REGULARIZATION ---
+                # This prevents the physics prior from drifting too far from initialization
+                # and becoming a random convolutional layer.
+                diffraction_reg = self.model.diffraction_filter.get_regularization_loss()
+                reg_loss_val = diffraction_reg.item() # Raw L2 Distance
+                reg_loss = self.lambda_diffraction * diffraction_reg
+                loss += reg_loss
+                # ------------------------------------------
+
                 if torch.isnan(loss):
                     print(f"⚠️ NaN detected at step {i}")
                     continue
@@ -121,8 +166,21 @@ class Trainer:
                 # 3. Scaled Backward Pass
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 
+                # FIX: Safely check for Infs before applying gradient clipping
+                # This prevents `clip_grad_norm_` from doing Inf * 0.0 = NaN
+                is_finite = True
+                for param in self.model.parameters():
+                    if param.grad is not None:
+                        if not torch.isfinite(param.grad).all():
+                            is_finite = False
+                            break
+                
+                if is_finite:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
+                
+                # Only step scheduler if scaler didn't skip the optimizer step
+                scale_before = self.scaler.get_scale()
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 
@@ -130,20 +188,31 @@ class Trainer:
                 
                 if i % 100 == 0:
                     current_lr = self.optimizer.param_groups[0]['lr']
-                    print(f"Epoch [{epoch+1}/{self.epochs}], Step [{i}/{len(self.train_loader)}], LR: {current_lr:.6f}, Loss: {loss.item():.4f} (P:{p_loss.item():.4f}, Pos:{po_loss.item():.4f}, F:{f_loss.item():.4f}, S:{s_loss.item():.4f}, B:{b_loss.item():.4f})")
+                    print(f"Epoch [{epoch+1}/{self.epochs}], Step [{i}/{len(self.train_loader)}], LR: {current_lr:.6f}, Loss: {loss.item():.4f} (P:{p_loss.item():.4f}, Pos:{po_loss.item():.4f}, F:{f_loss.item():.4f}, B:{b_loss.item():.4f}, DReg:{reg_loss_val:.6f})")
+
+
+                # 4. FIX: Step scheduler if the optimizer was actually stepped
+                if self.scaler.get_scale() >= scale_before:
+                    self.scheduler.step()
             
             avg_epoch_loss = epoch_loss/len(self.train_loader)
             print(f"==> Epoch {epoch+1} Complete | Avg Loss: {avg_epoch_loss:.4f} | Time: {time.time()-start_time:.1f}s")
             val_loss = self.validate(); print(f"Validation Loss: {val_loss:.4f}")
             
-            self.scheduler.step(val_loss)
-            
             os.makedirs("checkpoints", exist_ok=True)
+            
+            # Persist PSF Library to disk if it doesn't exist (Safety Layer)
+            if self.psf_library is not None and not os.path.exists("master_psf_library.pt"):
+                torch.save(self.psf_library, "master_psf_library.pt")
+                print("💾 Persisted Master PSF Library from training batch to disk.")
+
             # Save full checkpoint dict for easier resuming
             checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': self.model.state_dict(),
                 'optimizer_state_dict': self.optimizer.state_dict(),
+                'scheduler_state_dict': self.scheduler.state_dict(),
+                'scaler_state_dict': self.scaler.state_dict(),
                 'val_loss': val_loss,
                 'psf_library': self.psf_library # Save PSF library
             }
@@ -184,6 +253,10 @@ class Trainer:
 
     def validate(self):
         self.model.eval(); val_loss = 0
+        num_batches = len(self.val_loader)
+        if num_batches == 0:
+            return 0.0 # Safety for empty val_loader
+            
         with torch.no_grad():
             for batch in self.val_loader:
                 if isinstance(batch, dict):
@@ -210,6 +283,10 @@ class Trainer:
                     preds = self.model(images_final)
                 
                 preds_fp32 = {k: v.float() for k, v in preds.items()}
-                loss, _, _, _, _, _ = compute_grid_loss(preds_fp32, targets, psf_library=psf_library, **self.loss_params)
+                
+                # FIX: Remove 'psf_library' and 'pca_std' arguments
+                loss, _, _, _, _ = compute_grid_loss(
+                    preds_fp32, targets, **self.loss_params
+                )
                 val_loss += loss.item()
-        return val_loss / len(self.val_loader)
+        return val_loss / num_batches

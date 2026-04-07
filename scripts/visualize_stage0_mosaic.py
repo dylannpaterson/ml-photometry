@@ -3,15 +3,15 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 import os
+import argparse
 from scipy.ndimage import map_coordinates
 from castor.data.transforms import AstroSpaceTransform
 from castor.constants import GLOBAL_STRETCH_SCALE
 
-def visualize_mosaic_optimized():
-    data_dir = "data/bulge_stage0_full/mosaics"
-    img_path = os.path.join(data_dir, "mosaic_000_img.npy")
-    cat_path = os.path.join(data_dir, "mosaic_000_cat.npy")
-    meta_path = os.path.join(data_dir, "mosaic_000_meta.npy")
+def visualize_mosaic_optimized(mosaic_idx=0, data_dir="data/bulge_stage0_full/mosaics"):
+    img_path = os.path.join(data_dir, f"mosaic_{mosaic_idx:03d}_img.npy")
+    cat_path = os.path.join(data_dir, f"mosaic_{mosaic_idx:03d}_cat.npy")
+    meta_path = os.path.join(data_dir, f"mosaic_{mosaic_idx:03d}_meta.npy")
     
     if not os.path.exists(img_path):
         print(f"Error: Mosaic not found at {img_path}")
@@ -53,8 +53,13 @@ def visualize_mosaic_optimized():
     targets_y = y[target_mask]
     targets_mag = structured_cat['mag'][target_mask]
     
+    # SNR > 2 mask
+    snr2_mask = snrs > 2.0
+    snr2_mag = structured_cat['mag'][snr2_mask]
+    
     print(f"Total stars in culled catalog: {len(structured_cat):,}")
     print(f"Detectable targets (SNR >= 5):  {len(targets_x):,}")
+    print(f"Visible sources (SNR > 2):      {len(snr2_mag):,}")
 
     # 3. Create Plot
     fig = plt.figure(figsize=(24, 12))
@@ -82,7 +87,9 @@ def visualize_mosaic_optimized():
     ax2 = plt.subplot2grid((2, 3), (1, 2))
     hist_range = (12, 30)
     ax2.hist(structured_cat['mag'], bins=50, range=hist_range, color='gray', alpha=0.3, label='Culled Pop')
-    ax2.hist(targets_mag, bins=50, range=hist_range, color='cyan', alpha=0.7, edgecolor='black', label='Targets')
+    ax2.hist(snr2_mag, bins=50, range=hist_range, color='orange', alpha=0.5, label='SNR > 2')
+    ax2.hist(targets_mag, bins=50, range=hist_range, color='cyan', alpha=0.7, edgecolor='black', label='Targets (SNR >= 5)')
+    
     ax2.set_title("Target Selection LF")
     ax2.set_xlabel("Magnitude")
     ax2.invert_xaxis()
@@ -93,5 +100,41 @@ def visualize_mosaic_optimized():
     plt.savefig("optimized_mosaic_validation.png", dpi=150)
     print(f"✅ Optimized mosaic validation saved to optimized_mosaic_validation.png")
 
+    # --- 4. Save to FITS ---
+    from astropy.io import fits
+    fits_path = "optimized_mosaic_validation.fits"
+    
+    # Primary HDU: Noisy observation
+    primary_hdu = fits.PrimaryHDU(img_noisy)
+    primary_hdu.header['EXTNAME'] = 'NOISY_OBS'
+    primary_hdu.header['EXPTIME'] = exp_time
+    primary_hdu.header['ZP'] = zp
+    primary_hdu.header['SKYMAG'] = sky_mag
+    primary_hdu.header['MEDIAN'] = chunk_median
+    
+    # Extension 1: Clean physics
+    clean_hdu = fits.ImageHDU(star_signal, name='CLEAN_PHYSICS')
+    
+    # Extension 2: Network input (Stretched)
+    stretched_hdu = fits.ImageHDU(network_input, name='NETWORK_INPUT')
+    
+    # Extension 3: Star density map
+    h, w = star_signal.shape
+    star_map, _, _ = np.histogram2d(
+        y, x, 
+        bins=[h, w], 
+        range=[[0, h], [0, w]]
+    )
+    star_hdu = fits.ImageHDU(star_map.astype(np.float32), name='STAR_DENSITY')
+    
+    hdul = fits.HDUList([primary_hdu, clean_hdu, stretched_hdu, star_hdu])
+    hdul.writeto(fits_path, overwrite=True)
+    print(f"✅ Mosaic saved to FITS: {fits_path}")
+
 if __name__ == "__main__":
-    visualize_mosaic_optimized()
+    parser = argparse.ArgumentParser(description="Visualize optimized mosaic")
+    parser.add_argument("--mosaic_idx", type=int, default=0, help="Index of the mosaic to visualize")
+    parser.add_argument("--data_dir", type=str, default="data/bulge_stage0_full/mosaics", help="Directory containing the mosaics")
+    args = parser.parse_args()
+    
+    visualize_mosaic_optimized(mosaic_idx=args.mosaic_idx, data_dir=args.data_dir)

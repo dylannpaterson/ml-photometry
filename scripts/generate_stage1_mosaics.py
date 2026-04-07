@@ -226,4 +226,4 @@ if __name__ == "__main__":
     num_workers = max(1, mp.cpu_count() - 2) 
     with mp.Pool(num_workers) as pool:
         pool.map(render_single_mosaic, range(NUM_MOSAICS))
-    print("✅ All 20 Macro-Sparse mosaics successfully generated.")
+    print(f"✅ All {NUM_MOSAICS} Macro-Sparse mosaics successfully generated.")

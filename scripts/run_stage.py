@@ -62,19 +62,26 @@ def load_stage_model(stage_idx, device, config, checkpoint_path=None):
 
 def ensure_stage0_data(stage_cfg, data_cfg, config_path):
     """Checks for HDF5 data and generates a small amount if missing."""
-    mosaic_dir = os.path.join(stage_cfg["data_dir"], "mosaics")
+    train_mos_dir = os.path.join(stage_cfg["data_dir"], "mosaics_train")
+    val_mos_dir = os.path.join(stage_cfg["data_dir"], "mosaics_val")
     val_h5 = os.path.join(stage_cfg["data_dir"], "stage0_val.h5")
     
     if not os.path.exists(val_h5):
         print("🔍 Local Stage 0 data not found. Triggering small-scale generation for inference/analysis...")
-        os.makedirs(mosaic_dir, exist_ok=True)
+        os.makedirs(train_mos_dir, exist_ok=True)
+        os.makedirs(val_mos_dir, exist_ok=True)
         
-        # Generate just 2 mosaics for quick local testing
-        os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/generate_mosaics.py --num 2 --stage 0 --config {config_path}")
+        # Generate small sets for quick local testing
+        os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/generate_mosaics.py --num 1 --stage 0 --config {config_path} --output_dir {train_mos_dir}")
+        os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/generate_mosaics.py --num 1 --stage 0 --config {config_path} --output_dir {val_mos_dir}")
         
         # Convert to a small HDF5 (100 samples is plenty for a few inference visuals)
-        os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/convert_to_hdf5.py --data_dir {stage_cfg['data_dir']} --train_samples 100 --val_samples 100")
+        os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/convert_to_hdf5.py --train_dir {train_mos_dir} --val_dir {val_mos_dir} --output_dir {stage_cfg['data_dir']} --train_samples 100 --val_samples 100")
         
+        # Cleanup
+        shutil.rmtree(train_mos_dir, ignore_errors=True)
+        shutil.rmtree(val_mos_dir, ignore_errors=True)
+
         if not os.path.exists(val_h5):
             print("❌ Error: Failed to generate local data fallback.")
             return False
@@ -110,19 +117,26 @@ def run_train(stage_idx, config, device):
     if stage_idx == 0:
         train_h5 = os.path.join(stage_cfg["data_dir"], "stage0_train.h5")
         val_h5 = os.path.join(stage_cfg["data_dir"], "stage0_val.h5")
-        mosaic_dir = os.path.join(stage_cfg["data_dir"], "mosaics")
+        train_mos_dir = os.path.join(stage_cfg["data_dir"], "mosaics_train")
+        val_mos_dir = os.path.join(stage_cfg["data_dir"], "mosaics_val")
         
         # 1. Check if we actually NEED to generate anything
         needs_gen = force_gen or not os.path.exists(train_h5) or not os.path.exists(val_h5)
         
         if needs_gen:
             # Only generate raw mosaics if they don't already exist
-            if force_gen or not os.path.exists(mosaic_dir) or not os.listdir(mosaic_dir):
+            if force_gen or not os.path.exists(train_mos_dir) or not os.listdir(train_mos_dir):
                 print("🛠️ Generating Mosaics for Stage 0...")
                 cfg_path = config.get("config_path", "config/config.yaml")
-                mos_cfg = stage_cfg.get("mosaic_params", {"num_mosaics": 5})
+                mos_cfg = stage_cfg.get("mosaic_params", {"num_mosaics": 5, "val_mosaics": 2})
                 num_mos = mos_cfg.get("num_mosaics", 5)
-                os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/generate_mosaics.py --num {num_mos} --stage {stage_idx} --config {cfg_path}")
+                num_val_mos = mos_cfg.get("val_mosaics", 2)
+                
+                os.makedirs(train_mos_dir, exist_ok=True)
+                os.makedirs(val_mos_dir, exist_ok=True)
+                
+                os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/generate_mosaics.py --num {num_mos} --stage {stage_idx} --config {cfg_path} --output_dir {train_mos_dir}")
+                os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/generate_mosaics.py --num {num_val_mos} --stage {stage_idx} --config {cfg_path} --output_dir {val_mos_dir}")
             
             print(f"🛠️ HDF5 dataset conversion triggered (force_gen={force_gen})...")
             # Clear old ones if force_gen is true to avoid h5py append/overlap confusion
@@ -131,12 +145,13 @@ def run_train(stage_idx, config, device):
                 if os.path.exists(val_h5): os.remove(val_h5)
             
             # The conversion script now handles incremental cleanup of raw files
-            ret = os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/convert_to_hdf5.py --data_dir {stage_cfg['data_dir']} --train_samples {data_cfg['num_train_samples']} --val_samples {data_cfg['num_val_samples']}")
+            ret = os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/convert_to_hdf5.py --train_dir {train_mos_dir} --val_dir {val_mos_dir} --output_dir {stage_cfg['data_dir']} --train_samples {data_cfg['num_train_samples']} --val_samples {data_cfg['num_val_samples']}")
             
-            # Final cleanup of the directory itself if it exists
-            if ret == 0 and os.path.exists(mosaic_dir):
-                print(f"🧹 Final cleanup of raw mosaic directory: {mosaic_dir}")
-                shutil.rmtree(mosaic_dir)
+            # Final cleanup
+            if ret == 0:
+                print(f"🧹 Final cleanup of raw mosaic directories...")
+                shutil.rmtree(train_mos_dir, ignore_errors=True)
+                shutil.rmtree(val_mos_dir, ignore_errors=True)
 
         from castor.data.stage0_gaussian import HDF5MosaicDataset
         print(f"🛠️ Using HDF5 Dataset: {train_h5}")
@@ -332,7 +347,7 @@ def run_infer(stage_idx, config, device, checkpoint=None):
         grid_size = dataset.grid_size
         K = dataset.K
         
-        # target shape is (grid_size, grid_size, K*25 + 1)
+        # target shape is (grid_size, grid_size, K*4 + 1)
         target_grid = target[:, :, :-1].view(grid_size, grid_size, K, -1).numpy()
         gt_bg_map = target[:, :, -1:].numpy()
         
@@ -341,13 +356,16 @@ def run_infer(stage_idx, config, device, checkpoint=None):
                 for k in range(K):
                     slot = target_grid[y, x, k]
                     tp = slot[0]
-                    if tp == 1.0:
-                        tdx, tdy, raw_flux, tc = slot[1], slot[2], slot[3], slot[4]
+                    # NEW: For visualization, we keep stars with visible labels
+                    if tp > 0.0:
+                        tdx, tdy, raw_flux = slot[1], slot[2], slot[3]
+                        
                         tgx = (x * cell_size) + tdx
                         tgy = (y * cell_size) + tdy
-                        true_stars.append((tgx, tgy, float(raw_flux), tc))
+                        # [p, dx, dy, flux]
+                        true_stars.append((tp, tgx, tgy, float(raw_flux)))
         
-        print(f"DEBUG: Found {len(true_stars)} true stars in the chunk.")
+        print(f"DEBUG: Found {len(true_stars)} stars with non-zero objectness labels in the chunk.")
         # Pass PCA reconstruction components to predict
         # FIX: Pass raw linear noisy image, as predict() handles its own stretch
         predicted_stars, predicted_shapes, bg_map = engine.predict(
@@ -356,14 +374,36 @@ def run_infer(stage_idx, config, device, checkpoint=None):
             mean_psf=mean_psf.numpy()
         )
         
+        # --- THE FIX: Extract Jitter for Visualization ---
+        # Metadata: [exp_time, zp, sky_mag, s_jit, q_jit, theta_jit]
+        # We need the last 3 values for the reconstruction to not look "blocky" (sharp)
+        try:
+            with h5py.File(val_h5, 'r') as f:
+                # Get the metadata for the specific mosaic index
+                # We need a way to link sample index to mosaic index
+                # For now, we assume the dataset returns metadata or we check common filenames
+                # Fallback: Check if metadata is available in the sample
+                if "meta" in sample:
+                    meta = sample["meta"]
+                    jitter_params = (meta[3], meta[4], meta[5])
+                else:
+                    jitter_params = None
+        except:
+            jitter_params = None
+        # -------------------------------------------------
+        
         # DEBUG: Print normalization stats
-        matches, _, _ = match_stars(true_stars, predicted_stars)
+        # Note: predicted_stars elements are (x, y, flux, p, sigmas)
+        # match_stars expects (x, y, flux) for matching
+        match_true = [(s[1], s[2], s[3]) for s in true_stars]
+        match_pred = [(s[0], s[1], s[2]) for s in predicted_stars]
+        matches, _, _ = match_stars(match_true, match_pred)
         if matches:
             ratios = []
             print("\n--- Normalization Diagnostic ---")
             for i in range(len(matches)):
                 t_idx, p_idx, _ = matches[i]
-                t_flux = true_stars[t_idx][2]
+                t_flux = true_stars[t_idx][3]
                 p_flux = predicted_stars[p_idx][2]
                 ratios.append(p_flux / t_flux)
                 if i < 5:
@@ -375,7 +415,19 @@ def run_infer(stage_idx, config, device, checkpoint=None):
         else:
             print("\n--- Normalization Diagnostic: No matches found ---")
             
-        engine.visualize(img_stretched, true_stars, predicted_stars, predicted_shapes, bg_map, gt_bg_map, threshold=0.5, chunk_median=noisy_median)
+        engine.visualize(
+            img_stretched, 
+            true_stars, 
+            predicted_stars, 
+            predicted_shapes, 
+            bg_map, 
+            gt_bg_map, 
+            threshold=0.5, 
+            chunk_median=noisy_median,
+            jitter_params=jitter_params,
+            psf_basis=psf_basis.numpy(),
+            mean_psf=mean_psf.numpy()
+        )
     else:
         print(f"⚠️ Specialized inference for stage {stage_idx} not yet implemented.")
 
