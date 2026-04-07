@@ -119,23 +119,23 @@ def get_star_stamp(x, y, flux, psf, mosaic_size):
 def main():
     parser = argparse.ArgumentParser(description="Generate Roman Microlensing Time Series (FITS)")
     parser.add_argument("--config", default="config/config.yaml")
-    parser.add_argument("--outdir", default="data/timeseries_test")
-    parser.add_argument("--mosaic_size", type=int, default=None)
+    parser.add_argument("--outdir", default="data/microlensing_stack")
+    parser.add_argument("--mosaic_size", type=int, default=512)
     parser.add_argument("--target_mag", type=float, default=19.0)
-    parser.add_argument("--num_epochs", type=int, default=1728)
-    parser.add_argument("--cadence", type=float, default=1.0)
-    parser.add_argument("--t0", type=float, default=36.0)
-    parser.add_argument("--tE", type=float, default=20.0)
-    parser.add_argument("--u0", type=float, default=0.1)
-    parser.add_argument("--center_on_t0", action="store_true")
+    parser.add_argument("--num_epochs", type=int, default=100)
+    parser.add_argument("--cadence", type=float, default=1.0, help="Cadence in hours")
+    parser.add_argument("--t0", type=float, default=36.0, help="Peak time in days")
+    parser.add_argument("--tE", type=float, default=20.0, help="Einstein time in days")
+    parser.add_argument("--u0", type=float, default=0.1, help="Impact parameter")
+    parser.add_argument("--off_center", action="store_true", help="Don't center on t0")
     parser.add_argument("--format", choices=["fits", "npy"], default="fits")
+    parser.add_argument("--psf_library", default="master_psf_library.pt")
     args = parser.parse_args()
 
     config = load_config(args.config)
     data_cfg = config["data_params"]
-    stage0_cfg = config["curriculum"]["stage0"]
     
-    mosaic_size = args.mosaic_size or stage0_cfg["mosaic_params"].get("mosaic_size", 1024)
+    mosaic_size = args.mosaic_size
     n_library_psfs = data_cfg.get("n_library_psfs", 100)
     read_noise = data_cfg["physics_params"].get("read_noise", 5.0)
     pixel_scale = data_cfg["physics_params"].get("pixel_scale", 0.11)
@@ -145,41 +145,48 @@ def main():
     
     os.makedirs(args.outdir, exist_ok=True)
     
-    # --- Step A: Generate Catalog ---
+    # --- Step A: Load/Generate PSF Library ---
+    if os.path.exists(args.psf_library):
+        print(f"🛰️ Loading PSF Library from {args.psf_library}")
+        master_data = torch.load(args.psf_library, map_location='cpu', weights_only=True)
+        if torch.is_tensor(master_data):
+            data = master_data.squeeze().float().numpy()
+            n_comp = data.shape[0] - 1
+            s = int(data.shape[1]**0.5)
+            # Use mean PSF as the template for all stars for this test stack
+            mean_psf = data[n_comp].reshape(s, s)
+            kb = np.repeat(mean_psf[np.newaxis, ...], n_library_psfs, axis=0)
+        else:
+            # Fallback to analytical if dict format but not what we expect
+            kb = generate_elliptical_psf_library(num_psfs=n_library_psfs)
+    else:
+        kb = generate_elliptical_psf_library(num_psfs=n_library_psfs)
+
+    # --- Step B: Generate Catalog ---
     print(f"🌌 Generating background catalog for {mosaic_size}x{mosaic_size} field...")
     n_stars_base = int(np.random.uniform(data_cfg['min_stars'], data_cfg['max_stars']))
     area_ratio = (mosaic_size / 256)**2
     n_stars_total = int(n_stars_base * area_ratio)
     
-    rc_loc = np.random.uniform(14.5, 16.5)
-    rc_scale = np.random.uniform(0.2, 0.5)
-    rc_enhancement = np.random.uniform(5.0, 15.0)
-    lf_gamma = np.random.uniform(0.25, 0.35)
-    
-    mags = sample_bulge_magnitudes(n_stars_total, rc_loc, rc_scale, rc_enhancement, m_min=12.0, m_max=32.0, gamma=lf_gamma)
+    lf_p = data_cfg["lf_params"]
+    mags = sample_bulge_magnitudes(n_stars_total, lf_p["rc_loc_min"], lf_p["rc_scale_min"], lf_p["rc_enh_min"], m_min=lf_p["m_min"], m_max=lf_p["m_max"], gamma=lf_p["gamma_min"])
     fluxes = exp_time * (10 ** (-0.4 * (mags - zp)))
     x_centers = np.random.uniform(0, mosaic_size, len(mags))
     y_centers = np.random.uniform(0, mosaic_size, len(mags))
     psf_indices = np.random.randint(0, n_library_psfs, size=len(mags))
     
-    # --- Step B: Target Selection ---
-    center = mosaic_size / 2
-    dist_from_center = np.sqrt((x_centers - center)**2 + (y_centers - center)**2)
-    central_mask = dist_from_center < (mosaic_size * 0.2)
-    
-    if central_mask.any():
-        target_idx = np.where(central_mask)[0][np.argmin(np.abs(mags[central_mask] - args.target_mag))]
-    else:
-        target_idx = np.argmin(np.abs(mags - args.target_mag))
+    # --- Step C: Target Selection ---
+    # Center target star in the image
+    target_idx = np.argmin(np.abs(mags - args.target_mag))
+    x_centers[target_idx] = mosaic_size / 2.0
+    y_centers[target_idx] = mosaic_size / 2.0
         
     print(f"🎯 Selected Target Star: Mag={mags[target_idx]:.3f} at ({x_centers[target_idx]:.1f}, {y_centers[target_idx]:.1f})")
     
-    # --- Step C: Optimized Rendering Strategy ---
-    kb = generate_elliptical_psf_library(num_psfs=n_library_psfs)
     sky_level = (10 ** (-0.4 * (sky_mag - zp))) * (pixel_scale**2) * exp_time
     
     # 1. Render all stars EXCEPT the target once
-    print("🎬 Rendering static background field (this may take a minute)...")
+    print("🎬 Rendering static background field...")
     static_mask = np.ones(len(mags), dtype=bool)
     static_mask[target_idx] = False
     
@@ -194,7 +201,8 @@ def main():
     
     # --- Step D: Time Series Loop ---
     cadence_days = args.cadence / 24.0
-    if args.center_on_t0:
+    if not args.off_center:
+        # Centered on t0
         times = (args.t0 - (args.num_epochs // 2) * cadence_days) + np.arange(args.num_epochs) * cadence_days
     else:
         times = np.arange(args.num_epochs) * cadence_days
@@ -204,14 +212,17 @@ def main():
         "u0": args.u0, "tE": args.tE, "t0": args.t0,
         "target_id": int(target_idx), "target_x": float(x_centers[target_idx]),
         "target_y": float(y_centers[target_idx]), "base_mag": float(mags[target_idx]),
-        "base_flux": float(fluxes[target_idx])
+        "base_flux": float(fluxes[target_idx]), "times": times.tolist()
     }
     with open(os.path.join(args.outdir, "event_params.json"), "w") as f:
         json.dump(event_params, f, indent=4)
     
+    # Center RA/Dec for WCS
     wcs = create_roman_wcs(mosaic_size, pixel_scale)
     
-    print(f"🎬 Generating {len(times)} epochs using optimized stamp modulation...")
+    print(f"🎬 Generating {len(times)} epochs centered on t0={args.t0}...")
+    
+    # For FITS format, we can also save as a single cube if requested, but for now individual files match existing script
     for i, t in enumerate(tqdm(times)):
         A = paczynski_magnification(t, args.t0, args.tE, args.u0)
         
@@ -227,11 +238,12 @@ def main():
             header = wcs.to_header()
             header['EXPTIME'], header['ZP'], header['SKYMAG'] = exp_time, zp, sky_mag
             header['MAGNIF'], header['EPOCH_T'] = A, t
+            header['OBJ_X'], header['OBJ_Y'] = x_centers[target_idx], y_centers[target_idx]
             fits.PrimaryHDU(data=noisy_image, header=header).writeto(os.path.join(args.outdir, f"epoch_{i:04d}.fits"), overwrite=True)
         else:
             np.save(os.path.join(args.outdir, f"epoch_{i:04d}.npy"), noisy_image)
     
-    print(f"✨ Success! Results in: {args.outdir}")
+    print(f"✨ Success! Microlensing stack ready in: {args.outdir}")
 
 if __name__ == "__main__":
     main()
