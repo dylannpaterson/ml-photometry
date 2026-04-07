@@ -104,34 +104,48 @@ def visualize_mosaic_optimized(mosaic_idx=0, data_dir="data/bulge_stage0_full/mo
 
     # --- 4. Save to FITS ---
     from astropy.io import fits
+    from astropy.wcs import WCS
     fits_path = "optimized_mosaic_validation.fits"
     
+    # Create WCS for the Bulge (RA/Dec)
+    w = WCS(naxis=2)
+    # Center of 1024x1024 mosaic
+    w.wcs.crpix = [512.5, 512.5]
+    # Random Bulge Coordinate (near Galactic Center)
+    w.wcs.crval = [266.417, -29.008] 
+    # Roman Pixel Scale: 0.11 arcsec = 0.11/3600 degrees
+    scale = 0.11 / 3600.0
+    w.wcs.cdelt = [-scale, scale] # RA increases to the left
+    w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    
+    header = w.to_header()
+    header['EXTNAME'] = 'NOISY_OBS'
+    header['EXPTIME'] = exp_time
+    header['ZP'] = zp
+    header['SKYMAG'] = sky_mag
+    header['MEDIAN'] = chunk_median
+
     # Primary HDU: Noisy observation
-    primary_hdu = fits.PrimaryHDU(img_noisy)
-    primary_hdu.header['EXTNAME'] = 'NOISY_OBS'
-    primary_hdu.header['EXPTIME'] = exp_time
-    primary_hdu.header['ZP'] = zp
-    primary_hdu.header['SKYMAG'] = sky_mag
-    primary_hdu.header['MEDIAN'] = chunk_median
+    primary_hdu = fits.PrimaryHDU(img_noisy, header=header)
     
     # Extension 1: Clean physics
-    clean_hdu = fits.ImageHDU(star_signal, name='CLEAN_PHYSICS')
+    clean_hdu = fits.ImageHDU(star_signal, name='CLEAN_PHYSICS', header=header)
     
     # Extension 2: Network input (Stretched)
-    stretched_hdu = fits.ImageHDU(network_input, name='NETWORK_INPUT')
+    stretched_hdu = fits.ImageHDU(network_input, name='NETWORK_INPUT', header=header)
     
     # Extension 3: Star density map
-    h, w = star_signal.shape
+    h, w_size = star_signal.shape
     star_map, _, _ = np.histogram2d(
         y, x, 
-        bins=[h, w], 
-        range=[[0, h], [0, w]]
+        bins=[h, w_size], 
+        range=[[0, h], [0, w_size]]
     )
-    star_hdu = fits.ImageHDU(star_map.astype(np.float32), name='STAR_DENSITY')
+    star_hdu = fits.ImageHDU(star_map.astype(np.float32), name='STAR_DENSITY', header=header)
     
     hdul = fits.HDUList([primary_hdu, clean_hdu, stretched_hdu, star_hdu])
     hdul.writeto(fits_path, overwrite=True)
-    print(f"✅ Mosaic saved to FITS: {fits_path}")
+    print(f"✅ Mosaic saved to FITS with WCS: {fits_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Visualize optimized mosaic")
