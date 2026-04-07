@@ -165,8 +165,19 @@ def generate_mosaic(idx, output_dir, params, mosaic_size, cell_size, master_psf_
         if is_bright.any():
             b_px, b_py, b_f = px[is_bright], py[is_bright], fluxes[is_bright]
             b_weights = psf_weights_lib[all_psf_indices[is_bright]]
-            correction_stamps = (b_weights @ eigen_psfs.reshape(N_PCA_COMPONENTS, -1)).reshape(-1, SHAPE_SIZE, SHAPE_SIZE)
-            _numpy_paint_hybrid(full_image, b_px, b_py, b_f, correction_stamps)
+            
+            # BATCHED PAINTING: Avoid MemoryError on huge mosaics
+            num_bright = len(b_px)
+            batch_size_stars = 10000 
+            for start_idx in range(0, num_bright, batch_size_stars):
+                end_idx = min(start_idx + batch_size_stars, num_bright)
+                batch_weights = b_weights[start_idx:end_idx]
+                
+                # Compute stamps for this batch only
+                correction_stamps = (batch_weights @ eigen_psfs.reshape(N_PCA_COMPONENTS, -1)).reshape(-1, SHAPE_SIZE, SHAPE_SIZE)
+                
+                # Paint this batch
+                _numpy_paint_hybrid(full_image, b_px[start_idx:end_idx], b_py[start_idx:end_idx], b_f[start_idx:end_idx], correction_stamps)
         v_mask = mags < mag_limit
         x_v, y_v, flux_v, mag_v, psf_indices = px[v_mask], py[v_mask], fluxes[v_mask], mags[v_mask], all_psf_indices[v_mask]
         final_weights_v = psf_weights_lib[psf_indices]
