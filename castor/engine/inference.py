@@ -199,10 +199,18 @@ class InferenceEngine:
         hdul.writeto(fits_path, overwrite=True)
 
         # Statistics
-        matched_true_mags = [np.log10(true_catalogue[m[0]][3] + 1e-9) for m in matches]
-        matched_pred_mags = [np.log10(detected_stars[m[1]][2] + 1e-9) for m in matches]
-        all_true_mags = [np.log10(s[3] + 1e-9) for s in true_catalogue]
-        missed_true_mags = [np.log10(true_catalogue[i][3] + 1e-9) for i in range(len(true_catalogue)) if i not in matched_true_indices]
+        physics_cfg = self.config.get("data_params", {}).get("physics_params", {})
+        zp = physics_cfg.get("zp", 26.5)
+        exp_time = physics_cfg.get("exp_time_min", 30.0) # Using min as representative if not fixed
+
+        def flux_to_mag(f):
+            # m = ZP - 2.5 * log10(flux / EXPTIME)
+            return zp - 2.5 * np.log10(np.maximum(f, 1e-9) / exp_time)
+
+        matched_true_mags = [flux_to_mag(true_catalogue[m[0]][3]) for m in matches]
+        matched_pred_mags = [flux_to_mag(detected_stars[m[1]][2]) for m in matches]
+        all_true_mags = [flux_to_mag(s[3]) for s in true_catalogue]
+        missed_true_mags = [flux_to_mag(true_catalogue[i][3]) for i in range(len(true_catalogue)) if i not in matched_true_indices]
 
         # Figure Layout
         fig = plt.figure(figsize=(30, 24))
@@ -268,13 +276,16 @@ class InferenceEngine:
             ax8.scatter(matched_true_mags, matched_pred_mags, alpha=0.5, s=10)
             m_all = matched_true_mags + matched_pred_mags
             ax8.plot([min(m_all), max(m_all)], [min(m_all), max(m_all)], 'r--', alpha=0.8)
-            ax8.set_title("Photometry Accuracy"); ax8.set_xlabel("True log10(Flux)"); ax8.set_ylabel("Pred log10(Flux)"); ax8.grid(True, alpha=0.3)
+            ax8.set_title("Photometry Accuracy"); ax8.set_xlabel("True Magnitude"); ax8.set_ylabel("Pred Magnitude")
+            ax8.invert_xaxis(); ax8.invert_yaxis(); ax8.grid(True, alpha=0.3)
 
         if all_true_mags:
             ax_hist = fig.add_subplot(gs[3, 1])
-            m_p10 = [np.log10(s[2] + 1e-9) for s in predicted_stars if s[3] >= 0.1]
+            m_p10 = [flux_to_mag(s[2]) for s in predicted_stars if s[3] >= 0.1]
             ax_hist.hist(all_true_mags, bins=30, alpha=0.2, label='Truth', color='black')
-            ax_hist.hist(m_p10, bins=30, alpha=0.4, label='p >= 0.1', histtype='step'); ax_hist.set_title("LF Recovery"); ax_hist.legend(); ax_hist.grid(True, alpha=0.2)
+            ax_hist.hist(m_p10, bins=30, alpha=0.4, label='p >= 0.1', histtype='step')
+            ax_hist.set_title("LF Recovery"); ax_hist.set_xlabel("Magnitude"); ax_hist.invert_xaxis()
+            ax_hist.legend(); ax_hist.grid(True, alpha=0.2)
 
         # Threshold Trade-off
         if true_catalogue and predicted_stars:
