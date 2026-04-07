@@ -1,5 +1,7 @@
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg') # Headless Backend
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 import os
