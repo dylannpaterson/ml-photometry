@@ -103,3 +103,22 @@ The pipeline uses a multi-stage curriculum to build a robust foundation model fo
 *   **Objective:** Master the specific artifacts and complex PSF of the Roman Space Telescope.
 *   **Data:** Real mission-simulated data from **Romanisim** including geometric distortion, inter-pixel capacitance (IPC), and time-varying PSFs.
 *   **Goal:** Exceed Mission Acceptance Criteria for the Galactic Bulge Time Domain Survey.
+
+## 8. Model Handover Workflow (Castor to Pollux)
+To ensure seamless transition from training (Castor) to production (Pollux), the pipeline employs a strict ONNX-based handover protocol.
+
+### 1. Baked-in Preprocessing
+To eliminate the "preprocessing gap," all image standardization steps are moved directly into the exported ONNX graph via a `HandoverWrapper`. 
+*   **Input:** Raw observed ADU values ($256 \times 256 \times 1$).
+*   **Internal Ops:**
+    1.  **Median Subtraction:** Computes the median per image using an ONNX-compatible sort-and-index operation.
+    2.  **Arcsinh Stretch:** Applies $I_{norm} = \text{asinh}((I_{raw} - \text{median}) / 10.0)$ within the graph.
+*   **Benefit:** Pollux remains "ignorant" of PyTorch and simply passes raw pixel arrays to the ONNX runtime.
+
+### 2. Artifact Versioning
+Model files are never named generically. The export script (`scripts/export_onnx.py`) automatically appends the short Git commit hash of the code used to generate the model (e.g., `stage0_a1b2c3.onnx`). This creates a permanent, traceable link between a specific photometric measurement in production and the exact code state in the training repository.
+
+### 3. The Parity Test
+Every handover includes a set of parity tensors (`test_input.npy`, `test_output_stars.npy`, `test_output_bg.npy`).
+*   **Verification:** The `scripts/verify_handover.py` tool loads these tensors, runs the ONNX model, and ensures the results match the PyTorch original within a strict tolerance ($\text{atol}=10^{-5}$). 
+*   **Requirement:** Parity verification is mandatory before any model artifact is deployed to Pollux.

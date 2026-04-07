@@ -8,11 +8,21 @@ __pycache__/
 checkpoints/
 *.log
 training.log_*
+*.out
 
-# Visualization outputs
+# Visualizations
 *.png
 visualization_bulge.png
 inference_comparison.png
+
+# Handover Artifacts
+artifacts/
+
+# Pytorch / Model Binaries
+*.pt
+*.pth
+*.onnx
+*.npy
 
 # Environment files
 .env
@@ -24,6 +34,7 @@ env.bak/
 venv.bak/
 .vscode
 
+# Data and large fits
 /data
 *.tar.gz
 *.asdf
