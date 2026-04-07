@@ -211,14 +211,17 @@ class DenseGridModel(nn.Module):
         
         # NEW: Predict in log-space, but output raw physical flux
         raw_log_flux = star_out[..., 3:4]
-        # CRITICAL: Clamp before exp() to prevent exploding gradients during early epochs
-        raw_log_flux = torch.clamp(raw_log_flux, min=-10.0, max=22.0) 
+        # Cap log flux to ~8.8 million (e^16) instead of 3.5 billion to prevent exponential explosion
+        raw_log_flux = torch.clamp(raw_log_flux, min=-10.0, max=16.0) 
         # FIX: Force float32 evaluation to prevent FP16 overflow on bright stars
         flux = torch.exp(raw_log_flux.float())
         
         # NEW: Uncertainty Estimates (Log-variance)
         # log_var_x (4), log_var_y (5), log_var_m (6)
         log_vars = star_out[..., 4:7]
+        # Clamp log_vars to prevent the NLL precision multiplier (exp(-log_var)) from hitting inf.
+        # min=-10 limits precision to ~22k, max=20 allows for large uncertainty on bright stars.
+        log_vars = torch.clamp(log_vars, min=-10.0, max=20.0) 
         
         # Background residuals can be negative
         bg = bg_out.permute(0, 2, 3, 1)

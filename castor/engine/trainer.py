@@ -166,7 +166,7 @@ class Trainer:
                 # 3. Scaled Backward Pass
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
                 
                 # Only step scheduler if scaler didn't skip the optimizer step
                 scale_before = self.scaler.get_scale()
