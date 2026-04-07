@@ -192,59 +192,67 @@ class DenseGridModel(nn.Module):
         p2 = self.fpn2(c2, p3)
         p1 = self.fpn1(c1, p2) # Final 64x64 features
 
-        out = self.head(p1)
-        
-        B, C, H, W = out.shape
-        star_out = out[:, :-1, :, :]
-        bg_out = out[:, -1:, :, :]
-        
-        star_out = star_out.view(B, self.K, 7, H, W)
-        star_out = star_out.permute(0, 3, 4, 1, 2)
-        
-        # --- THE LOGIT BYPASS ---
-        p_logits = star_out[..., 0:1] # Keep raw logits
-        p = torch.sigmoid(p_logits)   # Standard probability for inference
-        # ------------------------
-        
-        dx = torch.sigmoid(star_out[..., 1:2]) * self.cell_size
-        dy = torch.sigmoid(star_out[..., 2:3]) * self.cell_size
-        
-        # NEW: Predict in log-space, but output raw physical flux
-        raw_log_flux = star_out[..., 3:4]
-        # Cap log flux to ~8.8 million (e^16) instead of 3.5 billion to prevent exponential explosion
-        raw_log_flux = torch.clamp(raw_log_flux, min=-10.0, max=16.0) 
-        # FIX: Force float32 evaluation to prevent FP16 overflow on bright stars
-        flux = torch.exp(raw_log_flux.float())
-        
-        # NEW: Uncertainty Estimates (Log-variance)
-        # log_var_x (4), log_var_y (5), log_var_m (6)
-        log_vars = star_out[..., 4:7]
-        # SOLUTION: The Physical Noise Floor
-        # We clamp log_vars to a physical minimum of -3.0. This restricts the precision 
-        # multiplier exp(-log_var) to ~20.0, preventing gradient explosions in FP16/AMP
-        # while reflecting the inherent instrument read noise floor.
-        log_vars = torch.clamp(log_vars, min=-3.0, max=20.0) 
-        
-        # Background residuals can be negative
-        bg = bg_out.permute(0, 2, 3, 1)
-        
-        return {
-            "stars": torch.cat([p, dx, dy, flux, log_vars], dim=-1),
-            "p_logits": p_logits,
-            "raw_log_flux": raw_log_flux,
-            "log_vars": log_vars,
-            "background": bg
-        }
+        # --- THE FP32 HEAD BYPASS ---
+        # Disable autocast for the sensitive final convolutions to prevent FP16 gradient overflow
+        with torch.autocast(device_type=p1.device.type, enabled=False):
+            p1_fp32 = p1.float()
+            out = self.head(p1_fp32)
+            
+            B, C, H, W = out.shape
+            star_out = out[:, :-1, :, :]
+            bg_out = out[:, -1:, :, :]
+            
+            star_out = star_out.view(B, self.K, 7, H, W)
+            star_out = star_out.permute(0, 3, 4, 1, 2)
+            
+            # --- THE LOGIT BYPASS ---
+            p_logits = star_out[..., 0:1] # Keep raw logits
+            p = torch.sigmoid(p_logits)   # Standard probability for inference
+            # ------------------------
+            
+            dx = torch.sigmoid(star_out[..., 1:2]) * self.cell_size
+            dy = torch.sigmoid(star_out[..., 2:3]) * self.cell_size
+            
+            # NEW: Predict in log-space, but output raw physical flux
+            raw_log_flux = star_out[..., 3:4]
+            # Cap log flux to ~8.8 million (e^16) instead of 3.5 billion to prevent exponential explosion
+            raw_log_flux = torch.clamp(raw_log_flux, min=-10.0, max=16.0) 
+            flux = torch.exp(raw_log_flux)
+            
+            # NEW: Uncertainty Estimates (Log-variance)
+            # log_var_x (4), log_var_y (5), log_var_m (6)
+            log_vars = star_out[..., 4:7]
+            # SOLUTION: The Safety Net
+            # We relax the clamp to -15.0 (sigma ~ 0.0005) thanks to Beta-NLL and the FP32 Bypass.
+            # This allows effectively zero variance for high-SNR targets while remaining numerically stable.
+            log_vars = torch.clamp(log_vars, min=-15.0, max=20.0) 
+            
+            # Background residuals can be negative
+            bg = bg_out.permute(0, 2, 3, 1)
+            
+            return {
+                "stars": torch.cat([p, dx, dy, flux, log_vars], dim=-1),
+                "p_logits": p_logits,
+                "raw_log_flux": raw_log_flux,
+                "log_vars": log_vars,
+                "background": bg
+            }
 
-def compute_nll_loss(pred, target, log_var):
+def compute_nll_loss(pred, target, log_var, beta=0.5):
     """
-    Calculates the Gaussian Negative Log-Likelihood.
-    log_var = ln(sigma^2). We use exp(-log_var) which equals 1/sigma^2
+    Calculates Beta-NLL to tame gradient explosions for high-SNR targets.
+    beta=0.5 balances the gradients while strictly preserving the Gaussian likelihood.
     """
     precision = torch.exp(-log_var)
-    # 0.5 * (precision * (pred - target)**2 + log_var)
+    # 1. Standard Gaussian NLL
     loss = 0.5 * (precision * (pred - target)**2 + log_var)
-    return loss.mean()
+    
+    # 2. Scale by detached variance^beta
+    # Detaching ensures we don't alter the optimization target for the variance itself
+    var_detached = torch.exp(log_var.detach())
+    beta_scale = var_detached ** beta
+    
+    return (loss * beta_scale).mean()
 
 def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=5.0, lambda_pos=50.0, lambda_flux=5.0, lambda_bg=0.1, focal_alpha=0.75, focal_gamma=2.0, stretch_scale=GLOBAL_STRETCH_SCALE):
     """
