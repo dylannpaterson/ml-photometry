@@ -8,12 +8,13 @@ import os
 import argparse
 from scipy.ndimage import map_coordinates
 from castor.data.transforms import AstroSpaceTransform
-from castor.constants import GLOBAL_STRETCH_SCALE
+from castor.constants import GLOBAL_STRETCH_SCALE, SHAPE_SIZE, N_PCA_COMPONENTS
 
 def visualize_mosaic_optimized(mosaic_idx=0, data_dir="data/bulge_stage0_full/mosaics"):
     img_path = os.path.join(data_dir, f"mosaic_{mosaic_idx:03d}_img.npy")
     cat_path = os.path.join(data_dir, f"mosaic_{mosaic_idx:03d}_cat.npy")
     meta_path = os.path.join(data_dir, f"mosaic_{mosaic_idx:03d}_meta.npy")
+    lib_path = os.path.join(data_dir, f"mosaic_{mosaic_idx:03d}_psf_lib.npy")
     
     if not os.path.exists(img_path):
         print(f"Error: Mosaic not found at {img_path}")
@@ -24,6 +25,21 @@ def visualize_mosaic_optimized(mosaic_idx=0, data_dir="data/bulge_stage0_full/mo
     structured_cat = np.load(cat_path)
     meta = np.load(meta_path)
     
+    # Load PSF Library to get actual peak and area
+    if os.path.exists(lib_path):
+        psf_lib = np.load(lib_path)
+        # psf_lib contains [eigen_psfs_1x, mean_psf_1x], all peak-normalized
+        mean_psf_1x = psf_lib[-1].reshape(SHAPE_SIZE, SHAPE_SIZE)
+        eigen_psfs_1x = psf_lib[:-1].reshape(N_PCA_COMPONENTS, SHAPE_SIZE, SHAPE_SIZE)
+        
+        # N_eff from peak-normalized PSF
+        eff_area = np.sum(mean_psf_1x ** 2)
+        print(f"📊 Using PSF from library: eff_area={eff_area:.2f}")
+    else:
+        # Fallback
+        eff_area = 5.5
+        print(f"⚠️ PSF library not found, using default eff_area.")
+
     exp_time, zp, sky_mag = meta[0], meta[1], meta[2]
     sky_level = (10 ** (-0.4 * (sky_mag - zp))) * (0.11**2) * exp_time
     
@@ -35,18 +51,40 @@ def visualize_mosaic_optimized(mosaic_idx=0, data_dir="data/bulge_stage0_full/mo
     transform = AstroSpaceTransform(stretch_scale=GLOBAL_STRETCH_SCALE)
     network_input = transform.image_to_network(img_noisy, chunk_median)
 
-    # --- 2. Correct SNR Filtering (Matching Dataset) ---
-    n_pix = 4 * np.pi * (1.5 ** 2)
-    psf_peak = 1.0 / (2 * np.pi * 1.5**2)
-    
+    # --- 2. Rigorous SNR Extraction ---
     fluxes = structured_cat['flux']
     x, y = structured_cat['x'], structured_cat['y']
+    x0, y0 = np.floor(x).astype(int), np.floor(y).astype(int)
     
-    # Sub-pixel sample background from baked physics
-    total_local_light = map_coordinates(star_signal, [y, x], order=1, mode='nearest')
-    local_background = np.maximum(0, total_local_light - (fluxes * psf_peak))
+    # Extract true center-pixel light
+    actual_pixel_values = star_signal[y0, x0]
     
-    noise_var = fluxes + n_pix * (sky_level + local_background + 25.0)
+    # Approximate phase-dependent peak (using lib values)
+    # For Roman PSF, min_peak/max_peak usually within ~20%
+    # We use lib mean peak as max_peak (it's normalized to 1)
+    max_peak = 1.0
+    min_peak = 0.7 # Approximation
+    
+    dx_sub = x - x0
+    dy_sub = y - y0
+    dist_from_pixel_center = np.sqrt((dx_sub - 0.5)**2 + (dy_sub - 0.5)**2)
+    phase_dependent_peak = max_peak - (max_peak - min_peak) * (dist_from_pixel_center / 0.7071)
+    
+    # Include PCA weights
+    weights = np.column_stack([structured_cat[f'w{i}'] for i in range(N_PCA_COMPONENTS)])
+    half = SHAPE_SIZE // 2
+    
+    # Correct confusion noise subtraction
+    # confusion = total light - star's own light
+    # We need the ACTUAL peak for this star
+    star_own_peak_frac = phase_dependent_peak.copy()
+    if os.path.exists(lib_path):
+        # Add PCA component contribution to peak
+        for i in range(len(fluxes)):
+            star_own_peak_frac[i] += np.dot(weights[i], eigen_psfs_1x[:, half, half])
+
+    confusion_light = np.maximum(0.0, actual_pixel_values - (fluxes * star_own_peak_frac))
+    noise_var = fluxes + eff_area * (sky_level + confusion_light + 25.0)
     snrs = fluxes / np.sqrt(noise_var)
     
     # Identify model targets

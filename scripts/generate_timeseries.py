@@ -10,7 +10,7 @@ from castor.cloud.config_utils import load_config
 from castor.data.stage0_gaussian import sample_bulge_magnitudes
 from castor.constants import GLOBAL_STRETCH_SCALE, SHAPE_SIZE, N_PCA_COMPONENTS
 from scipy.signal import fftconvolve
-from scipy.ndimage import map_coordinates
+from scipy.ndimage import shift
 
 # Astronomical Libraries
 from astropy.io import fits
@@ -25,7 +25,6 @@ def paczynski_magnification(t, t0, tE, u0):
 def create_roman_wcs(mosaic_size, RA=266.417, Dec=-29.008, pixel_scale=0.11, crpix_offset=[0, 0]):
     """ Creates a WCS for a Roman-like mosaic with optional crpix offset for drift. """
     w = WCS(naxis=2)
-    # Note: FITS pixels are 1-indexed, crpix usually refers to center of pixel (0.5)
     w.wcs.crpix = [mosaic_size / 2.0 + crpix_offset[0], mosaic_size / 2.0 + crpix_offset[1]]
     w.wcs.cdelt = [-pixel_scale / 3600.0, pixel_scale / 3600.0]
     w.wcs.crval = [RA, Dec]
@@ -124,20 +123,33 @@ def render_numpy_fidelity(x, y, fluxes, mags, psf_indices, eigen_psfs, mean_psf,
             _paint_stamps(full_image, b_x[s_idx:e_idx], b_y[s_idx:e_idx], b_f[s_idx:e_idx], correction_stamps)
     return full_image
 
-def get_star_stamp_pca(x, y, flux, weights, eigen_psfs, mean_psf, mosaic_size):
-    psf = mean_psf + (weights @ eigen_psfs.reshape(N_PCA_COMPONENTS, -1)).reshape(SHAPE_SIZE, SHAPE_SIZE)
-    psf = np.maximum(0, psf); psf /= (psf.sum() + 1e-9)
-    half = SHAPE_SIZE // 2; ix, iy = int(x), int(y); dx, dy = x - ix, y - iy
-    phase_map = np.zeros((SHAPE_SIZE + 1, SHAPE_SIZE + 1), dtype=np.float32)
-    phase_map[half, half], phase_map[half, half+1], phase_map[half+1, half], phase_map[half+1, half+1] = flux*(1-dx)*(1-dy), flux*dx*(1-dy), flux*(1-dx)*dy, flux*dx*dy
-    stamp = fftconvolve(phase_map, psf, mode='same')
-    y0, y1, x0, x1 = iy - half, iy - half + stamp.shape[0], ix - half, ix - half + stamp.shape[1]
-    return stamp, y0, y1, x0, x1
+def render_star_at_phase(image, x, y, flux, psf):
+    """ High-fidelity star injection with sub-pixel bilinear phase mapping. """
+    H, W = image.shape
+    S = psf.shape[0]; half = S // 2
+    ix, iy = int(np.floor(x)), int(np.floor(y))
+    dx, dy = x - ix, y - iy
+    
+    # 2x2 bilinear weights for the four integer corners
+    weights = [(1-dx)*(1-dy), dx*(1-dy), (1-dx)*dy, dx*dy]
+    offsets = [(0,0), (0,1), (1,0), (1,1)]
+    
+    for (oy, ox), w in zip(offsets, weights):
+        if w <= 0: continue
+        iy_off, ix_off = iy + oy, ix + ox
+        y0, y1 = max(0, iy_off - half), min(H, iy_off + half + 1)
+        x0, x1 = max(0, ix_off - half), min(W, ix_off + half + 1)
+        
+        sy0, sy1 = half - (iy_off - y0), half + (y1 - iy_off)
+        sx0, sx1 = half - (ix_off - x0), half + (x1 - ix_off)
+        
+        if sy1 > sy0 and sx1 > sx0:
+            image[y0:y1, x0:x1] += (flux * w) * psf[sy0:sy1, sx0:sx1]
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config/config.yaml")
-    parser.add_argument("--outdir", default="data/microlensing_stack_drift")
+    parser.add_argument("--outdir", default="data/microlensing_stack_smooth")
     parser.add_argument("--mosaic_size", type=int, default=512)
     parser.add_argument("--target_mag", type=float, default=21.0)
     parser.add_argument("--num_epochs", type=int, default=1000)
@@ -161,79 +173,61 @@ def main():
     cos, sin = np.cos(t_jit), np.sin(t_jit); gxp, gyp = gx * cos + gy * sin, -gx * sin + gy * cos
     jitter_kernel = np.exp(-(gxp**2 / (2 * s_jit**2) + gyp**2 / (2 * (s_jit * q_jit)**2))); jitter_kernel /= (jitter_kernel.sum() + 1e-9)
 
-    # --- CALCULATE MAX DRIFT ---
     cadence_days = args.cadence / 24.0
     times = (args.t0 - (args.num_epochs // 2) * cadence_days) + np.arange(args.num_epochs) * cadence_days
-    total_time_span = times.max() - times.min()
-    max_drift_pix = args.drift_rate * total_time_span
-    padding = int(max_drift_pix) + 10
+    max_drift = args.drift_rate * (times.max() - times.min())
+    padding = int(max_drift) + 20
     super_size = mosaic_size + padding * 2
 
-    print(f"🌌 Generating background catalog for {super_size} super-field (Drift: {args.drift_rate} px/day)...")
+    print(f"🌌 Rendering super-mosaic ({super_size}x{super_size})...")
     n_requested = int(np.random.uniform(data_cfg['min_stars'], data_cfg['max_stars']) * (super_size / 256)**2)
     mags = sample_bulge_magnitudes(n_requested, 15.5, 0.35, 10.0, m_min=12.0, m_max=32.0, gamma=0.3)
-    n_total = len(mags)
-    fluxes = exp_time * (10 ** (-0.4 * (mags - zp)))
+    n_total = len(mags); fluxes = exp_time * (10 ** (-0.4 * (mags - zp)))
     x_c, y_c, psf_idx = np.random.uniform(0, super_size, n_total), np.random.uniform(0, super_size, n_total), np.random.randint(0, n_lib, n_total)
     
     t_idx = np.argmin(np.abs(mags - args.target_mag))
-    
-    # Target Celestial Center
     target_RA, target_Dec = 266.417, -29.008
-    # Initial Super-mosaic position: center + small random subpixel offset
-    x_c[t_idx] = super_size / 2.0 + np.random.uniform(-0.5, 0.5)
-    y_c[t_idx] = super_size / 2.0 + np.random.uniform(-0.5, 0.5)
+    x_c[t_idx], y_c[t_idx] = super_size/2.0 + np.random.uniform(-0.5, 0.5), super_size/2.0 + np.random.uniform(-0.5, 0.5)
+    wcs_init = create_roman_wcs(mosaic_size, RA=target_RA, Dec=target_Dec, crpix_offset=[0, 0])
+    obj_ra, obj_dec = wcs_init.all_pix2world(x_c[t_idx] - padding, y_c[t_idx] - padding, 0)
+    print(f"🎯 Target Star: Mag={mags[t_idx]:.3f} at celestial ({obj_ra:.6f}, {obj_dec:.6f})")
     
-    # Calculate the target's celestial coordinates based on the initial WCS (at dt=0)
-    # At dt=0, x0=padding, y0=padding. 
-    # Frame coord at dt=0 is x_c[t_idx] - padding
-    initial_wcs = create_roman_wcs(mosaic_size, RA=target_RA, Dec=target_Dec, crpix_offset=[0, 0])
-    obj_ra, obj_dec = initial_wcs.all_pix2world(x_c[t_idx] - padding, y_c[t_idx] - padding, 0)
-    
-    print(f"🎯 Selected Target Star: Mag={mags[t_idx]:.3f} at celestial ({obj_ra:.6f}, {obj_dec:.6f})")
-    
-    print("🎬 Rendering static super-background field (High Fidelity)...")
     s_mask = np.ones(n_total, dtype=bool); s_mask[t_idx] = False
     static_super = render_numpy_fidelity(x_c[s_mask], y_c[s_mask], fluxes[s_mask], mags[s_mask], psf_idx[s_mask], eigen_psfs, mean_psf, psf_weights_lib, super_size, mag_limit)
-    t_stamp, sy0, sy1, sx0, sx1 = get_star_stamp_pca(x_c[t_idx], y_c[t_idx], fluxes[t_idx], psf_weights_lib[psf_idx[t_idx]], eigen_psfs, mean_psf, super_size)
+    target_psf = mean_psf + (psf_weights_lib[psf_idx[t_idx]] @ eigen_psfs.reshape(N_PCA_COMPONENTS, -1)).reshape(SHAPE_SIZE, SHAPE_SIZE)
+    target_psf = np.maximum(0, target_psf); target_psf /= (target_psf.sum() + 1e-9)
     
     sky_level = (10 ** (-0.4 * (sky_mag - zp))) * (0.11**2) * exp_time
     drift_vec = np.array([np.cos(np.radians(args.drift_angle)), np.sin(np.radians(args.drift_angle))]) * args.drift_rate
 
-    print(f"🎬 Generating {len(times)} epochs with Pointing Drift...")
+    print(f"🎬 Generating {len(times)} epochs with Buttery-Smooth Drift...")
     for i, t in enumerate(tqdm(times)):
         A = paczynski_magnification(t, args.t0, args.tE, args.u0)
-        dt = t - times[0]
-        curr_drift = drift_vec * dt
+        curr_drift = drift_vec * (t - times[0])
         
-        y0, x0 = int(padding + curr_drift[1]), int(padding + curr_drift[0])
-        y1, x1 = y0 + mosaic_size, x0 + mosaic_size
-        epoch_clean = static_super[y0:y1, x0:x1].copy()
+        # 1. Higher-Order Extraction
+        offset_y, offset_x = padding + curr_drift[1], padding + curr_drift[0]
+        y0_int, x0_int = int(np.round(offset_y)), int(np.round(offset_x))
+        dy_sub, dx_sub = offset_y - y0_int, offset_x - x0_int
         
-        cur_sy0, cur_sy1, cur_sx0, cur_sx1 = int(sy0 - y0), int(sy1 - y0), int(sx0 - x0), int(sx1 - x0)
-        st_y0, st_y1 = max(0, -cur_sy0), min(t_stamp.shape[0], mosaic_size - cur_sy0)
-        st_x0, st_x1 = max(0, -cur_sx0), min(t_stamp.shape[1], mosaic_size - cur_sx0)
-        ta_y0, ta_y1 = max(0, cur_sy0), min(mosaic_size, cur_sy1)
-        ta_x0, ta_x1 = max(0, cur_sx0), min(mosaic_size, cur_sx1)
+        epoch_crop = static_super[y0_int:y0_int+mosaic_size, x0_int:x0_int+mosaic_size]
+        epoch_clean = shift(epoch_crop, [-dy_sub, -dx_sub], order=3, mode='constant', cval=0.0)
         
-        if ta_y1 > ta_y0 and ta_x1 > ta_x0:
-            epoch_clean[ta_y0:ta_y1, ta_x0:ta_x1] += t_stamp[st_y0:st_y1, st_x0:st_x1] * A
+        # 2. Exact Phase Target Injection
+        frame_x, frame_y = x_c[t_idx] - offset_x, y_c[t_idx] - offset_y
+        render_star_at_phase(epoch_clean, frame_x, frame_y, fluxes[t_idx] * A, target_psf)
         
+        # 3. Jitter and Noise
         epoch_clean = fftconvolve(epoch_clean, jitter_kernel, mode='same')
         noisy = np.random.poisson(np.maximum(0, epoch_clean + sky_level)).astype(np.float32)
         noisy += np.random.normal(0, read_noise, noisy.shape)
         
-        # Synchronized WCS: Update CRPIX to keep celestial coords static
         wcs = create_roman_wcs(mosaic_size, RA=target_RA, Dec=target_Dec, crpix_offset=[-curr_drift[0], -curr_drift[1]])
-        header = wcs.to_header()
-        header.update({
+        header = wcs.to_header(); header.update({
             'EXPTIME': exp_time, 'ZP': zp, 'SKYMAG': sky_mag, 'MAGNIF': A, 'EPOCH_T': t, 
-            'OBJ_X': float(x_c[t_idx] - x0), 'OBJ_Y': float(y_c[t_idx] - y0),
-            'OBJ_RA': float(obj_ra), 'OBJ_DEC': float(obj_dec),
-            'DRIFT_X': curr_drift[0], 'DRIFT_Y': curr_drift[1]
-        })
+            'OBJ_X': float(frame_x), 'OBJ_Y': float(frame_y), 'OBJ_RA': float(obj_ra), 'OBJ_DEC': float(obj_dec)})
         fits.PrimaryHDU(data=noisy, header=header).writeto(os.path.join(args.outdir, f"epoch_{i:04d}.fits"), overwrite=True)
     
-    print(f"✨ Success! Drifting stack ready in: {args.outdir}")
+    print(f"✨ Success! Smooth drifting stack ready in: {args.outdir}")
 
 if __name__ == "__main__": main()

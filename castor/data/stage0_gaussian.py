@@ -87,7 +87,7 @@ class GaussianPretrainingProvider(Dataset):
         
         if psf_library_path and os.path.exists(psf_library_path):
             print(f"📂 GaussianPretrainingProvider: Loading Master PSF Library from {psf_library_path}")
-            master_data = torch.load(psf_library_path, map_location='cpu', weights_only=True)
+            master_data = torch.load(psf_library_path, map_location='cpu', weights_only=False)
             if isinstance(master_data, dict):
                 self.eigen_psfs = master_data['eigen_psfs']
                 self.psf_weights_lib = master_data['weights_lib']
@@ -164,70 +164,142 @@ class GaussianPretrainingProvider(Dataset):
         else: exp_time, zp, sky_mag = exp_params
 
         pixel_scale, sky_level = 0.11, (10 ** (-0.4 * (sky_mag - zp))) * (0.11**2) * exp_time
-        n_stars_base = int(np.random.uniform(self.min_stars, self.max_stars))
+        # Adjust star counts for image size if they are meant for a larger area
+        # Assuming min_stars/max_stars are for a 4096x4096 area
+        area_ratio = (self.img_size / 4096.0)**2
+        n_stars_base = int(np.random.uniform(self.min_stars, self.max_stars) * area_ratio)
+        if n_stars_base < 100: n_stars_base = 10000 # Fallback for small chunks
+        
         mags = sample_bulge_magnitudes(n_stars_base, rc_loc, rc_scale, rc_enhancement, m_min=12.0, m_max=32.0, gamma=lf_gamma)
         fluxes = exp_time * (10 ** (-0.4 * (mags - zp)))
         sort_idx = np.argsort(fluxes)[::-1]
         fluxes, mags = fluxes[sort_idx], mags[sort_idx]
         x_centers, y_centers = np.random.uniform(0, self.img_size, len(mags)), np.random.uniform(0, self.img_size, len(mags))
         
-        # RENDERING ONLY: PCA Weights are still used to render realistic backgrounds
-        psf_indices = np.random.randint(0, 100, size=len(mags))
-        physical_weights = self.psf_weights_lib[psf_indices]
+        # 3. Enforce Spatial Correlation for PCA Weights
+        from scripts.generate_mosaics import compute_spatially_correlated_weights
+        physical_weights = compute_spatially_correlated_weights(x_centers, y_centers, self.img_size, self.psf_weights_lib)
 
-        # Hybrid Fast Rendering (NumPy Optimized)
+        # 4. Apply Jitter Before Pixelation
+        s_jit, q_jit, theta_jit = np.random.normal(0.127, 0.01), np.random.uniform(0.8, 1.0), np.random.uniform(0, np.pi)
+        O = 4 # Oversampling
+        S_jit_high = self.S * O
+        k_half_high = S_jit_high // 2
+        gy, gx = np.meshgrid(np.arange(S_jit_high) - k_half_high, np.arange(S_jit_high) - k_half_high, indexing='ij')
+        cos, sin = np.cos(theta_jit), np.sin(theta_jit)
+        s_jit_high = s_jit * O
+        gxp, gyp = gx * cos + gy * sin, -gx * sin + gy * cos
+        jitter_kernel_high = np.exp(-(gxp**2 / (2 * s_jit_high**2) + gyp**2 / (2 * (s_jit_high * q_jit)**2)))
+        jitter_kernel_high /= (jitter_kernel_high.sum() + 1e-9)
+
+        # We assume self.mean_psf and self.eigen_psfs are at 1x resolution here
+        # For true oversampling, they should be 4x. 
+        # If they are 1x, we'll upscale them first (simple but better than nothing)
+        # In a real run, the master library would already be 4x.
+        def get_upsampled(img, scale):
+            from scipy.ndimage import zoom
+            return zoom(img, scale, order=3)
+
+        if self.mean_psf.shape[0] == self.S:
+            mean_psf_4x = get_upsampled(self.mean_psf, O)
+            eigen_psfs_4x = np.array([get_upsampled(e, O) for e in self.eigen_psfs])
+        else:
+            mean_psf_4x = self.mean_psf
+            eigen_psfs_4x = self.eigen_psfs
+
+        mean_psf_jit_4x = fftconvolve(mean_psf_4x, jitter_kernel_high, mode='same')
+        eigen_psfs_jit_4x = np.array([fftconvolve(e, jitter_kernel_high, mode='same') for e in eigen_psfs_4x])
+
+        # Pre-compute 16 shifted 1x PSFs for the mean component
+        mean_psf_library = np.zeros((O, O, self.S, self.S), dtype=np.float32)
+        for dy_idx in range(O):
+            for dx_idx in range(O):
+                mean_psf_library[dy_idx, dx_idx] = mean_psf_jit_4x[dy_idx::O, dx_idx::O][:self.S, :self.S]
+
+        # Rendering
         x0, y0 = np.floor(x_centers).astype(int), np.floor(y_centers).astype(int)
-        dx, dy = x_centers - x0, y_centers - y0
-        valid = (x0 >= 0) & (x0 < self.img_size-1) & (y0 >= 0) & (y0 < self.img_size-1)
+        dx_idx = np.clip(np.floor((x_centers - x0) * O).astype(int), 0, O-1)
+        dy_idx = np.clip(np.floor((y_centers - y0) * O).astype(int), 0, O-1)
+        valid = (x0 >= 0) & (x0 < self.img_size) & (y0 >= 0) & (y0 < self.img_size)
         
-        # 1. Base grid for mean PSF pass
-        flat_indices = np.concatenate([y0[valid] * self.img_size + x0[valid], 
-                                       y0[valid] * self.img_size + x0[valid] + 1,
-                                       (y0[valid]+1) * self.img_size + x0[valid],
-                                       (y0[valid]+1) * self.img_size + x0[valid] + 1])
-        f_v = fluxes[valid]
-        vals = np.concatenate([f_v * (1-dx[valid]) * (1-dy[valid]), f_v * dx[valid] * (1-dy[valid]), f_v * (1-dx[valid]) * dy[valid], f_v * dx[valid] * dy[valid]])
-        base_grid_render = np.bincount(flat_indices, weights=vals, minlength=self.img_size*self.img_size).reshape(self.img_size, self.img_size)
-        star_signal = fftconvolve(base_grid_render, self.mean_psf, mode='same')
+        # 1. Replace Bilinear Grid Scattering with Oversampled PSF Stamping
+        # Fast Rendering using 16 sub-pixel grids
+        star_signal = np.zeros((self.img_size, self.img_size), dtype=np.float32)
+        for dyi in range(O):
+            for dxi in range(O):
+                mask = valid & (dx_idx == dxi) & (dy_idx == dyi)
+                if not mask.any(): continue
+                flat_indices = y0[mask] * self.img_size + x0[mask]
+                grid = np.bincount(flat_indices, weights=fluxes[mask], minlength=self.img_size*self.img_size).reshape(self.img_size, self.img_size)
+                star_signal += fftconvolve(grid, mean_psf_library[dyi, dxi], mode='same')
 
-        # 2. Correction pass
+        # 2. Correction pass for bright stars
         is_significant = fluxes > (5.0 * np.sqrt(fluxes + 100)) 
         if is_significant.any():
-            sig_weights = physical_weights[is_significant]
-            correction_stamps = (sig_weights @ self.eigen_psfs.reshape(self.n_pca, -1)).reshape(-1, self.S, self.S)
+            sig_indices = np.where(is_significant)[0]
+            sig_weights = physical_weights[sig_indices]
             half = self.S // 2
-            for i, idx_sig in enumerate(np.where(is_significant)[0]):
-                ix, iy, f = int(x_centers[idx_sig]), int(y_centers[idx_sig]), fluxes[idx_sig]
-                dx_s, dy_s = x_centers[idx_sig]-ix, y_centers[idx_sig]-iy
-                w00, w10, w01, w11 = (1-dx_s)*(1-dy_s), dx_s*(1-dy_s), (1-dx_s)*dy_s, dx_s*dy_s
+            for i, idx_sig in enumerate(sig_indices):
+                ix, iy, f = x0[idx_sig], y0[idx_sig], fluxes[idx_sig]
+                dxi, dyi = dx_idx[idx_sig], dy_idx[idx_sig]
+                
+                # Reconstruct oversampled jittered PSF for this star
+                weights = sig_weights[i]
+                high_psf = mean_psf_jit_4x + np.tensordot(weights, eigen_psfs_jit_4x, axes=1)
+                # Bin down with shift
+                stamp = high_psf[dyi::O, dxi::O][:self.S, :self.S]
                 
                 y0_s, y1_s = max(0, iy-half), min(self.img_size, iy+half+1)
                 x0_s, x1_s = max(0, ix-half), min(self.img_size, ix+half+1)
                 sy0, sy1 = half - (iy - y0_s), half + (y1_s - iy)
                 sx0, sx1 = half - (ix - x0_s), half + (x1_s - ix)
                 
-                stamp = correction_stamps[i][sy0:sy1, sx0:sx1] * f
-                star_signal[y0_s:y1_s, x0_s:x1_s] += stamp * w00 
+                # We subtract the mean contribution already added
+                star_signal[y0_s:y1_s, x0_s:x1_s] += (stamp[sy0:sy1, sx0:sx1] - mean_psf_library[dyi, dxi, sy0:sy1, sx0:sx1]) * f
 
-        # 3. Apply Global Jitter
-        s_jit, q_jit, theta_jit = np.random.normal(0.127, 0.01), np.random.uniform(0.8, 1.0), np.random.uniform(0, np.pi)
-        k_half = self.S // 2
-        gy, gx = np.meshgrid(np.arange(self.S) - k_half, np.arange(self.S) - k_half, indexing='ij')
-        cos, sin = np.cos(theta_jit), np.sin(theta_jit)
-        gxp, gyp = gx * cos + gy * sin, -gx * sin + gy * cos
-        jitter_kernel = np.exp(-(gxp**2 / (2 * s_jit**2) + gyp**2 / (2 * (s_jit * q_jit)**2)))
-        jitter_kernel /= (jitter_kernel.sum() + 1e-9)
-        star_signal = fftconvolve(star_signal, jitter_kernel, mode='same')
         star_signal = np.maximum(0, star_signal)
 
         total_photon_flux = star_signal + sky_level
         chunk_median = np.median(star_signal) + sky_level
 
-        # Calculate SNR under Jitter
-        eff_area_jit = 1.0 / np.sum(fftconvolve(self.mean_psf, jitter_kernel, mode='same')**2)
-        lib_peaks_jit = (self.mean_psf[k_half, k_half] + physical_weights @ self.eigen_psfs[:, k_half, k_half]) * (1.0 / (np.sum(self.mean_psf**2) * eff_area_jit))
-        total_local_light = map_coordinates(star_signal, [y_centers, x_centers], order=1, mode='nearest')
-        noise_variance = fluxes + eff_area_jit * (sky_level + np.maximum(0, total_local_light - fluxes * lib_peaks_jit) + 25.0)
+        # Calculate Rigorous SNR
+        # 1. Calculate the true Noise Equivalent Area (N_eff) from the downsampled PSF
+        # Use the most "centered" PSF from our 16 shifts (normalized to peak=1)
+        centered_psf = mean_psf_library[O//2, O//2]
+        psf_peak_val = np.max(centered_psf)
+        psf_norm_to_peak = centered_psf / (psf_peak_val + 1e-9)
+        N_eff = np.sum(psf_norm_to_peak ** 2)
+        
+        # 2. Extract true local light using integer pixel indexing
+        x0_idx = np.clip(x0, 0, self.img_size - 1)
+        y0_idx = np.clip(y0, 0, self.img_size - 1)
+        actual_pixel_values = star_signal[y0_idx, x0_idx]
+        
+        # 3. Calculate phase-dependent peak fraction dynamically
+        k_half = self.S // 2
+        peaks = mean_psf_library[:, :, k_half, k_half]
+        max_peak = np.max(peaks)
+        min_peak = np.min(peaks)
+        
+        dx_sub = x_centers - x0
+        dy_sub = y_centers - y0
+        dist_from_pixel_center = np.sqrt((dx_sub - 0.5)**2 + (dy_sub - 0.5)**2)
+        # 0.707 is the max distance from center (0.5, 0.5) to corner (0, 0)
+        phase_dependent_peak = max_peak - (max_peak - min_peak) * (dist_from_pixel_center / 0.7071)
+        
+        # Reconstruct star peaks including PCA (normalized to peak=1)
+        star_peaks = phase_dependent_peak.copy()
+        if is_significant.any():
+            for i, idx_sig in enumerate(sig_indices):
+                dxi, dyi = dx_idx[idx_sig], dy_idx[idx_sig]
+                star_peaks[idx_sig] += np.dot(sig_weights[i], eigen_psfs_jit_4x[:, dyi::O, dxi::O][:, k_half, k_half])
+        
+        # 4. Calculate Confusion Noise
+        # The light in the center pixel minus the star's own contribution
+        confusion_light = np.maximum(0.0, actual_pixel_values - (fluxes * star_peaks))
+        
+        # 5. Calculate Final SNR (Matched Filter Equation)
+        noise_variance = fluxes + N_eff * (sky_level + confusion_light + 25.0)
         snrs = fluxes / np.sqrt(noise_variance)
 
         # TARGET GENERATION: Drop PCA Weights
