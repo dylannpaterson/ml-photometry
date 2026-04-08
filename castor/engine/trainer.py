@@ -4,6 +4,7 @@ from torch.utils.data import DataLoader
 import os
 import time
 import re
+import numpy as np
 from castor.models.dense_grid import compute_grid_loss
 from castor.constants import GLOBAL_STRETCH_SCALE
 
