@@ -133,8 +133,11 @@ def run_train(stage_idx, config, device):
                 os.makedirs(train_mos_dir, exist_ok=True)
                 os.makedirs(val_mos_dir, exist_ok=True)
                 
-                os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/generate_mosaics.py --num {num_mos} --stage {stage_idx} --config {cfg_path} --output_dir {train_mos_dir}")
-                os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/generate_mosaics.py --num {num_val_mos} --stage {stage_idx} --config {cfg_path} --output_dir {val_mos_dir}")
+                # Check for existing library to ensure consistency
+                lib_arg = "--psf_library master_psf_library.pt" if os.path.exists("master_psf_library.pt") else ""
+                
+                os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/generate_mosaics.py --num {num_mos} --stage {stage_idx} --config {cfg_path} --output_dir {train_mos_dir} {lib_arg}")
+                os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/generate_mosaics.py --num {num_val_mos} --stage {stage_idx} --config {cfg_path} --output_dir {val_mos_dir} {lib_arg}")
             
             print(f"🛠️ HDF5 dataset conversion triggered (force_gen={force_gen})...")
             # Clear old ones if force_gen is true to avoid h5py append/overlap confusion

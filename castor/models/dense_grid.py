@@ -47,7 +47,8 @@ class DiffractionAwareFilter(nn.Module):
         # Try Priority 1: Library Mean
         if os.path.exists(psf_library_path):
             try:
-                master_data = torch.load(psf_library_path, map_location='cpu', weights_only=True)
+                # Set weights_only=False to allow loading NumPy objects in the master library
+                master_data = torch.load(psf_library_path, map_location='cpu', weights_only=False)
                 
                 # Robust extraction of mean_psf
                 if isinstance(master_data, dict):

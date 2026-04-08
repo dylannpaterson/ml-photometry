@@ -3,14 +3,13 @@ run_config:
   force_regenerate_data: true
 
 curriculum:
-  # Stage 0: Small local test run
   stage0:
-    name: "Local Test Run"
+    name: "Local Test Stage 0"
     data_dir: "data/local_test"
-    epochs: 5
+    epochs: 1
     batch_size: 16
-    learning_rate: 0.0001
-    num_workers: 0 # Faster startup for small local tests
+    learning_rate: 0.001
+    num_workers: 0
     resume_from_last_stage: false
     cell_size: 4
     mosaic_params:
@@ -19,19 +18,15 @@ curriculum:
       mosaic_size: 512
 
 data_params:
-  num_train_samples: 200 
-  num_val_samples: 50
-  
-  min_stars: 1000
-  max_stars: 5000
-  
+  num_train_samples: 100
+  num_val_samples: 20
+  min_stars: 5000
+  max_stars: 10000
   image_size: 256
-  
   max_capacity_per_cell: 3
   shape_size: 31
   GLOBAL_STRETCH_SCALE: 10.0
-  
-  n_library_psfs: 100
+  n_library_psfs: 10
   min_snr: 5.0
   
   physics_params:
@@ -57,8 +52,8 @@ data_params:
   
 loss_params:
   lambda_prob: 25.0
-  lambda_pos: 25.0      
-  lambda_flux: 10.0     
+  lambda_pos: 25.0
+  lambda_flux: 10.0
   lambda_bg: 0.5
   lambda_diffraction_reg: 10.0
   focal_alpha: 0.25

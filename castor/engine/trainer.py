@@ -33,7 +33,7 @@ class Trainer:
         # 2. Transition to OneCycleLR for faster convergence and local minima escape
         self.scheduler = optim.lr_scheduler.OneCycleLR(
             self.optimizer,
-            max_lr=self.lr * 5,
+            max_lr=self.lr * 2,
             steps_per_epoch=len(self.train_loader),
             epochs=self.epochs,
             pct_start=0.1, # 10% warmup
@@ -199,6 +199,13 @@ class Trainer:
             print(f"==> Epoch {epoch+1} Complete | Avg Loss: {avg_epoch_loss:.4f} | Time: {time.time()-start_time:.1f}s")
             val_loss = self.validate(); print(f"Validation Loss: {val_loss:.4f}")
             
+            # --- THE NaN SAFETY GUARD ---
+            # Do not save checkpoints if the model has diverged (NaN).
+            if np.isnan(avg_epoch_loss) or np.isnan(val_loss):
+                print(f"❌ NaN detected in loss (Train: {avg_epoch_loss:.4f}, Val: {val_loss:.4f}). Skipping checkpoint saving to protect disk state.")
+                continue 
+            # ----------------------------
+
             os.makedirs("checkpoints", exist_ok=True)
             
             # Persist PSF Library to disk if it doesn't exist (Safety Layer)
