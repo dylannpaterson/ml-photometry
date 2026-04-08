@@ -6,12 +6,10 @@ import sys
 import shutil
 from castor.cloud.config_utils import load_config
 from castor.models.dense_grid import DenseGridModel
-from castor.data.dataset import PregeneratedDataset
 from castor.engine.trainer import Trainer
 from castor.engine.evaluator import Evaluator
 # Removed top-level InferenceEngine import
 from castor.engine.analyzer import ThresholdAnalyzer
-from castor.data.stage0_gaussian import GaussianPretrainingProvider
 from torch.utils.data import DataLoader
 from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE
 
@@ -184,16 +182,9 @@ def run_train(stage_idx, config, device):
             global_stretch_scale=stretch_scale
         )
     else:
-        data_dir = stage_cfg["data_dir"]
-        train_dir = os.path.join(data_dir, "train")
-        val_dir = os.path.join(data_dir, "val")
-
-        if not os.path.exists(train_dir) or not os.listdir(train_dir):
-            print(f"❌ Error: Data not found in {train_dir}. Run 'gen' for stage {stage_idx} first.")
-            return
-
-        train_dataset = PregeneratedDataset(train_dir, K=K, shape_size=S)
-        val_dataset = PregeneratedDataset(val_dir, K=K, shape_size=S)
+        print(f"❌ Error: Stage {stage_idx} data loading via PregeneratedDataset is obsolete.")
+        print(f"   Please implement HDF5MosaicDataset support for Stage {stage_idx}.")
+        return
 
     
     batch_size = stage_cfg["batch_size"]

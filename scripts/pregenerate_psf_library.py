@@ -2,7 +2,7 @@ import os
 import torch
 import numpy as np
 import argparse
-from scripts.generate_mosaics import generate_field_realistic_psf_library, _compute_eigen_psfs
+from castor.data.stage0_gaussian import generate_field_realistic_psf_library, _compute_eigen_psfs
 from castor.constants import SHAPE_SIZE, N_PCA_COMPONENTS
 
 def main():
