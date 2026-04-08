@@ -7,6 +7,54 @@ from scipy.signal import fftconvolve
 from castor.data.transforms import AstroSpaceTransform
 from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, GLOBAL_STRETCH_SCALE, SHAPE_SIZE, N_PCA_COMPONENTS
 
+def generate_field_realistic_psf_library(num_psfs=100, grid_size=127, oversample=4):
+    """Generates a master optical library with oversampling."""
+    print(f"📡 Generating Master OPTICAL PSF Library ({num_psfs} PSFs, {oversample}x oversampled)...")
+    S = grid_size * oversample
+    library = np.zeros((num_psfs, S, S), dtype=np.float32)
+    half = S // 2
+    optical_template = None
+    if os.path.exists("roman_psf_prior_4x.pt"):
+        try:
+            optical_template = torch.load("roman_psf_prior_4x.pt", map_location='cpu', weights_only=False).numpy()
+            if optical_template.shape[0] != S:
+                from scipy.ndimage import zoom
+                scale = S / optical_template.shape[0]
+                optical_template = zoom(optical_template, scale, order=3)
+        except Exception as e: print(f"⚠️ Oversampled PSF Load Failed: {e}")
+
+    y, x = np.meshgrid(np.arange(S) - half, np.arange(S) - half, indexing='ij')
+    for i in range(num_psfs):
+        fx, fy = np.random.uniform(-2048, 2048), np.random.uniform(-2048, 2048)
+        r_norm = np.sqrt(fx**2 + fy**2) / 2896.0
+        q_opt = np.random.uniform(0.9, 1.0) - (0.1 * r_norm)
+        theta = np.arctan2(fy, fx) + np.random.normal(0, 0.1)
+        cos, sin = np.cos(theta), np.sin(theta)
+        xp, yp = x * cos + y * sin, -x * sin + y * cos
+        s_opt = 0.45 * oversample 
+        opt_core = np.exp(-(xp**2 / (2 * s_opt**2) + yp**2 / (2 * (s_opt * q_opt)**2)))
+        opt_core /= (opt_core.sum() + 1e-9)
+        if optical_template is not None:
+            from scipy.ndimage import rotate
+            rotated = rotate(optical_template, np.random.uniform(0, 360), reshape=False, order=3, mode='constant', cval=0.0)
+            psf = fftconvolve(rotated, opt_core, mode='same')
+        else:
+            psf = opt_core
+        psf = np.maximum(0, psf)
+        library[i] = psf / (psf.sum() + 1e-9)
+    return library
+
+def _compute_eigen_psfs(large_library, n_components=10):
+    """Performs PCA on the library to extract basis components."""
+    N, H, W = large_library.shape
+    data = torch.from_numpy(large_library).float().view(N, H * W)
+    mean_psf = data.mean(dim=0)
+    centered_data = data - mean_psf
+    U, S, V = torch.pca_lowrank(centered_data, q=n_components)
+    eigen_psfs = V.t().view(n_components, H, W).numpy()
+    psf_weights = (U * S).numpy() 
+    return eigen_psfs, psf_weights, mean_psf.view(H, W).numpy()
+
 def fast_paint_grid(lx, ly, fluxes, snrs, sort_idx, min_snr, grid_size, cell_size, K):
     """Highly optimized target grid painter."""
     grid_stars = np.zeros((grid_size, grid_size, K, 4), dtype=np.float32)
