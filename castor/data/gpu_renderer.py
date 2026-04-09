@@ -80,13 +80,15 @@ def _get_jax_renderer_core():
 
         # 16-channel convolution
         k_h, k_w = S, S
-        pad_h, pad_w = k_h // 2, k_w // 2
+        # Fixed: Asymmetric padding for even kernels to ensure "same" output size without shift
+        pad_h_low, pad_h_high = k_h // 2 - 1, k_h // 2
+        pad_w_low, pad_w_high = k_w // 2 - 1, k_w // 2
         
         final_image = lax.conv_general_dilated(
             grids[jnp.newaxis, :, :, :],
             psfs_binned[:, jnp.newaxis, ::-1, ::-1],
             window_strides=(1, 1),
-            padding=[(pad_h, pad_h), (pad_w, pad_w)],
+            padding=[(pad_h_low, pad_h_high), (pad_w_low, pad_w_high)],
             dimension_numbers=('NCHW', 'OIHW', 'NCHW'),
             feature_group_count=16
         ).sum(axis=1).squeeze()

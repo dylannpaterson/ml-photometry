@@ -82,6 +82,10 @@ def main():
     ra_center, dec_center = template.meta.pointing.ra_v1, template.meta.pointing.dec_v1
     pa_aper, obs_time_base = template.meta.wcsinfo.roll_ref, Time(template.meta.exposure.start_time)
     
+    # Extract the pristine gWCS object from the template ONCE before the loop
+    original_wcs = ris_wcs.get_wcs(template.meta)
+    center_x, center_y = mosaic_size / 2.0, mosaic_size / 2.0
+    
     from romanisim import parameters
     valid_tables = list(parameters.read_pattern.keys())
     ma_table = 10 if 10 in valid_tables else valid_tables[0]
