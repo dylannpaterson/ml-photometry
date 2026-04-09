@@ -71,8 +71,11 @@ def _get_jax_renderer_core():
         S = mean_psf_4x.shape[0] // O
         for dyi in range(O):
             for dxi in range(O):
-                # Binning: slicing at offset
-                psfs_binned.append(mean_psf_jit[dyi::O, dxi::O][:S, :S])
+                # Pad first so the window aligns at (dyi, dxi)
+                window = jnp.pad(mean_psf_jit, ((0, O), (0, O)))[dyi:dyi + S*O, dxi:dxi + S*O]
+                binned = window.reshape(S, O, S, O).mean(axis=(1, 3))
+                binned = binned / (binned.sum() + 1e-9)
+                psfs_binned.append(binned)
         psfs_binned = jnp.stack(psfs_binned) # (16, S, S)
 
         # 16-channel convolution
@@ -98,7 +101,11 @@ def _get_jax_renderer_core():
             e_psfs_binned = []
             for dyi in range(O):
                 for dxi in range(O):
-                    e_psfs_binned.append(eigen_psf_jit[dyi::O, dxi::O][:S, :S])
+                    # Pad first so the window aligns at (dyi, dxi)
+                    window = jnp.pad(eigen_psf_jit, ((0, O), (0, O)))[dyi:dyi + S*O, dxi:dxi + S*O]
+                    binned = window.reshape(S, O, S, O).mean(axis=(1, 3))
+                    # Normalization not strictly needed for eigen corrections but keeps it stable
+                    e_psfs_binned.append(binned)
             e_psfs_binned = jnp.stack(e_psfs_binned)
             
             w_f = bright_fluxes * star_weights[:, i]
