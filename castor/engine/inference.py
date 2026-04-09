@@ -216,6 +216,12 @@ class InferenceEngine:
         fig = plt.figure(figsize=(30, 24))
         gs = fig.add_gridspec(5, 4, hspace=0.3, wspace=0.3)
         
+        # Calculate Stellar Density
+        pixel_scale = 0.11 # Roman arcsec/pixel
+        area_sq_deg = (H * pixel_scale * W * pixel_scale) / (3600**2)
+        n_bright = sum(1 for m in all_true_mags if m < 26.0)
+        density_per_sq_deg = n_bright / area_sq_deg
+
         def add_colorbar(im, ax):
             divider = make_axes_locatable(ax)
             cax = divider.append_axes("right", size="5%", pad=0.05)
@@ -355,5 +361,11 @@ class InferenceEngine:
             
             for ax in [ax_sig_x, ax_sig_y, ax_sig_f, ax_ast_2d]: ax.grid(True, alpha=0.3, which="both")
 
-        plt.suptitle(f"Aleatoric Uncertainty & Precision Diagnostic | Predicted Stars (p>=0.5): {len(detected_stars)}", fontsize=24)
+        # Calculate Stellar Density
+        pixel_scale = 0.11 # Roman arcsec/pixel
+        area_sq_deg = (H * pixel_scale * W * pixel_scale) / (3600**2)
+        n_bright = sum(1 for m in all_true_mags if m < 26.0)
+        density_per_sq_deg = n_bright / area_sq_deg
+
+        plt.suptitle(f"Aleatoric Uncertainty & Precision Diagnostic | Stars (m<26): {n_bright} ({density_per_sq_deg:,.0f}/sq.deg) | Predicted: {len(detected_stars)}", fontsize=24)
         plt.savefig(output_path); print(f"Comparison saved to {output_path}")
