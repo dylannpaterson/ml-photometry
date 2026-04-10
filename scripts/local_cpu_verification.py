@@ -4,8 +4,8 @@ import torch
 import os
 from scipy.ndimage import center_of_mass
 import castor.data.stage0_gaussian as s0
-from castor.data.stage0_gaussian import generate_mosaic_data, _compute_eigen_psfs, generate_field_realistic_psf_library
-from castor.constants import SHAPE_SIZE, N_PCA_COMPONENTS
+from castor.data.stage0_gaussian import generate_mosaic_data, generate_field_realistic_psf_library
+from castor.constants import SHAPE_SIZE
 
 # --- Force Stars ---
 def fake_sample_magnitudes(n_total, *args, **kwargs):
@@ -14,11 +14,12 @@ def fake_sample_magnitudes(n_total, *args, **kwargs):
 
 # --- Force Symmetric Gaussians ---
 def fake_psf_library(num_psfs=100, grid_size=127, oversample=4):
-    """ Generates perfectly symmetric Gaussians. """
-    # Use global SHAPE_SIZE
+    """ Generates perfectly symmetric Gaussians centered at (S-1)/2.0. """
     S = SHAPE_SIZE * oversample
     library = np.zeros((num_psfs, S, S), dtype=np.float32)
-    y, x = np.meshgrid(np.arange(S) - S//2, np.arange(S) - S//2, indexing='ij')
+    # Center at (S-1)/2
+    center = (S - 1) / 2.0
+    y, x = np.meshgrid(np.arange(S) - center, np.arange(S) - center, indexing='ij')
     psf = np.exp(-(x**2 + y**2) / (2 * (1.5 * oversample)**2))
     psf /= psf.sum()
     for i in range(num_psfs):
@@ -33,25 +34,23 @@ def verify_cpu_absolute_official():
     print("🧪 Starting Local CPU Renderer Absolute Accuracy Test (OFFICIAL Engine)...")
     print(f"💡 FORCING: Stars @ Mag 20.0 | Size ({SHAPE_SIZE}) | Symmetric Gaussian PSF")
     
-    mosaic_size = 256
+    mosaic_size = 512 # Larger mosaic to avoid edge effects
     O = 4
-    num_psfs = N_PCA_COMPONENTS + 2
-    n_pca = N_PCA_COMPONENTS
+    num_psfs = 10
     
     # 1. Setup params
     params = {
-        'image_size': 256,
-        'min_stars': 10,
-        'max_stars': 10
+        'image_size': 512,
+        'min_stars': 1,
+        'max_stars': 1
     }
     
     # 2. Generate master PSF library
     kb_array = fake_psf_library(num_psfs=num_psfs, grid_size=SHAPE_SIZE, oversample=O)
-    master_psf_data = _compute_eigen_psfs(kb_array, n_components=n_pca)
     
     # 3. Use the OFFICIAL engine
     print("🎨 Rendering mosaic via OFFICIAL engine...")
-    img, cat, meta, _ = generate_mosaic_data(mosaic_size, params, master_psf_data)
+    img, cat, meta, _ = generate_mosaic_data(mosaic_size, params, kb_array)
     
     if len(cat) == 0:
         print("❌ Error: No stars rendered.")
@@ -62,8 +61,8 @@ def verify_cpu_absolute_official():
     star = cat[0]
     target_x, target_y = star['x'], star['y']
     
-    # Calculate crop around target
-    patch = 15
+    # Calculate crop around target - use larger patch since PSF is 129x129
+    patch = 64 
     ix, iy = int(target_x), int(target_y)
     
     # Ensure patch is within bounds
@@ -87,8 +86,8 @@ def verify_cpu_absolute_official():
     print(f"\n  Target Y:  {target_y:.3f}")
     print(f"  Actual Y:  {actual_y:.3f} -> Error: {err_y:+.6f}")
     
-    # Error should be very small (< 0.05)
-    if abs(err_x) < 0.05 and abs(err_y) < 0.05:
+    # Error should be very small (< 0.01)
+    if abs(err_x) < 0.01 and abs(err_y) < 0.01:
         print("\n✅ SUCCESS: Official CPU Renderer is tracking absolute coordinates accurately.")
     else:
         print("\n❌ FAILURE: Official CPU Renderer still has absolute drift.")

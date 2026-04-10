@@ -141,8 +141,8 @@ def render_single_mosaic(idx):
     gs_params = galsim.GSParams(folding_threshold=1e-3, maximum_fft_size=16384)
     base_psf = generate_archetype_psf(archetype, wavelength, params).withGSParams(gs_params)
     
-    # 4. Pre-render Kernel (Large 127x127 to avoid box artifacts)
-    kernel_size = 127
+    # 4. Pre-render Kernel (Large 129x129 to avoid box artifacts)
+    kernel_size = 129
     psf_kernel_image = galsim.ImageF(kernel_size, kernel_size, scale=pixel_scale)
     base_psf.drawImage(image=psf_kernel_image, method='no_pixel')
     psf_kernel = psf_kernel_image.array

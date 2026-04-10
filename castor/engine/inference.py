@@ -169,7 +169,9 @@ class InferenceEngine:
         # --- APPLY GLOBAL JITTER ---
         if jitter_params is not None:
             s_j, q_j, t_j = jitter_params
-            kj = 63; gy, gx = np.meshgrid(np.arange(127) - kj, np.arange(127) - kj, indexing='ij')
+            S_j = SHAPE_SIZE
+            kj = (S_j - 1) / 2.0
+            gy, gx = np.meshgrid(np.arange(S_j) - kj, np.arange(S_j) - kj, indexing='ij')
             cos, sin = np.cos(t_j), np.sin(t_j)
             gxp, gyp = gx * cos + gy * sin, -gx * sin + gy * cos
             j_kernel = np.exp(-(gxp**2 / (2 * s_j**2) + gyp**2 / (2 * (s_j * q_j)**2)))

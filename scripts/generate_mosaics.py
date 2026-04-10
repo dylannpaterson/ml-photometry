@@ -3,9 +3,9 @@ import os
 import torch
 import numpy as np
 import time
-from castor.data.stage0_gaussian import generate_mosaic_data, generate_field_realistic_psf_library, _compute_eigen_psfs
+from castor.data.stage0_gaussian import generate_mosaic_data, generate_field_realistic_psf_library
 from castor.cloud.config_utils import load_config
-from castor.constants import SHAPE_SIZE, N_PCA_COMPONENTS
+from castor.constants import SHAPE_SIZE
 
 def main():
     parser = argparse.ArgumentParser(description="Thin wrapper for Mosaic Generation")
@@ -23,10 +23,13 @@ def main():
     # 1. Load or Generate Master PSF Library
     if args.psf_library and os.path.exists(args.psf_library):
         master_data = torch.load(args.psf_library, map_location='cpu', weights_only=False)
-        master_psf_data = (master_data['eigen_psfs'], master_data['weights_lib'], master_data['mean_psf'])
+        if 'kb_array' in master_data:
+            master_psf_library = master_data['kb_array']
+        else:
+            # Fallback for old libraries: use the mean PSF
+            master_psf_library = master_data['mean_psf'][np.newaxis, ...]
     else:
-        kb_array = generate_field_realistic_psf_library(num_psfs=100, grid_size=SHAPE_SIZE)
-        master_psf_data = _compute_eigen_psfs(kb_array, n_components=N_PCA_COMPONENTS)
+        master_psf_library = generate_field_realistic_psf_library(num_psfs=100, grid_size=SHAPE_SIZE)
         
     num = args.num if args.num else stage_cfg["mosaic_params"]["num_mosaics"]
     out = args.output_dir if args.output_dir else os.path.join(stage_cfg["data_dir"], "mosaics")
@@ -44,7 +47,7 @@ def main():
     for i in range(num):
         start_time = time.time()
         full_image, structured_cat, meta, psf_lib_save = generate_mosaic_data(
-            mosaic_size, params, master_psf_data
+            mosaic_size, params, master_psf_library
         )
         
         # 3. Save Outputs

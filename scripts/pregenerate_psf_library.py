@@ -22,6 +22,7 @@ def main():
     
     # 3. Save as a dictionary for easy loading
     master_data = {
+        'kb_array': kb_array, # Physical PSFs
         'eigen_psfs': eigen_psfs,
         'weights_lib': weights_lib,
         'mean_psf': mean_psf,

@@ -13,6 +13,11 @@ from roman_datamodels import datamodels
 import argparse
 from tqdm import tqdm
 
+def paczynski_magnification(t, t0, tE, u0):
+    """ Theoretical magnification formula. """
+    u = np.sqrt(u0**2 + ((t - t0) / tE)**2)
+    return (u**2 + 2) / (u * np.sqrt(u**2 + 4) + 1e-9)
+
 def main():
     parser = argparse.ArgumentParser(description="Animate microlensing events from ASDF stack.")
     parser.add_argument("--indir", default="data/microlensing_mag23_strict", help="Directory containing ASDF and JSON files")
@@ -63,8 +68,16 @@ def main():
         with datamodels.open(f) as model:
             img = model.data.copy()
             ix, iy = int(round(px)), int(round(py))
-            if 1 <= ix < img.shape[1]-1 and 1 <= iy < img.shape[0]-1:
-                pixel_values.append(np.max(img[iy-1:iy+2, ix-1:ix+2]))
+            w = 2
+            if w <= ix < img.shape[1]-w and w <= iy < img.shape[0]-w:
+                patch = img[iy-w:iy+w+1, ix-w:ix+w+1]
+                
+                # Optional but recommended: subtract a local background median 
+                # so the baseline doesn't artificially inflate
+                local_bg = np.median(img[iy-10:iy+10, ix-10:ix+10])
+                total_flux = np.sum(patch) - (patch.size * local_bg)
+                
+                pixel_values.append(total_flux)
             elif 0 <= ix < img.shape[1] and 0 <= iy < img.shape[0]:
                 pixel_values.append(img[iy, ix])
             else:
@@ -140,14 +153,27 @@ def main():
     
     fig.text(0.5, 0.05, param_text, ha='center', fontsize=10, bbox=dict(facecolor='white', alpha=0.5))
 
-    lc_plot, = ax2.plot([], [], 'b.', markersize=2, alpha=0.6)
+    lc_plot, = ax2.plot([], [], 'b.', markersize=2, alpha=0.6, label='Peak Pixel Value')
     lc_point, = ax2.plot([], [], 'ro', markersize=5)
     ax2.set_xlim(times.min(), times.max())
     ax2.set_ylim(pixel_values.min() * 0.9, pixel_values.max() * 1.1)
     ax2.set_xlabel("Time (days)")
     ax2.set_ylabel("Peak Pixel Value")
-    ax2.set_title("Light Curve")
+    ax2.set_title("Light Curve vs Theoretical A(t)")
     ax2.grid(True, alpha=0.3)
+
+    # Secondary axis for Magnification
+    ax2_mag = ax2.twinx()
+    ax2_mag.set_ylabel("Magnification (A)", color='tab:orange')
+    ax2_mag.tick_params(axis='y', labelcolor='tab:orange')
+    
+    if ml_params.get('t0', 'N/A') != 'N/A':
+        t_smooth = np.linspace(times.min(), times.max(), 1000)
+        a_smooth = paczynski_magnification(t_smooth, ml_params['t0'], ml_params['tE'], ml_params['u0'])
+        ax2_mag.plot(t_smooth, a_smooth, 'tab:orange', alpha=0.3, linewidth=2, label='Theoretical A(t)')
+        ax2_mag.set_ylim(1.0, max(a_smooth) * 1.2)
+    
+    mag_points, = ax2_mag.plot([], [], 'x', color='tab:orange', markersize=4, alpha=0.5, label='Actual Magnification')
 
     def update(frame):
         f = asdf_files[frame]
@@ -157,7 +183,7 @@ def main():
         px, py = positions[frame]
         im_plot.set_data(cutout)
         
-        dx, dy = px - x_min - 1, py - y_min - 1
+        dx, dy = px - x_min , py - y_min 
         circ.set_center((dx, dy))
         ch_h.set_ydata([dy, dy])
         ch_v.set_xdata([dx, dx])
@@ -165,8 +191,13 @@ def main():
         lc_plot.set_data(times[:frame+1], pixel_values[:frame+1])
         lc_point.set_data([times[frame]], [pixel_values[frame]])
         
+        # Update Actual Magnification Points
+        if ml_params.get('t0', 'N/A') != 'N/A':
+            a_actual = paczynski_magnification(times[:frame+1], ml_params['t0'], ml_params['tE'], ml_params['u0'])
+            mag_points.set_data(times[:frame+1], a_actual)
+        
         ax1.set_xlabel(f"Frame {frame} | Time {times[frame]:.2f}d\nPos: ({px:.1f}, {py:.1f})")
-        return im_plot, circ, ch_h, ch_v, lc_plot, lc_point
+        return im_plot, circ, ch_h, ch_v, lc_plot, lc_point, mag_points
 
     print(f"📽️ Encoding animation to {args.out}...")
     ani = FuncAnimation(fig, update, frames=len(asdf_files), blit=True)

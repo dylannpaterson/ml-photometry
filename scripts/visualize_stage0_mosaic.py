@@ -31,11 +31,13 @@ def visualize_mosaic_optimized(mosaic_idx=0, data_dir="data/bulge_stage0_full/mo
     # Load PSF Library to get actual peak and area
     if os.path.exists(lib_path):
         psf_lib = np.load(lib_path)
-        # psf_lib contains [eigen_psfs_1x, mean_psf_1x], peak-normalized
-        mean_psf_1x = psf_lib[-1].reshape(SHAPE_SIZE, SHAPE_SIZE)
+        # Handle new format (single flattened PSF) or old format
+        if psf_lib.size == SHAPE_SIZE * SHAPE_SIZE:
+            mean_psf_1x = psf_lib.reshape(SHAPE_SIZE, SHAPE_SIZE)
+        else:
+            # Fallback for older multi-component format
+            mean_psf_1x = psf_lib[-1].reshape(SHAPE_SIZE, SHAPE_SIZE)
         
-        # NEA (N_eff) = 1 / sum(P^2) where sum(P)=1
-        # P = mean_psf_1x / sum(mean_psf_1x)
         sum_p = np.sum(mean_psf_1x)
         eff_area = (sum_p**2) / (np.sum(mean_psf_1x**2) + 1e-9)
         print(f"📊 Using PSF from library: eff_area={eff_area:.2f}")

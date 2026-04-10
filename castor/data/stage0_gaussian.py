@@ -12,7 +12,8 @@ def generate_field_realistic_psf_library(num_psfs=100, grid_size=127, oversample
     print(f"📡 Generating Master OPTICAL PSF Library ({num_psfs} PSFs, {oversample}x oversampled)...")
     S = grid_size * oversample
     library = np.zeros((num_psfs, S, S), dtype=np.float32)
-    half = S // 2
+    # Correct center for perfect alignment: (S-1)/2.0
+    center = (S - 1) / 2.0
     optical_template = None
     if os.path.exists("roman_psf_prior_4x.pt"):
         try:
@@ -23,7 +24,7 @@ def generate_field_realistic_psf_library(num_psfs=100, grid_size=127, oversample
                 optical_template = zoom(optical_template, scale, order=3)
         except Exception as e: print(f"⚠️ Oversampled PSF Load Failed: {e}")
 
-    y, x = np.meshgrid(np.arange(S) - half, np.arange(S) - half, indexing='ij')
+    y, x = np.meshgrid(np.arange(S) - center, np.arange(S) - center, indexing='ij')
     for i in range(num_psfs):
         fx, fy = np.random.uniform(-2048, 2048), np.random.uniform(-2048, 2048)
         r_norm = np.sqrt(fx**2 + fy**2) / 2896.0
@@ -117,117 +118,84 @@ def calculate_safe_magnitude_cutoff(exp_time, zp, sky_mag, read_noise=5.0, sigma
     min_flux = (-b + np.sqrt(b**2 - 4*a*c)) / (2*a)
     return zp - 2.5 * np.log10(min_flux / exp_time)
 
-def generate_mosaic_data(mosaic_size, params, master_psf_data):
+def generate_mosaic_data(mosaic_size, params, master_psf_library):
     """
-    The Core Stage 0 Rendering Engine.
-    Generates a full mosaic using Area Integration and Representative PSFs.
+    Simplified Stage 0 Engine: Uses a single physical PSF from the library.
+    Employs bi-linear interpolation for sub-pixel placement.
     """
     area_ratio = (mosaic_size / params['image_size'])**2
-    exp_time, zp, sky_mag = np.random.uniform(30.0, 60.0), 26.5, 22.0
+    exp_time, zp, sky_mag = np.random.uniform(30.0, 90.0), 26.5, 22.0
     mag_limit = calculate_safe_magnitude_cutoff(exp_time, zp, sky_mag, snr_cutoff=1.0)
     
     n_stars_total = int(10 ** np.random.uniform(np.log10(params['min_stars'] * area_ratio), np.log10(params['max_stars'] * area_ratio)))
     mags = sample_bulge_magnitudes(n_stars_total, np.random.uniform(14.5, 16.5), np.random.uniform(0.2, 0.5), np.random.uniform(5.0, 15.0), m_min=12.0, m_max=32.0, gamma=np.random.uniform(0.25, 0.35))
     fluxes = exp_time * (10 ** (-0.4 * (mags - zp)))
     
-    eigen_psfs, psf_weights_lib, mean_psf = master_psf_data
     O = 4 # Oversampling
     
-    # Representative PSF Selection
-    repr_idx = np.random.randint(0, len(psf_weights_lib))
-    repr_weights = psf_weights_lib[repr_idx]
+    # 1. Select a single Physical PSF from the library
+    repr_idx = np.random.randint(0, len(master_psf_library))
+    repr_psf_4x = master_psf_library[repr_idx] # Shape: (516, 516) for SHAPE_SIZE=129
+
+    # 2. Binning for 1x PSF (Centered at SHAPE_SIZE//2)
+    # Since repr_psf_4x is centered at (516-1)/2 = 257.5, 
+    # the 1x binning at index 64 covers [256, 257, 258, 259], 
+    # which is perfectly centered at 257.5.
+    psf_1x = repr_psf_4x.reshape(SHAPE_SIZE, O, SHAPE_SIZE, O).mean(axis=(1, 3))
+    psf_1x /= (np.sum(psf_1x) + 1e-9)
+
+    # 3. Bi-linear placement of stars onto the grid
+    px, py = np.random.uniform(0.5, mosaic_size-1.5, len(fluxes)), np.random.uniform(0.5, mosaic_size-1.5, len(fluxes))
+    full_image_grid = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
     
-    def get_upsampled(img, scale):
-        from scipy.ndimage import zoom
-        return zoom(img, scale, order=3)
-
-    if mean_psf.shape[0] == SHAPE_SIZE:
-        mean_psf_4x = get_upsampled(mean_psf, O)
-        eigen_psfs_4x = np.array([get_upsampled(e, O) for e in eigen_psfs])
-    else:
-        mean_psf_4x = mean_psf
-        eigen_psfs_4x = eigen_psfs
-
-    repr_psf_4x = mean_psf_4x + np.tensordot(repr_weights, eigen_psfs_4x, axes=1)
-    repr_psf_4x = np.maximum(0, repr_psf_4x)
-    repr_psf_4x /= (repr_psf_4x.sum() + 1e-9)
-
-    s_jit, q_jit, theta_jit = np.random.normal(0.127, 0.01), np.random.uniform(0.8, 1.0), np.random.uniform(0, np.pi)
-    S_jit_high = SHAPE_SIZE * O
-    k_half_high = S_jit_high // 2
-    gy, gx = np.meshgrid(np.arange(S_jit_high) - k_half_high, np.arange(S_jit_high) - k_half_high, indexing='ij')
-    cos, sin = np.cos(theta_jit), np.sin(theta_jit)
-    s_jit_high = s_jit * O
-    gxp, gyp = gx * cos + gy * sin, -gx * sin + gy * cos
-    jitter_kernel_high = np.exp(-(gxp**2 / (2 * s_jit_high**2) + gyp**2 / (2 * (s_jit_high * q_jit)**2)))
-    jitter_kernel_high /= (jitter_kernel_high.sum() + 1e-9)
-
-    repr_psf_jit_4x = fftconvolve(repr_psf_4x, jitter_kernel_high, mode='same')
-
-    # Proper Binning (Area Integration) with Sub-Pixel Alignment
-    psf_library = np.zeros((O, O, SHAPE_SIZE, SHAPE_SIZE), dtype=np.float32)
-    
-    # Pad to allow for sub-pixel window shifts
-    pad_amt = O
-    padded_psf = np.pad(repr_psf_jit_4x, ((pad_amt, pad_amt), (pad_amt, pad_amt)))
-    
-    for dy_idx in range(O):
-        for dx_idx in range(O):
-            # The bin spans [d/O, (d+1)/O]. The center is (d + 0.5)/O.
-            # To align the PSF center (0.0) with the bin center, we shift by O-1-d.
-            offset_y = (O - 1) - dy_idx
-            offset_x = (O - 1) - dx_idx
-            window = padded_psf[offset_y : offset_y + SHAPE_SIZE*O, offset_x : offset_x + SHAPE_SIZE*O]
-            binned = window.reshape(SHAPE_SIZE, O, SHAPE_SIZE, O).mean(axis=(1, 3))
-            psf_library[dy_idx, dx_idx] = binned / (np.sum(binned) + 1e-9)
-
-    px, py = np.random.uniform(0, mosaic_size, len(fluxes)), np.random.uniform(0, mosaic_size, len(fluxes))
-    full_image = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
     x0, y0 = np.floor(px).astype(int), np.floor(py).astype(int)
-    dx_idx = np.clip(np.floor((px - x0) * O).astype(int), 0, O-1)
-    dy_idx = np.clip(np.floor((py - y0) * O).astype(int), 0, O-1)
-    valid = (x0 >= 0) & (x0 < mosaic_size) & (y0 >= 0) & (y0 < mosaic_size)
+    dx, dy = px - x0, py - y0
     
-    for dyi in range(O):
-        for dxi in range(O):
-            mask = valid & (dx_idx == dxi) & (dy_idx == dyi)
-            if not mask.any(): continue
-            flat_indices = y0[mask] * mosaic_size + x0[mask]
-            grid = np.bincount(flat_indices, weights=fluxes[mask], minlength=mosaic_size*mosaic_size).reshape(mosaic_size, mosaic_size)
-            
-            # Simple 'same' convolution is accurate for odd kernels
-            full_image += fftconvolve(grid, psf_library[dyi, dxi], mode='same')
+    # Weights for the 4 nearest pixels
+    w00 = (1 - dx) * (1 - dy)
+    w10 = dx * (1 - dy)
+    w01 = (1 - dx) * dy
+    w11 = dx * dy
+    
+    # Efficient grid painting
+    def paint_flux(grid, x, y, w, f):
+        flat_indices = y * mosaic_size + x
+        grid.flat += np.bincount(flat_indices, weights=f * w, minlength=grid.size)
+
+    paint_flux(full_image_grid, x0, y0, w00, fluxes)
+    paint_flux(full_image_grid, x0 + 1, y0, w10, fluxes)
+    paint_flux(full_image_grid, x0, y0 + 1, w01, fluxes)
+    paint_flux(full_image_grid, x0 + 1, y0 + 1, w11, fluxes)
+
+    # 4. Single Convolution
+    full_image = fftconvolve(full_image_grid, psf_1x, mode='same')
 
     full_image = np.maximum(0, full_image)
     v_mask = mags < mag_limit
     
     # Rigorous SNR
     half = SHAPE_SIZE // 2
-    centered_psf = psf_library[O//2, O//2]
-    N_eff = 1.0 / (np.sum(centered_psf**2) + 1e-9)
-    actual_pixel_values = full_image[y0[v_mask], x0[v_mask]]
-    star_peaks = psf_library[dy_idx[v_mask], dx_idx[v_mask], half, half]
+    N_eff = 1.0 / (np.sum(psf_1x**2) + 1e-9)
+    actual_pixel_values = full_image[np.clip(y0[v_mask], 0, mosaic_size-1), np.clip(x0[v_mask], 0, mosaic_size-1)]
+    star_peak_val = psf_1x[half, half]
     sky_level = (10 ** (-0.4 * (sky_mag - zp))) * (0.11**2) * exp_time
-    confusion_light = np.maximum(0.0, actual_pixel_values - (fluxes[v_mask] * star_peaks))
+    confusion_light = np.maximum(0.0, actual_pixel_values - (fluxes[v_mask] * star_peak_val))
     noise_variance = fluxes[v_mask] + N_eff * (sky_level + confusion_light + 25.0)
     snrs = fluxes[v_mask] / np.sqrt(noise_variance)
     
-    cat_dtype = [('x', 'f4'), ('y', 'f4'), ('flux', 'f4'), ('mag', 'f4'), ('snr', 'f4')] + [(f'w{i}', 'f2') for i in range(N_PCA_COMPONENTS)]
+    cat_dtype = [('x', 'f4'), ('y', 'f4'), ('flux', 'f4'), ('mag', 'f4'), ('snr', 'f4')]
     structured_cat = np.zeros(np.sum(v_mask), dtype=cat_dtype)
     structured_cat['x'], structured_cat['y'], structured_cat['flux'], structured_cat['mag'] = px[v_mask], py[v_mask], fluxes[v_mask], mags[v_mask]
     structured_cat['snr'] = snrs
-    for i in range(N_PCA_COMPONENTS): structured_cat[f'w{i}'] = repr_weights[i]
     
-    # Save the 1x version for visualizer compatibility
-    repr_psf_1x = repr_psf_jit_4x.reshape(SHAPE_SIZE, O, SHAPE_SIZE, O).mean(axis=(1, 3))
-    norm_val = np.max(repr_psf_1x)
-    repr_psf_1x /= (norm_val + 1e-9)
+    # Save in (N_PCA + 1, S*S) format for compatibility with inference and HDF5 structure
     psf_lib_save = np.zeros((N_PCA_COMPONENTS + 1, SHAPE_SIZE * SHAPE_SIZE), dtype=np.float32)
-    psf_lib_save[-1] = repr_psf_1x.flatten()
+    psf_lib_save[-1] = psf_1x.flatten()
 
-    meta = np.array([exp_time, zp, sky_mag, s_jit, q_jit, theta_jit])
-    
+    meta = np.array([exp_time, zp, sky_mag, 0.0, 0.0, 0.0]) # Jitter zeros
+
     return full_image, structured_cat, meta, psf_lib_save
+
 
 class HDF5MosaicDataset(Dataset):
     def __init__(self, h5_path, image_size=256):

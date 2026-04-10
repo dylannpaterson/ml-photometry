@@ -60,15 +60,23 @@ def create_hdf5_datasets_combined(train_mosaic_dir, val_mosaic_dir, train_path, 
     print(f"Found {len(train_mosaics)} train and {len(val_mosaics)} val mosaics. Creating HDF5 databases...")
     os.makedirs(os.path.dirname(train_path), exist_ok=True)
 
-    # --- NEW: CALCULATE GLOBAL PCA STD FROM TRAIN SPLIT ---
-    print("🛰️ Calculating Global PCA StdDev from training catalogs...")
-    all_weights = []
-    for mosaic in train_mosaics:
-        cat = np.load(mosaic['cat'])
-        weights = np.column_stack([cat[f'w{i}'] for i in range(N_PCA)])
-        all_weights.append(weights)
-    global_weights_std = np.std(np.concatenate(all_weights, axis=0), axis=0) + 1e-8
-    print(f"🛰️ Global PCA StdDev: {global_weights_std}")
+    # --- OPTIONAL: CALCULATE GLOBAL PCA STD FROM TRAIN SPLIT ---
+    print("🛰️ Checking for PCA weights in catalogs...")
+    first_cat = np.load(train_mosaics[0]['cat'])
+    has_weights = all(f'w{i}' in first_cat.dtype.names for i in range(N_PCA))
+    
+    if has_weights:
+        print("🛰️ Calculating Global PCA StdDev from training catalogs...")
+        all_weights = []
+        for mosaic in train_mosaics:
+            cat = np.load(mosaic['cat'])
+            weights = np.column_stack([cat[f'w{i}'] for i in range(N_PCA)])
+            all_weights.append(weights)
+        global_weights_std = np.std(np.concatenate(all_weights, axis=0), axis=0) + 1e-8
+        print(f"🛰️ Global PCA StdDev: {global_weights_std}")
+    else:
+        print("🛰️ No PCA weights found (Simplified Engine). Using dummy std.")
+        global_weights_std = np.ones(N_PCA, dtype=np.float32)
     # -----------------------------------------------------
 
     with h5py.File(train_path, 'w') as h5_train, h5py.File(val_path, 'w') as h5_val:
@@ -142,7 +150,6 @@ def create_hdf5_datasets_combined(train_mosaic_dir, val_mosaic_dir, train_path, 
                         local_cat = band_cat[mask_x]
                         lx, ly = local_cat['x'] - px, local_cat['y'] - py
                         local_snrs = snrs[y_start:y_end][mask_x]
-                        psf_weights = np.column_stack([local_cat[f'w{i}'] for i in range(N_PCA)])
                         sort_idx = np.argsort(local_cat['flux'])[::-1]
                         
                         grid_stars = fast_paint_grid(lx, ly, local_cat['flux'], local_snrs, sort_idx, 5.0, grid_size, cell_size, K)

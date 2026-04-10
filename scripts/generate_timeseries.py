@@ -31,22 +31,29 @@ def paczynski_magnification(t, t0, tE, u0):
     A = (u**2 + 2) / (u * np.sqrt(u**2 + 4) + 1e-9)
     return A
 
-def render_16phase_mosaic(px, py, fluxes, mosaic_size, psf_library, O=4):
-    """ High-fidelity 16-phase rendering logic. """
-    full_image = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
+def render_bilinear_mosaic(px, py, fluxes, mosaic_size, psf_1x):
+    """ High-fidelity bi-linear rendering logic. """
+    full_image_grid = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
     x0, y0 = np.floor(px).astype(int), np.floor(py).astype(int)
-    dx_idx = np.clip(np.floor((px - x0) * O).astype(int), 0, O-1)
-    dy_idx = np.clip(np.floor((py - y0) * O).astype(int), 0, O-1)
-    valid = (x0 >= 0) & (x0 < mosaic_size) & (y0 >= 0) & (y0 < mosaic_size)
+    dx, dy = px - x0, py - y0
     
-    for dyi in range(O):
-        for dxi in range(O):
-            mask = valid & (dx_idx == dxi) & (dy_idx == dyi)
-            if not mask.any(): continue
-            flat_indices = y0[mask] * mosaic_size + x0[mask]
-            grid = np.bincount(flat_indices, weights=fluxes[mask], minlength=mosaic_size*mosaic_size).reshape(mosaic_size, mosaic_size)
-            full_image += fftconvolve(grid, psf_library[dyi, dxi], mode='same')
-    return full_image
+    valid = (x0 >= 0) & (x0 < mosaic_size-1) & (y0 >= 0) & (y0 < mosaic_size-1)
+    
+    w00 = (1 - dx) * (1 - dy)
+    w10 = dx * (1 - dy)
+    w01 = (1 - dx) * dy
+    w11 = dx * dy
+    
+    def paint_flux(grid, x, y, w, f, mask):
+        flat_indices = y[mask] * mosaic_size + x[mask]
+        grid.flat += np.bincount(flat_indices, weights=f[mask] * w[mask], minlength=grid.size)
+
+    paint_flux(full_image_grid, x0, y0, w00, fluxes, valid)
+    paint_flux(full_image_grid, x0 + 1, y0, w10, fluxes, valid)
+    paint_flux(full_image_grid, x0, y0 + 1, w01, fluxes, valid)
+    paint_flux(full_image_grid, x0 + 1, y0 + 1, w11, fluxes, valid)
+
+    return fftconvolve(full_image_grid, psf_1x, mode='same')
 
 def main():
     parser = argparse.ArgumentParser()
@@ -82,9 +89,7 @@ def main():
     ra_center, dec_center = template.meta.pointing.ra_v1, template.meta.pointing.dec_v1
     pa_aper, obs_time_base = template.meta.wcsinfo.roll_ref, Time(template.meta.exposure.start_time)
     
-    # Extract the pristine gWCS object from the template ONCE before the loop
     original_wcs = ris_wcs.get_wcs(template.meta)
-    center_x, center_y = mosaic_size / 2.0, mosaic_size / 2.0
     
     from romanisim import parameters
     valid_tables = list(parameters.read_pattern.keys())
@@ -93,39 +98,20 @@ def main():
     # 2. PSF Library Setup
     if os.path.exists(args.psf_library):
         master_data = torch.load(args.psf_library, map_location='cpu', weights_only=False)
-        if isinstance(master_data, dict): master_psf_data = (master_data['eigen_psfs'], master_data['weights_lib'], master_data['mean_psf'])
-        else: master_psf_data = master_data
+        if 'kb_array' in master_data:
+            master_psf_library = master_data['kb_array']
+        else:
+            master_psf_library = master_data['mean_psf'][np.newaxis, ...]
     else:
-        kb_array = generate_field_realistic_psf_library(num_psfs=100, grid_size=SHAPE_SIZE, oversample=O)
-        master_psf_data = _compute_eigen_psfs(kb_array, n_components=N_PCA_COMPONENTS)
+        master_psf_library = generate_field_realistic_psf_library(num_psfs=100, grid_size=SHAPE_SIZE, oversample=O)
     
-    eigen_psfs, psf_weights_lib, mean_psf = master_psf_data
-    repr_weights = psf_weights_lib[np.random.randint(0, len(psf_weights_lib))]
-    
-    # Reconstruct 4x representative PSF
-    if mean_psf.shape[0] == SHAPE_SIZE:
-        from scipy.ndimage import zoom
-        mean_psf_4x = zoom(mean_psf, O, order=3)
-        eigen_psfs_4x = np.array([zoom(e, O, order=3) for e in eigen_psfs])
-    else: mean_psf_4x, eigen_psfs_4x = mean_psf, eigen_psfs
+    # Select a single Physical PSF
+    repr_idx = np.random.randint(0, len(master_psf_library))
+    repr_psf_4x = master_psf_library[repr_idx] 
 
-    repr_psf_4x = np.maximum(0, mean_psf_4x + np.tensordot(repr_weights, eigen_psfs_4x, axes=1))
-    repr_psf_4x /= (repr_psf_4x.sum() + 1e-9)
-
-    # Apply Jitter
-    s_jit, q_jit, t_jit = np.random.normal(0.127, 0.01), np.random.uniform(0.8, 1.0), np.random.uniform(0, np.pi)
-    kh = (SHAPE_SIZE * O) // 2; gy, gx = np.meshgrid(np.arange(SHAPE_SIZE*O) - kh, np.arange(SHAPE_SIZE*O) - kh, indexing='ij')
-    cos, sin = np.cos(t_jit), np.sin(t_jit); gxp, gyp = gx * cos + gy * sin, -gx * sin + gy * cos
-    jitter_k = np.exp(-(gxp**2 / (2 * (s_jit*O)**2) + gyp**2 / (2 * (s_jit*O * q_jit)**2)))
-    repr_psf_jit_4x = fftconvolve(repr_psf_4x, jitter_k / (jitter_k.sum() + 1e-9), mode='same')
-
-    # Bin phases
-    psf_library = np.zeros((O, O, SHAPE_SIZE, SHAPE_SIZE), dtype=np.float32)
-    padded_psf = np.pad(repr_psf_jit_4x, ((0, O), (0, O)))
-    for dy_idx in range(O):
-        for dx_idx in range(O):
-            window = padded_psf[dy_idx : dy_idx + SHAPE_SIZE*O, dx_idx : dx_idx + SHAPE_SIZE*O]
-            psf_library[dy_idx, dx_idx] = window.reshape(SHAPE_SIZE, O, SHAPE_SIZE, O).mean(axis=(1, 3))
+    # Correct Center (S-1)/2.0 and binning
+    psf_1x = repr_psf_4x.reshape(SHAPE_SIZE, O, SHAPE_SIZE, O).mean(axis=(1, 3))
+    psf_1x /= (np.sum(psf_1x) + 1e-9)
 
     # 3. Super-Mosaic Setup
     cadence_days = args.cadence / 24.0
@@ -140,48 +126,38 @@ def main():
     fluxes = exp_time * (10 ** (-0.4 * (mags - zp)))
     x_c, y_c = np.random.uniform(0, super_size, len(mags)), np.random.uniform(0, super_size, len(mags))
     
-    # Select Multiple Microlensing Events across a range of magnitudes
-    target_mag_min, target_mag_max = args.target_mag - 3.0, args.target_mag + 3.0
-    candidates = np.where((mags >= target_mag_min) & (mags <= target_mag_max))[0]
-    
+    # Select Multiple Microlensing Events
+    # Filter for stars brighter than 25.0 (numerically <= 25.0
+    # Sampling randomly from this set naturally follows the Bulge Luminosity Function distribution
+    candidates = np.where(mags <= 25.0)[0]
     if len(candidates) < args.num_events:
         event_indices = np.random.choice(len(mags), args.num_events, replace=False)
     else:
-        # Try to pick events across the magnitude range
-        candidate_mags = mags[candidates]
-        bins = np.linspace(target_mag_min, target_mag_max, args.num_events + 1)
-        event_indices = []
-        for j in range(args.num_events):
-            in_bin = candidates[(candidate_mags >= bins[j]) & (candidate_mags < bins[j+1])]
-            if len(in_bin) > 0:
-                event_indices.append(np.random.choice(in_bin))
-            else:
-                event_indices.append(np.random.choice(candidates))
+        event_indices = np.random.choice(candidates, args.num_events, replace=False)
     
     total_duration = times.max() - times.min()
     events = []
     for idx in event_indices:
-        # 1. Significant baseline constraint: 2 * tE < 0.5 * total_duration => tE < 0.25 * total_duration
-        max_tE = min(args.tE_max, 0.25 * total_duration)
-        min_tE = min(args.tE_min, max_tE * 0.5) # Ensure min is sane
-        tE = float(np.random.uniform(min_tE, max_tE))
+        # Tight constraint: tE < 0.125 * total_duration (8*tE fits in the series)
+        # This provides roughly 3*tE of baseline on BOTH sides if centered.
+        upper_limit = min(args.tE_max, 0.125 * total_duration)
         
-        # 2. Well-covered constraint: t0 - tE > times.min() and t0 + tE < times.max()
-        # => times.min() + tE < t0 < times.max() - tE
-        t0 = float(np.random.uniform(times.min() + tE, times.max() - tE))
+        # Ensure lower limit is strictly less than upper limit
+        lower_limit = min(args.tE_min, upper_limit * 0.5)
+        
+        tE = float(np.random.uniform(lower_limit, upper_limit))
+        
+        # Center the event with at least 2*tE margin from either edge
+        t0 = float(np.random.uniform(times.min() + 2*tE, times.max() - 2*tE))
         
         events.append({
-            'idx': int(idx),
-            't0': t0,
-            'tE': tE,
-            'u0': float(np.random.uniform(0.01, 0.5)),
-            'mag_base': float(mags[idx]),
-            'flux_base': float(fluxes[idx])
+            'idx': int(idx), 't0': t0, 'tE': tE, 'u0': float(np.random.uniform(0.01, 0.5)),
+            'mag_base': float(mags[idx]), 'flux_base': float(fluxes[idx])
         })
     
-    # Render static background (excluding event stars)
+    # Render static background
     s_mask = np.ones(len(mags), dtype=bool); s_mask[event_indices] = False
-    static_super = render_16phase_mosaic(x_c[s_mask], y_c[s_mask], fluxes[s_mask], super_size, psf_library, O=O)
+    static_super = render_bilinear_mosaic(x_c[s_mask], y_c[s_mask], fluxes[s_mask], super_size, psf_1x)
     
     sky_level = (10 ** (-0.4 * (sky_mag - zp))) * (0.11**2) * exp_time
     pixel_scale_deg = 0.11 / 3600.0
@@ -194,57 +170,40 @@ def main():
         y0_int, x0_int = int(np.round(offset_y)), int(np.round(offset_x))
         dy_sub, dx_sub = offset_y - y0_int, offset_x - x0_int
         
-        # 1. Clean background
-        epoch_img = shift(static_super[y0_int:y0_int+mosaic_size, x0_int:x0_int+mosaic_size], [-dy_sub, -dx_sub], order=3)
+        # 1. Background Shift (using order=1 for speed/consistency with bi-linear)
+        epoch_img = shift(static_super[y0_int:y0_int+mosaic_size, x0_int:x0_int+mosaic_size], [-dy_sub, -dx_sub], order=1)
         
         # 2. Inject Events
         current_event_data = []
         for ev in events:
             A = paczynski_magnification(t, ev['t0'], ev['tE'], ev['u0'])
             
-            # Use same spline-shift logic as background for the event star
-            # 1. Calculate precise position in SCA frame
+            # Position in SCA frame
             frame_x, frame_y = x_c[ev['idx']] - offset_x, y_c[ev['idx']] - offset_y
             
-            # 2. Render a high-res patch for the star once (at magnification 1.0)
-            # Or just render it in the frame every time but we want to avoid aliasing differences
-            # Option 3 says: Render a "static" baseline version and shift it.
-            # We'll render a 64x64 patch centered on the star's super-mosaic position.
-            # But since magnification changes, we only render the PSF shape.
-            
+            # Render a high-res patch for the star using bi-linear logic
             patch_size = 64
-            # We render it at the nearest integer pixel in the super-mosaic to keep PSF centered
             sx_int, sy_int = int(round(x_c[ev['idx']])), int(round(y_c[ev['idx']]))
-            # Position relative to patch center
             dx_patch, dy_patch = x_c[ev['idx']] - sx_int, y_c[ev['idx']] - sy_int
             
-            # Render the PSF into a small patch
-            star_patch = render_16phase_mosaic(
+            star_patch = render_bilinear_mosaic(
                 np.array([patch_size//2 + dx_patch]), 
                 np.array([patch_size//2 + dy_patch]), 
                 np.array([ev['flux_base']]), 
-                patch_size, psf_library, O=O
+                patch_size, psf_1x
             )
             
-            # Shift the patch by the exact same sub-pixel amount as the background
-            shifted_star = shift(star_patch, [-dy_sub, -dx_sub], order=3) * A
+            # Background-consistent shift
+            shifted_star = shift(star_patch, [-dy_sub, -dx_sub], order=1) * A
             
-            # Add to epoch image at the correct integer location
-            # Note: y0_int, x0_int are the top-left of the mosaic in super-mosaic
-            # Star is at sx_int, sy_int. Relative to mosaic top-left:
             ry, rx = sy_int - y0_int, sx_int - x0_int
-            
             y1, y2 = ry - patch_size//2, ry + patch_size//2
             x1, x2 = rx - patch_size//2, rx + patch_size//2
             
-            # Handle bounds
             iy1, iy2 = max(0, y1), min(mosaic_size, y2)
             ix1, ix2 = max(0, x1), min(mosaic_size, x2)
-            py1, py2 = iy1 - y1, iy2 - y1
-            px1, px2 = ix1 - x1, ix2 - x1
-            
             if iy2 > iy1 and ix2 > ix1:
-                epoch_img[iy1:iy2, ix1:ix2] += shifted_star[py1:py2, px1:px2]
+                epoch_img[iy1:iy2, ix1:ix2] += shifted_star[iy1-y1:iy2-y1, ix1-x1:ix2-x1]
 
             current_event_data.append({
                 'target_x_sca': float(frame_x), 'target_y_sca': float(frame_y),

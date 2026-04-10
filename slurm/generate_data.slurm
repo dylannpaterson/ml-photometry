@@ -5,8 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8          
 #SBATCH --mem=64G                  
-#SBATCH --partition=batch-gpu      
-#SBATCH --gpus-per-node=1          
+#SBATCH --partition=batch        
 #SBATCH --output=logs/gen_%j.out
 #SBATCH --error=logs/gen_%j.err
 
@@ -47,7 +46,20 @@ echo "🧩 Generating $NUM_MOSAICS train and $NUM_VAL_MOSAICS val mosaics..."
 
 # 3. Master PSF Library Generation (Do once for the whole dataset)
 mkdir -p "$FINAL_DIR"
+NEEDS_REGEN=false
 if [ ! -f "$MASTER_PSF_LIB" ]; then
+    NEEDS_REGEN=true
+else
+    # Check if existing library matches SHAPE_SIZE
+    CURR_SHAPE=$(python3 -c "from castor.constants import SHAPE_SIZE; print(SHAPE_SIZE)")
+    LIB_SHAPE=$(python3 -c "import torch; d=torch.load('$MASTER_PSF_LIB', map_location='cpu', weights_only=False); print(d.get('shape_size', 127))")
+    if [ "$CURR_SHAPE" != "$LIB_SHAPE" ]; then
+        echo "⚠️ PSF Library shape mismatch ($LIB_SHAPE vs $CURR_SHAPE). Forcing REGEN..."
+        NEEDS_REGEN=true
+    fi
+fi
+
+if [ "$NEEDS_REGEN" = true ]; then
     echo "📡 Pre-generating Master PSF Library..."
     srun python -u scripts/pregenerate_psf_library.py --num_psfs 100 --output "$MASTER_PSF_LIB"
 else
