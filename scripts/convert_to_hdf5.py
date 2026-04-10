@@ -113,6 +113,11 @@ def create_hdf5_datasets_combined(train_mosaic_dir, val_mosaic_dir, train_path, 
                 
                 img_data = np.load(mosaic['img'])
                 cat_data = np.load(mosaic['cat'])
+                
+                # IMPORTANT: Ensure catalog is sorted by Y for searchsorted
+                if not np.all(np.diff(cat_data['y']) >= 0):
+                    cat_data = np.sort(cat_data, order='y')
+                
                 meta_path = mosaic['img'].replace("_img.npy", "_meta.npy")
                 meta_data = np.load(meta_path) if os.path.exists(meta_path) else np.zeros(6, dtype=np.float32)
                 psf_lib = np.load(mosaic['lib']) if mosaic['lib'] else np.zeros((N_PCA + 1, SHAPE_SIZE * SHAPE_SIZE), dtype=np.float32)

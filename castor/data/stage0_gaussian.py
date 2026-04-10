@@ -184,9 +184,15 @@ def generate_mosaic_data(mosaic_size, params, master_psf_library):
     snrs = fluxes[v_mask] / np.sqrt(noise_variance)
     
     cat_dtype = [('x', 'f4'), ('y', 'f4'), ('flux', 'f4'), ('mag', 'f4'), ('snr', 'f4')]
+    
+    # Sort catalog by Y for searchsorted compatibility in HDF5 conversion
+    sort_y = np.argsort(py[v_mask])
     structured_cat = np.zeros(np.sum(v_mask), dtype=cat_dtype)
-    structured_cat['x'], structured_cat['y'], structured_cat['flux'], structured_cat['mag'] = px[v_mask], py[v_mask], fluxes[v_mask], mags[v_mask]
-    structured_cat['snr'] = snrs
+    structured_cat['x'] = px[v_mask][sort_y]
+    structured_cat['y'] = py[v_mask][sort_y]
+    structured_cat['flux'] = fluxes[v_mask][sort_y]
+    structured_cat['mag'] = mags[v_mask][sort_y]
+    structured_cat['snr'] = snrs[sort_y]
     
     # Save in (N_PCA + 1, S*S) format for compatibility with inference and HDF5 structure
     psf_lib_save = np.zeros((N_PCA_COMPONENTS + 1, SHAPE_SIZE * SHAPE_SIZE), dtype=np.float32)
