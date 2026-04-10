@@ -113,7 +113,23 @@ class Trainer:
                     
                     # Capture psf_library once for checkpointing
                     if self.psf_library is None:
-                        self.psf_library = psf_library[0:1].detach().cpu()
+                        # 1. Extract the library and strip empty batch dimensions
+                        raw_lib = psf_library.detach().cpu().squeeze()
+                        
+                        # Handle potential single-PSF or complex batch dimensions
+                        if raw_lib.dim() == 2:
+                            raw_lib = raw_lib.unsqueeze(0) # [1, H, W]
+                        elif raw_lib.dim() > 3:
+                            # Flatten batch dimensions into a single list of PSFs
+                            raw_lib = raw_lib.view(-1, raw_lib.shape[-2], raw_lib.shape[-1])
+                            
+                        # 2. CRITICAL FIX: Explicit L1 Normalization
+                        # Force every individual PSF profile to sum to exactly 1.0.
+                        # This ensures that when the mean PSF is calculated later, 
+                        # unscaled artifacts don't distort the physics prior or reconstructor.
+                        normalized_lib = raw_lib / (raw_lib.sum(dim=(-2, -1), keepdim=True) + 1e-9)
+                        
+                        self.psf_library = normalized_lib
                 else:
                     images, targets = batch
                     images, targets = images.to(self.device, non_blocking=True), targets.to(self.device, non_blocking=True).float()

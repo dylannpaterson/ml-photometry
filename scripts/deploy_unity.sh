@@ -21,6 +21,7 @@ rsync -avz --progress \
     --exclude='*.fits' \
     --exclude='*.png' \
     --exclude='*.asdf' \
+    --exclude='animations' \
     ./ $REMOTE_HOST:$REMOTE_DIR/
 
 echo "✅ Sync complete."

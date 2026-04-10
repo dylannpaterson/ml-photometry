@@ -6,7 +6,7 @@ import os
 from scipy.ndimage import zoom
 from astropy.io import fits
 from castor.data.transforms import AstroSpaceTransform
-from castor.constants import GLOBAL_STRETCH_SCALE, N_PCA_COMPONENTS
+from castor.constants import GLOBAL_STRETCH_SCALE, N_PCA_COMPONENTS, SHAPE_SIZE
 from scipy.signal import fftconvolve
 
 def upsample_background(bg_map, target_size):
@@ -72,9 +72,31 @@ class InferenceEngine:
         grid_h, grid_w, K, _ = prediction.shape
         cell_size = self.img_size // grid_h
         
-        # Determine S from basis if available, else fallback
+        # Robustly unpack the PSF regardless of batch dims or tensor/numpy type
+        base_psf = None
         if mean_psf is not None:
-            S = int(mean_psf.shape[0]**0.5)
+            # Ensure it's a numpy array and squeeze batch/channel dims
+            if hasattr(mean_psf, 'cpu'):
+                psf_arr = mean_psf.detach().cpu().squeeze().numpy()
+            else:
+                psf_arr = np.squeeze(mean_psf)
+                
+            # If it somehow remained 1D (old format), reshape it to 2D
+            if psf_arr.ndim == 1:
+                s = int(psf_arr.shape[0]**0.5)
+                psf_arr = psf_arr.reshape(s, s)
+                
+            S_full = psf_arr.shape[0] # Guaranteed 2D here
+            
+            # Bin down if oversampled
+            if S_full > SHAPE_SIZE:
+                O = S_full // SHAPE_SIZE
+                base_psf = psf_arr.reshape(SHAPE_SIZE, O, SHAPE_SIZE, O).mean(axis=(1, 3))
+                base_psf = base_psf / (np.sum(base_psf) + 1e-9)
+                S = SHAPE_SIZE
+            else:
+                base_psf = psf_arr
+                S = S_full
         else:
             S = 9
         
@@ -91,8 +113,8 @@ class InferenceEngine:
                         predicted_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, float(physical_flux), p, sigmas))
                         
                         # Use Mean PSF for reconstruction (Shape recovery dropped in favor of uncertainty)
-                        if mean_psf is not None:
-                            predicted_shapes.append(mean_psf.reshape(S, S))
+                        if base_psf is not None:
+                            predicted_shapes.append(base_psf)
                         else:
                             # Safe fallback - Create a simple 9x9 Gaussian
                             sy, sx = np.meshgrid(np.arange(9)-4, np.arange(9)-4)
@@ -146,9 +168,37 @@ class InferenceEngine:
 
         # --- RECONSTRUCT MISSED SOURCES ---
         reconstruction_missed_linear = np.zeros_like(img_stretched)
+        
+        # Robustly unpack the PSF regardless of batch dims or tensor/numpy type
+        base_psf = None
         if mean_psf is not None:
-            S_m = int(len(mean_psf)**0.5); half_m = S_m // 2
-            mean_psf_2d = mean_psf.reshape(S_m, S_m)
+            # Ensure it's a numpy array and squeeze batch/channel dims
+            if hasattr(mean_psf, 'cpu'):
+                psf_arr = mean_psf.detach().cpu().squeeze().numpy()
+            else:
+                psf_arr = np.squeeze(mean_psf)
+                
+            # If it somehow remained 1D (old format), reshape it to 2D
+            if psf_arr.ndim == 1:
+                s = int(psf_arr.shape[0]**0.5)
+                psf_arr = psf_arr.reshape(s, s)
+                
+            S_full = psf_arr.shape[0] # Guaranteed 2D here
+            
+            # Bin down if oversampled
+            if S_full > SHAPE_SIZE:
+                O = S_full // SHAPE_SIZE
+                base_psf = psf_arr.reshape(SHAPE_SIZE, O, SHAPE_SIZE, O).mean(axis=(1, 3))
+                base_psf = base_psf / (np.sum(base_psf) + 1e-9)
+                S_m = SHAPE_SIZE
+            else:
+                base_psf = psf_arr
+                S_m = S_full
+        else:
+            S_m = 9
+
+        if base_psf is not None:
+            half_m = S_m // 2
             for i in range(len(true_catalogue)):
                 if i not in matched_true_indices:
                     p_t, x_t, y_t, flux_t = true_catalogue[i][:4]
@@ -164,7 +214,7 @@ class InferenceEngine:
                         sy0, sy1 = half_m - (iy-ym), half_m + (yM-iy)
                         sx0, sx1 = half_m - (ix-xm), half_m + (xM-ix)
                         if sy1 > sy0 and sx1 > sx0:
-                            reconstruction_missed_linear[ym:yM, xm:xM] += (flux_t * w) * mean_psf_2d[sy0:sy1, sx0:sx1]
+                            reconstruction_missed_linear[ym:yM, xm:xM] += (flux_t * w) * base_psf[sy0:sy1, sx0:sx1]
 
         # --- APPLY GLOBAL JITTER ---
         if jitter_params is not None:

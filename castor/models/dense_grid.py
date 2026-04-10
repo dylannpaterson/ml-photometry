@@ -54,11 +54,21 @@ class DiffractionAwareFilter(nn.Module):
                 if isinstance(master_data, dict):
                     m_psf = torch.from_numpy(master_data['mean_psf']).float()
                 elif torch.is_tensor(master_data):
-                    # Check for [Batch, N_PCA+1, H*W] or [N_PCA+1, H*W]
-                    if master_data.dim() == 3:
-                        m_psf = master_data[0, -1].float()
+                    # Squeeze batch and channel dims -> e.g., [516, 516]
+                    master_data = master_data.squeeze()
+                    
+                    if master_data.dim() == 2:
+                        m_psf = master_data.float()
+                    elif master_data.dim() == 1:
+                        # Old flattened format
+                        s = int(master_data.shape[0]**0.5)
+                        m_psf = master_data.view(s, s).float()
                     else:
+                        # Fallback for old [N_PCA+1, H*W] format
                         m_psf = master_data[-1].float()
+                        if m_psf.dim() == 1:
+                            s = int(m_psf.shape[0]**0.5)
+                            m_psf = m_psf.view(s, s)
                 elif isinstance(master_data, (list, tuple)):
                     # Assume tuple (eigen, weights, mean)
                     m_psf = torch.from_numpy(master_data[2]).float()
@@ -67,11 +77,14 @@ class DiffractionAwareFilter(nn.Module):
                     m_psf = None
                 
                 if m_psf is not None:
-                    # Reshape to 2D if needed (assume square)
-                    if m_psf.dim() == 1:
-                        s = int(m_psf.shape[0]**0.5)
-                        m_psf = m_psf.view(s, s)
-                    
+                    # NEW: Bin down to 1x if oversampled
+                    from castor.constants import SHAPE_SIZE
+                    S_full = m_psf.shape[0]
+                    if S_full > SHAPE_SIZE:
+                        O = S_full // SHAPE_SIZE
+                        m_psf = m_psf.reshape(SHAPE_SIZE, O, SHAPE_SIZE, O).mean(dim=(1, 3))
+                        m_psf = m_psf / (m_psf.sum() + 1e-9)
+
                     kernel = self._fit_to_kernel_size(m_psf, kernel_size)
                     print(f"🛰️ DiffractionAwareFilter: Initialized with Master Library Mean ({psf_library_path})")
             except Exception as e:
