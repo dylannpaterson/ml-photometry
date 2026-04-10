@@ -164,12 +164,20 @@ def generate_mosaic_data(mosaic_size, params, master_psf_data):
 
     repr_psf_jit_4x = fftconvolve(repr_psf_4x, jitter_kernel_high, mode='same')
 
-    # Proper Binning (Area Integration)
+    # Proper Binning (Area Integration) with Sub-Pixel Alignment
     psf_library = np.zeros((O, O, SHAPE_SIZE, SHAPE_SIZE), dtype=np.float32)
-    padded_psf = np.pad(repr_psf_jit_4x, ((0, O), (0, O)))
+    
+    # Pad to allow for sub-pixel window shifts
+    pad_amt = O
+    padded_psf = np.pad(repr_psf_jit_4x, ((pad_amt, pad_amt), (pad_amt, pad_amt)))
+    
     for dy_idx in range(O):
         for dx_idx in range(O):
-            window = padded_psf[dy_idx : dy_idx + SHAPE_SIZE*O, dx_idx : dx_idx + SHAPE_SIZE*O]
+            # The bin spans [d/O, (d+1)/O]. The center is (d + 0.5)/O.
+            # To align the PSF center (0.0) with the bin center, we shift by O-1-d.
+            offset_y = (O - 1) - dy_idx
+            offset_x = (O - 1) - dx_idx
+            window = padded_psf[offset_y : offset_y + SHAPE_SIZE*O, offset_x : offset_x + SHAPE_SIZE*O]
             binned = window.reshape(SHAPE_SIZE, O, SHAPE_SIZE, O).mean(axis=(1, 3))
             psf_library[dy_idx, dx_idx] = binned / (np.sum(binned) + 1e-9)
 
@@ -186,6 +194,8 @@ def generate_mosaic_data(mosaic_size, params, master_psf_data):
             if not mask.any(): continue
             flat_indices = y0[mask] * mosaic_size + x0[mask]
             grid = np.bincount(flat_indices, weights=fluxes[mask], minlength=mosaic_size*mosaic_size).reshape(mosaic_size, mosaic_size)
+            
+            # Simple 'same' convolution is accurate for odd kernels
             full_image += fftconvolve(grid, psf_library[dyi, dxi], mode='same')
 
     full_image = np.maximum(0, full_image)
