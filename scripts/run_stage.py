@@ -304,21 +304,71 @@ def run_infer(stage_idx, config, device, checkpoint=None):
         image_tensor = sample["image"]
         target = sample["target"]
         
-        # --- PSF Basis Loading ---
+        # --- Robust PSF Basis Loading ---
         # Priority: Checkpoint embedded library > Local .pt file > Dataset sample
+        psf_lib_data = None
         if psf_lib_ckpt is not None:
             print("📂 Using PSF basis embedded in model checkpoint...")
-            psf_lib = psf_lib_ckpt.squeeze(0) # [N_PCA + 1, 961]
+            psf_lib_data = psf_lib_ckpt
         elif os.path.exists("stage0_psf_basis.pt"):
             print(f"📂 Loading PSF basis from stage0_psf_basis.pt...")
-            psf_lib = torch.load("stage0_psf_basis.pt", map_location="cpu")
+            psf_lib_data = torch.load("stage0_psf_basis.pt", map_location="cpu")
+        elif os.path.exists("master_psf_library.pt"):
+            print(f"📂 Loading PSF basis from master_psf_library.pt...")
+            psf_lib_data = torch.load("master_psf_library.pt", map_location="cpu")
         else:
-            psf_lib = sample["psf_library"] # [N_PCA + 1, 961]
+            psf_lib_data = sample["psf_library"]
             
-        # Extract basis and mean for reconstruction
-        # psf_lib is expected to be [N_PCA + 1, 961]
-        psf_basis = psf_lib[:-1, :]
-        mean_psf = psf_lib[-1, :]
+        # Extract mean_psf and basis robustly
+        mean_psf = None
+        psf_basis = None
+        
+        if isinstance(psf_lib_data, dict):
+            mean_psf = psf_lib_data.get('mean_psf')
+            # Basis might not be in all formats, but we try
+            if 'eigen_psfs' in psf_lib_data:
+                psf_basis = psf_lib_data['eigen_psfs']
+        elif isinstance(psf_lib_data, (list, tuple)):
+            # Assuming (eigen, weights, mean)
+            psf_basis = psf_lib_data[0]
+            mean_psf = psf_lib_data[2] if len(psf_lib_data) > 2 else psf_lib_data[-1]
+        elif torch.is_tensor(psf_lib_data) or isinstance(psf_lib_data, np.ndarray):
+            data = psf_lib_data if isinstance(psf_lib_data, np.ndarray) else psf_lib_data.cpu().numpy()
+            data = np.squeeze(data)
+            
+            # Handle [N_PCA+1, H*W] or [H, W]
+            if data.ndim == 2:
+                mean_psf = data
+            elif data.ndim == 1:
+                s = int(data.shape[0]**0.5)
+                mean_psf = data.reshape(s, s)
+            else:
+                # [N_PCA+1, H, W] or [N_PCA+1, H*W]
+                psf_basis = data[:-1]
+                mean_psf = data[-1]
+                if mean_psf.ndim == 1:
+                    s = int(mean_psf.shape[0]**0.5)
+                    mean_psf = mean_psf.reshape(s, s)
+                    psf_basis = psf_basis.reshape(-1, s, s)
+
+        # Ensure mean_psf is numpy and 2D
+        if torch.is_tensor(mean_psf):
+            mean_psf = mean_psf.detach().cpu().numpy()
+        
+        # Bin down if oversampled
+        S_full = mean_psf.shape[0]
+        if S_full > SHAPE_SIZE:
+            O = S_full // SHAPE_SIZE
+            mean_psf = mean_psf.reshape(SHAPE_SIZE, O, SHAPE_SIZE, O).mean(axis=(1, 3))
+            if psf_basis is not None:
+                psf_basis = psf_basis.reshape(-1, S_full, S_full)
+                psf_basis = psf_basis.reshape(-1, SHAPE_SIZE, O, SHAPE_SIZE, O).mean(axis=(2, 4))
+
+        # Normalize
+        mean_psf = mean_psf / (np.sum(mean_psf) + 1e-9)
+        if psf_basis is not None:
+            # Flatten basis if needed for engine.predict compatibility
+            psf_basis = psf_basis.reshape(-1, SHAPE_SIZE * SHAPE_SIZE)
         # -------------------------
         
         # --- THE FIX: Apply Live Noise and Stretch ---
@@ -364,8 +414,8 @@ def run_infer(stage_idx, config, device, checkpoint=None):
         # FIX: Pass raw linear noisy image, as predict() handles its own stretch
         predicted_stars, predicted_shapes, bg_map = engine.predict(
             img_noisy, 
-            psf_basis=psf_basis.numpy(), 
-            mean_psf=mean_psf.numpy()
+            psf_basis=psf_basis, 
+            mean_psf=mean_psf
         )
         
         # --- THE FIX: Extract Jitter for Visualization ---
@@ -419,8 +469,8 @@ def run_infer(stage_idx, config, device, checkpoint=None):
             threshold=0.5, 
             chunk_median=noisy_median,
             jitter_params=jitter_params,
-            psf_basis=psf_basis.numpy(),
-            mean_psf=mean_psf.numpy()
+            psf_basis=psf_basis,
+            mean_psf=mean_psf
         )
     else:
         print(f"⚠️ Specialized inference for stage {stage_idx} not yet implemented.")

@@ -137,7 +137,6 @@ class InferenceEngine:
         
         # 1. MATCHING
         detected_stars = [s for s in predicted_stars if s[3] >= 0.5]
-        detected_shapes = [shp for s, shp in zip(predicted_stars, predicted_shapes) if s[3] >= 0.5]
         
         match_true = [(s[1], s[2], s[3]) for s in true_catalogue]
         match_pred = [(s[0], s[1], s[2]) for s in detected_stars]
@@ -149,27 +148,7 @@ class InferenceEngine:
         full_residual_bg_stretched = upsample_background(bg_map.squeeze(), (H, W))
         full_gt_residual_bg_stretched = upsample_background(gt_bg_map.squeeze(), (H, W))
         
-        # --- SUB-PIXEL ACCURATE RECONSTRUCTION ---
-        reconstruction_stars_linear = np.zeros_like(img_stretched)
-        for (x, y, flux, p, sigmas), shape in zip(detected_stars, detected_shapes):
-            S_s = shape.shape[0]; half_s = S_s // 2
-            x0, y0 = int(np.floor(x)), int(np.floor(y))
-            dx, dy = x - x0, y - y0
-            w00, w10, w01, w11 = (1.0-dx)*(1.0-dy), dx*(1.0-dy), (1.0-dx)*dy, dx*dy
-            for j, i, w in [(0, 0, w00), (1, 0, w10), (0, 1, w01), (1, 1, w11)]:
-                if w <= 0: continue
-                iy, ix = y0 + i, x0 + j
-                y_min, y_max = max(0, iy-half_s), min(H, iy+half_s+1)
-                x_min, x_max = max(0, ix-half_s), min(W, ix+half_s+1)
-                sy0, sy1 = half_s - (iy-y_min), half_s + (y_max-iy)
-                sx0, sx1 = half_s - (ix-x_min), half_s + (x_max-ix)
-                if sy1 > sy0 and sx1 > sx0:
-                    reconstruction_stars_linear[y_min:y_max, x_min:x_max] += (flux * w) * shape[sy0:sy1, sx0:sx1]
-
-        # --- RECONSTRUCT MISSED SOURCES ---
-        reconstruction_missed_linear = np.zeros_like(img_stretched)
-        
-        # Robustly unpack the PSF regardless of batch dims or tensor/numpy type
+        # --- ROBUST PSF EXTRACTION ---
         base_psf = None
         if mean_psf is not None:
             # Ensure it's a numpy array and squeeze batch/channel dims
@@ -183,53 +162,84 @@ class InferenceEngine:
                 s = int(psf_arr.shape[0]**0.5)
                 psf_arr = psf_arr.reshape(s, s)
                 
-            S_full = psf_arr.shape[0] # Guaranteed 2D here
+            S_full = psf_arr.shape[0]
             
             # Bin down if oversampled
             if S_full > SHAPE_SIZE:
                 O = S_full // SHAPE_SIZE
                 base_psf = psf_arr.reshape(SHAPE_SIZE, O, SHAPE_SIZE, O).mean(axis=(1, 3))
                 base_psf = base_psf / (np.sum(base_psf) + 1e-9)
-                S_m = SHAPE_SIZE
             else:
                 base_psf = psf_arr
-                S_m = S_full
-        else:
-            S_m = 9
+        
+        if base_psf is None:
+            # Safe fallback - Create a simple 9x9 Gaussian if no PSF provided
+            sy, sx = np.meshgrid(np.arange(9)-4, np.arange(9)-4)
+            base_psf = np.exp(-(sx**2 + sy**2) / (2 * 1.5**2))
+            base_psf /= (base_psf.sum() + 1e-9)
 
-        if base_psf is not None:
-            half_m = S_m // 2
-            for i in range(len(true_catalogue)):
-                if i not in matched_true_indices:
-                    p_t, x_t, y_t, flux_t = true_catalogue[i][:4]
-                    if p_t < 0.1: continue 
-                    x0, y0 = int(np.floor(x_t)), int(np.floor(y_t))
-                    dx, dy = x_t - x0, y_t - y0
-                    w00, w10, w01, w11 = (1.0-dx)*(1.0-dy), dx*(1.0-dy), (1.0-dx)*dy, dx*dy
-                    for j, i_off, w in [(0, 0, w00), (1, 0, w10), (0, 1, w01), (1, 1, w11)]:
-                        if w <= 0: continue
-                        iy, ix = y0 + i_off, x0 + j
-                        ym, yM = max(0, iy-half_m), min(H, iy+half_m+1)
-                        xm, xM = max(0, ix-half_m), min(W, ix+half_m+1)
-                        sy0, sy1 = half_m - (iy-ym), half_m + (yM-iy)
-                        sx0, sx1 = half_m - (ix-xm), half_m + (xM-ix)
-                        if sy1 > sy0 and sx1 > sx0:
-                            reconstruction_missed_linear[ym:yM, xm:xM] += (flux_t * w) * base_psf[sy0:sy1, sx0:sx1]
+        # --- EFFICIENT DRAWING (Matching Mosaic Engine) ---
+        def draw_stars_on_grid(stars, height, width, is_predicted=True):
+            grid = np.zeros((height, width), dtype=np.float32)
+            if not stars:
+                return grid
+                
+            if is_predicted:
+                # predicted: (x, y, flux, p, sigmas)
+                px = np.array([s[0] for s in stars])
+                py = np.array([s[1] for s in stars])
+                fluxes = np.array([s[2] for s in stars])
+            else:
+                # true: (p, x, y, flux)
+                px = np.array([s[1] for s in stars])
+                py = np.array([s[2] for s in stars])
+                fluxes = np.array([s[3] for s in stars])
+                
+            x0, y0 = np.floor(px).astype(int), np.floor(py).astype(int)
+            dx, dy = px - x0, py - y0
+            
+            # Bi-linear weights
+            w00, w10, w01, w11 = (1-dx)*(1-dy), dx*(1-dy), (1-dx)*dy, dx*dy
+            
+            def paint_flux(x_coords, y_coords, weights):
+                # Mask out-of-bounds
+                mask = (x_coords >= 0) & (x_coords < width) & (y_coords >= 0) & (y_coords < height)
+                xc, yc, wc, fc = x_coords[mask], y_coords[mask], weights[mask], fluxes[mask]
+                flat_idx = yc * width + xc
+                grid.flat += np.bincount(flat_idx, weights=fc * wc, minlength=grid.size)
+
+            paint_flux(x0, y0, w00)
+            paint_flux(x0 + 1, y0, w10)
+            paint_flux(x0, y0 + 1, w01)
+            paint_flux(x0 + 1, y0 + 1, w11)
+            return grid
+
+        # Reconstruct detected stars
+        detected_grid = draw_stars_on_grid(detected_stars, H, W, is_predicted=True)
+        reconstruction_stars_linear = fftconvolve(detected_grid, base_psf, mode='same')
+
+        # Reconstruct missed stars
+        missed_stars = [true_catalogue[i] for i in range(len(true_catalogue)) if i not in matched_true_indices and true_catalogue[i][0] >= 0.1]
+        missed_grid = draw_stars_on_grid(missed_stars, H, W, is_predicted=False)
+        reconstruction_missed_linear = fftconvolve(missed_grid, base_psf, mode='same')
 
         # --- APPLY GLOBAL JITTER ---
         if jitter_params is not None:
             s_j, q_j, t_j = jitter_params
-            S_j = SHAPE_SIZE
-            kj = (S_j - 1) / 2.0
-            gy, gx = np.meshgrid(np.arange(S_j) - kj, np.arange(S_j) - kj, indexing='ij')
-            cos, sin = np.cos(t_j), np.sin(t_j)
-            gxp, gyp = gx * cos + gy * sin, -gx * sin + gy * cos
-            j_kernel = np.exp(-(gxp**2 / (2 * s_j**2) + gyp**2 / (2 * (s_j * q_j)**2)))
-            j_kernel /= (j_kernel.sum() + 1e-9)
-            reconstruction_stars_linear = fftconvolve(reconstruction_stars_linear, j_kernel, mode='same')
-            reconstruction_missed_linear = fftconvolve(reconstruction_missed_linear, j_kernel, mode='same')
+            if s_j > 0:
+                S_j = SHAPE_SIZE
+                kj = (S_j - 1) / 2.0
+                gy, gx = np.meshgrid(np.arange(S_j) - kj, np.arange(S_j) - kj, indexing='ij')
+                cos, sin = np.cos(t_j), np.sin(t_j)
+                gxp, gyp = gx * cos + gy * sin, -gx * sin + gy * cos
+                j_kernel = np.exp(-(gxp**2 / (2 * s_j**2) + gyp**2 / (2 * (s_j * q_j)**2)))
+                j_kernel /= (j_kernel.sum() + 1e-9)
+                reconstruction_stars_linear = fftconvolve(reconstruction_stars_linear, j_kernel, mode='same')
+                reconstruction_missed_linear = fftconvolve(reconstruction_missed_linear, j_kernel, mode='same')
 
         # 3. ABSOLUTE SPACE CONVERSION
+        # FIX: The model now outputs LINEAR flux directly (exp of log_flux).
+        # We NO LONGER apply network_to_flux here.
         full_residual_bg_linear = self.transform.network_to_bg(full_residual_bg_stretched)
         full_reconstruction_linear_abs = reconstruction_stars_linear + full_residual_bg_linear + chunk_median
         img_linear_abs = self.transform.network_to_image(img_stretched, chunk_median)
