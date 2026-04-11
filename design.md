@@ -23,9 +23,9 @@ To develop a machine learning pipeline capable of performing fast, direct point-
         *   **Logit Bypass:** For training stability, the model outputs raw logits for $p$. Sigmoid is only applied during inference.
         *   **Sub-Pixel Confusion SNR:** The local SNR natively accounts for crowding. It is calculated by sampling the total simulated starlight at the sub-pixel coordinates, subtracting the star's own peak flux, and adding this residual "confusion light" to the sky background and read noise variance.
     2.  **dx, dy:** Sub-pixel offset from the cell's top-left corner ($0.0 \to \text{cell\_size}$).
-    3.  **flux:** Physical Flux. Predicted via a **Log-Space Bypass**: The network predicts raw log-flux, which is clamped ($[-10.0, 22.0]$) and exponentiated to output physical flux.
+    3.  **flux:** Physical Flux. Predicted via an **Asinh-Space Bypass**: The network predicts the flux in Arcsinh space, which is clamped ($[-2.0, 30.0]$) and converted back using Sinh to output physical flux. This aligns the photometry head with the input image distribution and stabilizes learning for faint stars.
     4.  **log_var_x, log_var_y:** Natural log of the astrometric variance ($\sigma_x^2, \sigma_y^2$).
-    5.  **log_var_m:** Natural log of the photometric variance ($\sigma_m^2$ in log-flux space).
+    5.  **log_var_f:** Natural log of the photometric variance ($\sigma_f^2$ in Arcsinh-flux space).
 *   **Background Value (1 per cell):**
     1.  **b:** Residual Background Level. Represents local deviations from the chunk's median sky in stretched space.
 
@@ -37,6 +37,7 @@ Before entering the backbone, the raw input image passes through a **Diffraction
 *   **Kernel Size:** $21 \times 21$.
 *   **Purpose:** Provides a mathematical prior optimized for blob detection and edge suppression. By concatenating the original image with this filter response, the network is immediately alerted to point-source structures vs. diffraction spikes or background gradients.
 *   **Trainability:** The filter weights are initialized using the LoG formula (or the survey-average PSF mean) but remain trainable, allowing the model to "warp" the prior to perfectly match the unique diffraction profile of the telescope.
+*   **Regularization:** An L2 penalty ($\mathcal{L}_{DReg}$) ensures the filter maintains physical interpretability.
 
 ### Stage 1: The Backbone
 *   **Backbone:** Full ResNet-34 (all 4 stages).
@@ -54,16 +55,18 @@ A **Feature Pyramid Network (FPN)** merges deep semantic context from the lower 
 *   **Activations:**
     *   **p:** Linear (Raw logits during training).
     *   **dx, dy:** Sigmoid $\times \text{cell\_size}$.
-    *   **flux:** Bounded Exponential (Log-Flux Bypass).
-    *   **log_vars:** Linear (Natural log space allows linear linear outputs to span $[-\infty, \infty]$ for stability).
+    *   **flux:** Bounded Sinh (Asinh-Flux Bypass).
+    *   **log_vars:** Linear (Natural log space allows linear outputs to span $[-\infty, \infty]$ for stability).
 
 ## 4. The Loss Function: Aleatoric Uncertainty NLL
 Instead of simple regression, the model minimizes the **Gaussian Negative Log-Likelihood (NLL)** for all measurement parameters.
 *   **Total Loss:** $\mathcal{L}_{Total} = \lambda_1 \mathcal{L}_{Prob} + \lambda_2 \mathcal{L}_{Pos\_NLL} + \lambda_3 \mathcal{L}_{Flux\_NLL} + \lambda_4 \mathcal{L}_{BG} + \lambda_5 \mathcal{L}_{DReg}$
 *   **$\mathcal{L}_{Prob}$:** `BCEWithLogitsLoss` with Logarithmic Soft SNR Targets, combined with manual Focal Loss.
+*   **Probability-Weighted Regression:** To prioritize recall while maintaining high precision, $\mathcal{L}_{Pos\_NLL}$ and $\mathcal{L}_{Flux\_NLL}$ are weighted by the **target probability $p$**. Faint stars (low SNR) contribute less to the precision gradients than bright stars, preventing noise from washing out the learned PSF geometry.
 *   **NLL Regression:** For $dx, dy$ and $flux$, the network learns to balance two terms:
-    1. **The Residual Term:** $\exp(-\ln \sigma^2) (\text{pred} - \text{target})^2$. If the network's prediction is far from the target, it can reduce this massive penalty by increasing the predicted variance.
-    2. **The Regularization Term:** $\ln \sigma^2$. This prevents the network from just predicting infinite variance everywhere to zero out the residual term.
+    1. **The Residual Term:** $\exp(-\ln \sigma^2) (\text{pred} - \text{target})^2$.
+    2. **The Regularization Term:** $\ln \sigma^2$.
+*   **Beta-NLL Stabilization:** Loss terms are scaled by $(\sigma^2)^\beta$ (with $\beta=0.5$) to prevent gradient explosions for high-SNR targets.
 *   **$\mathcal{L}_{BG}$:** Global MSE for the background residuals.
 *   **$\mathcal{L}_{DReg}$:** L2 regularization for the Diffraction-Aware Filter to prevent it from drifting too far from the initialization prior.
 
