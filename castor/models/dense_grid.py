@@ -190,6 +190,10 @@ class DenseGridModel(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(256, self.num_output_channels, kernel_size=1)
         )
+        
+        # NEW: Homoscedastic Task Uncertainty Parameters
+        # Indices: 0:Prob, 1:Pos, 2:Flux, 3:BG, 4:DReg
+        self.log_task_vars = nn.Parameter(torch.zeros(5))
 
     def forward(self, x):
         # Bottom-up
@@ -250,7 +254,8 @@ class DenseGridModel(nn.Module):
                 "p_logits": p_logits,
                 "raw_asinh_flux": raw_asinh_flux,
                 "log_vars": log_vars,
-                "background": bg
+                "background": bg,
+                "log_task_vars": self.log_task_vars # Export learnable weights
             }
 
 def compute_nll_loss(pred, target, log_var, beta=0.5, weights=None):
@@ -275,9 +280,10 @@ def compute_nll_loss(pred, target, log_var, beta=0.5, weights=None):
     
     return weighted_loss.mean()
 
-def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=5.0, lambda_pos=50.0, lambda_flux=5.0, lambda_bg=0.1, focal_alpha=0.75, focal_gamma=2.0, stretch_scale=GLOBAL_STRETCH_SCALE):
+def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=5.0, lambda_pos=50.0, lambda_flux=5.0, lambda_bg=0.1, focal_alpha=0.75, focal_gamma=2.0, stretch_scale=GLOBAL_STRETCH_SCALE, log_task_vars=None):
     """
     Refactored loss using Aleatoric Uncertainty Estimation (NLL).
+    Now supports Homoscedastic Task Uncertainty Weighting.
     """
     star_preds = preds["stars"]
     bg_preds = preds["background"]
@@ -303,7 +309,7 @@ def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=5.0, lambda_pos=
     focal_weight = (1 - p_t) ** focal_gamma
     alpha_t = p_target * focal_alpha + (1 - p_target) * (1 - focal_alpha)
     
-    prob_loss = (alpha_t * focal_weight * bce_loss).mean()
+    raw_prob_loss = (alpha_t * focal_weight * bce_loss).mean()
     
     # 3. Regression Losses (Masked & Weighted by p_target)
     if obj_mask.sum() > 0:
@@ -318,25 +324,39 @@ def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=5.0, lambda_pos=
         asinh_flux_target = torch.asinh(flux_target / float(stretch_scale))
         log_var_flux = star_preds[..., 6:7][obj_mask]
         
-        # KEY CHANGE: Weight the regression loss by the target probability.
-        # This preserves the aleatoric interpretation while prioritizing clear stars.
         reg_weights = p_target[obj_mask]
 
         # Calculate Weighted NLL Losses
-        pos_loss = compute_nll_loss(pos_pred, pos_target, log_var_pos, weights=reg_weights)
-        flux_loss = compute_nll_loss(asinh_flux_pred, asinh_flux_target, log_var_flux, weights=reg_weights)
+        raw_pos_loss = compute_nll_loss(pos_pred, pos_target, log_var_pos, weights=reg_weights)
+        raw_flux_loss = compute_nll_loss(asinh_flux_pred, asinh_flux_target, log_var_flux, weights=reg_weights)
     else:
-        pos_loss = torch.tensor(0.0, device=star_preds.device)
-        flux_loss = torch.tensor(0.0, device=star_preds.device)
+        raw_pos_loss = torch.tensor(0.0, device=star_preds.device)
+        raw_flux_loss = torch.tensor(0.0, device=star_preds.device)
         
     # 4. Background Loss (Global MSE)
-    bg_loss = F.mse_loss(bg_preds, bg_targets, reduction='mean')
+    raw_bg_loss = F.mse_loss(bg_preds, bg_targets, reduction='mean')
+    
+    # --- TASK UNCERTAINTY WEIGHTING ---
+    if log_task_vars is not None:
+        # Weights: 0:Prob, 1:Pos, 2:Flux, 3:BG, 4:DReg
+        # Using the standard multi-task loss formulation: exp(-s) * L + s
+        prob_loss = torch.exp(-log_task_vars[0]) * raw_prob_loss + log_task_vars[0]
+        pos_loss = torch.exp(-log_task_vars[1]) * raw_pos_loss + log_task_vars[1]
+        flux_loss = torch.exp(-log_task_vars[2]) * raw_flux_loss + log_task_vars[2]
+        bg_loss = torch.exp(-log_task_vars[3]) * raw_bg_loss + log_task_vars[3]
         
-    total_loss = (lambda_prob * prob_loss + 
-                  lambda_pos * pos_loss + 
-                  lambda_flux * flux_loss +
-                  lambda_bg * bg_loss)
-                  
+        # Final weighted sum (lambdas now act as optional base-scales)
+        total_loss = (lambda_prob * prob_loss + 
+                      lambda_pos * pos_loss + 
+                      lambda_flux * flux_loss +
+                      lambda_bg * bg_loss)
+    else:
+        # Fallback to static weights if params missing
+        total_loss = (lambda_prob * raw_prob_loss + 
+                      lambda_pos * raw_pos_loss + 
+                      lambda_flux * raw_flux_loss +
+                      lambda_bg * raw_bg_loss)
+        prob_loss, pos_loss, flux_loss, bg_loss = raw_prob_loss, raw_pos_loss, raw_flux_loss, raw_bg_loss
                   
     return total_loss, prob_loss, pos_loss, flux_loss, bg_loss
         

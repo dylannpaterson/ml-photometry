@@ -34,7 +34,7 @@ class Trainer:
         # 2. Transition to OneCycleLR for faster convergence and local minima escape
         self.scheduler = optim.lr_scheduler.OneCycleLR(
             self.optimizer,
-            max_lr=self.lr * 2,
+            max_lr=self.lr * 3,
             steps_per_epoch=len(self.train_loader),
             epochs=self.epochs,
             pct_start=0.1, # 10% warmup
@@ -125,7 +125,8 @@ class Trainer:
                 preds_fp32 = {k: v.float() for k, v in preds.items()}
                 
                 loss, p_loss, po_loss, f_loss, b_loss = compute_grid_loss(
-                    preds_fp32, targets, **self.loss_params
+                    preds_fp32, targets, **self.loss_params,
+                    log_task_vars=preds.get("log_task_vars")
                 )
                 
                 diffraction_reg = self.model.diffraction_filter.get_regularization_loss()
@@ -238,6 +239,9 @@ class Trainer:
                     preds = self.model(images_final)
                 
                 preds_fp32 = {k: v.float() for k, v in preds.items()}
-                loss, _, _, _, _ = compute_grid_loss(preds_fp32, targets, **self.loss_params)
+                loss, _, _, _, _ = compute_grid_loss(
+                    preds_fp32, targets, **self.loss_params,
+                    log_task_vars=preds.get("log_task_vars")
+                )
                 val_loss += loss.item()
         return val_loss / num_batches
