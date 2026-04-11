@@ -34,7 +34,7 @@ class Trainer:
         # 2. Transition to OneCycleLR for faster convergence and local minima escape
         self.scheduler = optim.lr_scheduler.OneCycleLR(
             self.optimizer,
-            max_lr=self.lr * 3,
+            max_lr=self.lr * 5.0,
             steps_per_epoch=len(self.train_loader),
             epochs=self.epochs,
             pct_start=0.1, # 10% warmup

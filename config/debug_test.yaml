@@ -60,7 +60,7 @@ A **Feature Pyramid Network (FPN)** merges deep semantic context from the lower 
 
 ## 4. The Loss Function: Aleatoric Uncertainty NLL
 Instead of simple regression, the model minimizes the **Gaussian Negative Log-Likelihood (NLL)** for all measurement parameters.
-*   **Total Loss:** $\mathcal{L}_{Total} = \lambda_1 \mathcal{L}_{Prob} + \lambda_2 \mathcal{L}_{Pos\_NLL} + \lambda_3 \mathcal{L}_{Flux\_NLL} + \lambda_4 \mathcal{L}_{BG} + \lambda_5 \mathcal{L}_{DReg}$
+*   **Homoscedastic Task Uncertainty (Self-Balancing):** Manual loss weight tuning (lambdas) is replaced by learnable task-dependent variances $s_i = \log(\sigma_i^2)$ for each task. The network automatically balances the loss terms by optimizing $\mathcal{L}_{Total} = \sum_i \left(\exp(-s_i) \mathcal{L}_i + s_i\right)$, allowing it to scale massive background gradients or focus on hard tasks.
 *   **$\mathcal{L}_{Prob}$:** `BCEWithLogitsLoss` with Logarithmic Soft SNR Targets, combined with manual Focal Loss.
 *   **Probability-Weighted Regression:** To prioritize recall while maintaining high precision, $\mathcal{L}_{Pos\_NLL}$ and $\mathcal{L}_{Flux\_NLL}$ are weighted by the **target probability $p$**. Faint stars (low SNR) contribute less to the precision gradients than bright stars, preventing noise from washing out the learned PSF geometry.
 *   **NLL Regression:** For $dx, dy$ and $flux$, the network learns to balance two terms:
@@ -68,7 +68,6 @@ Instead of simple regression, the model minimizes the **Gaussian Negative Log-Li
     2. **The Regularization Term:** $\ln \sigma^2$.
 *   **Beta-NLL Stabilization:** Loss terms are scaled by $(\sigma^2)^\beta$ (with $\beta=0.5$) to prevent gradient explosions for high-SNR targets.
 *   **$\mathcal{L}_{BG}$:** Global MSE for the background residuals.
-*   **Curvature Regularization ($\mathcal{L}_{Curv}$):** To ensure a smooth astrophysical background, the network minimizes the spatial curvature ($\nabla^2 b$) of the background map. This is implemented via a discrete Laplacian convolution with **Interior Masking** (ignoring the 1-pixel boundary) to prevent edge artifacts. This allows for natural large-scale gradients while penalizing sharp, unphysical fluctuations.
 *   **$\mathcal{L}_{DReg}$:** L2 regularization for the Diffraction-Aware Filter to prevent it from drifting too far from the initialization prior.
 
 ## 5. Success Metrics (Acceptance Criteria)

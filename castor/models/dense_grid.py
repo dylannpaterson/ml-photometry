@@ -192,7 +192,7 @@ class DenseGridModel(nn.Module):
         )
         
         # NEW: Homoscedastic Task Uncertainty Parameters
-        # Indices: 0:Prob, 1:Pos, 2:Flux, 3:BG, 4:DReg
+        # Indices: 0:Prob, 1:Pos, 2:Flux, 3:BG, 4:Curvature
         self.log_task_vars = nn.Parameter(torch.zeros(5))
 
     def forward(self, x):
@@ -280,10 +280,32 @@ def compute_nll_loss(pred, target, log_var, beta=0.5, weights=None):
     
     return weighted_loss.mean()
 
-def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=5.0, lambda_pos=50.0, lambda_flux=5.0, lambda_bg=0.1, focal_alpha=0.75, focal_gamma=2.0, stretch_scale=GLOBAL_STRETCH_SCALE, log_task_vars=None):
+def compute_curvature_loss(bg_pred):
+    """
+    Calculates the L2 penalty on the spatial curvature of the background.
+    Uses an interior mask to avoid boundary artifacts from zero-padding.
+    bg_pred shape: (Batch, H, W, 1)
+    """
+    # 1. Prepare for Conv2D (B, 1, H, W)
+    x = bg_pred.permute(0, 3, 1, 2)
+    
+    # 2. Define Discrete Laplacian Kernel
+    laplacian = torch.tensor([[[[ 0.,  1.,  0.],
+                                [ 1., -4.,  1.],
+                                [ 0.,  1.,  0.]]]], device=x.device, dtype=x.dtype)
+    
+    # 3. Convolve to find curvature
+    curvature = F.conv2d(x, laplacian, padding=1)
+    
+    # 4. Interior Masking: Ignore the 1-pixel boundary
+    interior = curvature[:, :, 1:-1, 1:-1]
+    
+    return torch.mean(interior ** 2)
+
+def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=1.0, lambda_pos=1.0, lambda_flux=1.0, lambda_bg=1.0, lambda_curvature=1.0, focal_alpha=0.50, focal_gamma=2.0, stretch_scale=GLOBAL_STRETCH_SCALE, log_task_vars=None):
     """
     Refactored loss using Aleatoric Uncertainty Estimation (NLL).
-    Now supports Homoscedastic Task Uncertainty Weighting.
+    Supports Homoscedastic Task Uncertainty Weighting and Curvature Regularization.
     """
     star_preds = preds["stars"]
     bg_preds = preds["background"]
@@ -333,40 +355,24 @@ def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=5.0, lambda_pos=
         raw_pos_loss = torch.tensor(0.0, device=star_preds.device)
         raw_flux_loss = torch.tensor(0.0, device=star_preds.device)
         
-    # 4. Background Loss (Global MSE)
+    # 4. Background Losses
     raw_bg_loss = F.mse_loss(bg_preds, bg_targets, reduction='mean')
+    raw_curvature_loss = compute_curvature_loss(bg_preds)
     
     # --- TASK UNCERTAINTY WEIGHTING ---
     if log_task_vars is not None:
-        # Weights: 0:Prob, 1:Pos, 2:Flux, 3:BG, 4:DReg
-        # Using the standard multi-task loss formulation: exp(-s) * L + s
+        # Weights: 0:Prob, 1:Pos, 2:Flux, 3:BG, 4:Curvature
         prob_loss = torch.exp(-log_task_vars[0]) * raw_prob_loss + log_task_vars[0]
         pos_loss = torch.exp(-log_task_vars[1]) * raw_pos_loss + log_task_vars[1]
         flux_loss = torch.exp(-log_task_vars[2]) * raw_flux_loss + log_task_vars[2]
         bg_loss = torch.exp(-log_task_vars[3]) * raw_bg_loss + log_task_vars[3]
+        curv_loss = torch.exp(-log_task_vars[4]) * raw_curvature_loss + log_task_vars[4]
         
-        # Final weighted sum (lambdas now act as optional base-scales)
-        total_loss = (lambda_prob * prob_loss + 
-                      lambda_pos * pos_loss + 
-                      lambda_flux * flux_loss +
-                      lambda_bg * bg_loss)
+        # Final weighted sum (base scales set to 1.0)
+        total_loss = (prob_loss + pos_loss + flux_loss + bg_loss + curv_loss)
     else:
-        # Fallback to static weights if params missing
-        total_loss = (lambda_prob * raw_prob_loss + 
-                      lambda_pos * raw_pos_loss + 
-                      lambda_flux * raw_flux_loss +
-                      lambda_bg * raw_bg_loss)
+        # Fallback
+        total_loss = (raw_prob_loss + raw_pos_loss + raw_flux_loss + raw_bg_loss + raw_curvature_loss)
         prob_loss, pos_loss, flux_loss, bg_loss = raw_prob_loss, raw_pos_loss, raw_flux_loss, raw_bg_loss
-                  
-    return total_loss, prob_loss, pos_loss, flux_loss, bg_loss
-        
-    # 4. Background Loss (Global MSE)
-    bg_loss = F.mse_loss(bg_preds, bg_targets, reduction='mean')
-        
-    total_loss = (lambda_prob * prob_loss + 
-                  lambda_pos * pos_loss + 
-                  lambda_flux * flux_loss +
-                  lambda_bg * bg_loss)
-                  
                   
     return total_loss, prob_loss, pos_loss, flux_loss, bg_loss
