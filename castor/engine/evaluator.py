@@ -111,11 +111,11 @@ class Evaluator:
                 img_noisy = torch.poisson(img_pos)
                 img_noisy += torch.randn_like(img_noisy) * 5.0  # Read noise
                 
-                # Calculate the median of the NOISY image
-                noisy_median = img_noisy.median().item()
+                # USE STABLE MEDIAN (Match Trainer)
+                stable_median = sample["chunk_median"]
                 
                 # Apply the Arcsinh stretch (Network Space)
-                img_stretched = torch.arcsinh((img_noisy - noisy_median) / self.stretch_scale)
+                img_stretched = torch.arcsinh((img_noisy - stable_median) / self.stretch_scale)
                 # -----------------------------------------------------
 
                 # Predict

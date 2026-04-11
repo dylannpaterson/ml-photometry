@@ -72,7 +72,7 @@ class InferenceEngine:
         grid_h, grid_w, K, _ = prediction.shape
         cell_size = self.img_size // grid_h
         
-        # Robustly unpack the PSF regardless of batch dims or tensor/numpy type
+        # --- ROBUST PSF EXTRACTION FIX ---
         base_psf = None
         if mean_psf is not None:
             # Ensure it's a numpy array and squeeze batch/channel dims
@@ -81,12 +81,20 @@ class InferenceEngine:
             else:
                 psf_arr = np.squeeze(mean_psf)
                 
-            # If it somehow remained 1D (old format), reshape it to 2D
+            # Handle [N, H, W] format
+            if psf_arr.ndim == 3:
+                psf_arr = psf_arr[-1]
+            
+            # Handle [N, S*S] format (e.g., 21, 16641)
+            if psf_arr.ndim == 2 and psf_arr.shape[0] < 100 and psf_arr.shape[0] < psf_arr.shape[1]:
+                psf_arr = psf_arr[-1]
+                
+            # Handle [S*S] format
             if psf_arr.ndim == 1:
                 s = int(psf_arr.shape[0]**0.5)
                 psf_arr = psf_arr.reshape(s, s)
                 
-            S_full = psf_arr.shape[0] # Guaranteed 2D here
+            S_full = psf_arr.shape[0] # Now ACTUALLY guaranteed to be 2D image height
             
             # Bin down if oversampled
             if S_full > SHAPE_SIZE:
@@ -106,7 +114,7 @@ class InferenceEngine:
                     p, dx, dy, physical_flux = prediction[y, x, k, :4]
                     if p > threshold:
                         # NEW: Extract log_vars and convert to sigma (standard deviation)
-                        # log_var_x (4), log_var_y (5), log_var_m (6)
+                        # log_var_x (4), log_var_y (5), log_var_f (6)
                         log_vars = prediction[y, x, k, 4:7]
                         sigmas = np.exp(0.5 * log_vars)
                         
@@ -148,7 +156,7 @@ class InferenceEngine:
         full_residual_bg_stretched = upsample_background(bg_map.squeeze(), (H, W))
         full_gt_residual_bg_stretched = upsample_background(gt_bg_map.squeeze(), (H, W))
         
-        # --- ROBUST PSF EXTRACTION ---
+        # --- ROBUST PSF EXTRACTION FIX ---
         base_psf = None
         if mean_psf is not None:
             # Ensure it's a numpy array and squeeze batch/channel dims
@@ -157,12 +165,20 @@ class InferenceEngine:
             else:
                 psf_arr = np.squeeze(mean_psf)
                 
-            # If it somehow remained 1D (old format), reshape it to 2D
+            # Handle [N, H, W] format
+            if psf_arr.ndim == 3:
+                psf_arr = psf_arr[-1]
+            
+            # Handle [N, S*S] format (e.g., 21, 16641)
+            if psf_arr.ndim == 2 and psf_arr.shape[0] < 100 and psf_arr.shape[0] < psf_arr.shape[1]:
+                psf_arr = psf_arr[-1]
+                
+            # Handle [S*S] format
             if psf_arr.ndim == 1:
                 s = int(psf_arr.shape[0]**0.5)
                 psf_arr = psf_arr.reshape(s, s)
                 
-            S_full = psf_arr.shape[0]
+            S_full = psf_arr.shape[0] # Now ACTUALLY guaranteed to be 2D image height
             
             # Bin down if oversampled
             if S_full > SHAPE_SIZE:
@@ -177,6 +193,16 @@ class InferenceEngine:
             sy, sx = np.meshgrid(np.arange(9)-4, np.arange(9)-4)
             base_psf = np.exp(-(sx**2 + sy**2) / (2 * 1.5**2))
             base_psf /= (base_psf.sum() + 1e-9)
+
+        # --- DEBUG: Plot the PSF being used ---
+        plt.figure(figsize=(6, 6))
+        plt.imshow(base_psf, cmap='inferno', origin='lower')
+        plt.title(f"PSF used for Rendering\nShape: {base_psf.shape} | Sum: {np.sum(base_psf):.4f}")
+        plt.colorbar()
+        plt.savefig("debug_inference_psf.png")
+        plt.close()
+        print(f"📸 Debug PSF saved to debug_inference_psf.png")
+        # --------------------------------------
 
         # --- EFFICIENT DRAWING (Matching Mosaic Engine) ---
         def draw_stars_on_grid(stars, height, width, is_predicted=True):

@@ -118,18 +118,21 @@ class DiffractionAwareFilter(nn.Module):
 
     def _generate_analytical_prior(self, kernel_size, sigma):
         # 1. Generate the 2D Mexican Hat (Laplacian of Gaussian) kernel
-        grid = torch.arange(-kernel_size // 2 + 1., kernel_size // 2 + 1.)
+        device = self.conv.weight.device
+        grid = torch.arange(-kernel_size // 2 + 1., kernel_size // 2 + 1., device=device, dtype=torch.float32)
         y, x = torch.meshgrid(grid, grid, indexing='ij')
         r2 = x**2 + y**2
 
         # LoG Formula
-        kernel = -(1.0 / (np.pi * sigma**4)) * (1.0 - r2 / (2 * sigma**2)) * torch.exp(-r2 / (2 * sigma**2))
+        pi = torch.tensor(np.pi, device=device, dtype=torch.float32)
+        kernel = -(1.0 / (pi * sigma**4)) * (1.0 - r2 / (2 * sigma**2)) * torch.exp(-r2 / (2 * sigma**2))
 
         # 2. Add Spikes to the prior (3 lines at 0, 60, 120 degrees)
-        angles = [0, np.pi/3, 2*np.pi/3]
+        angles = [0.0, np.pi/3.0, 2.0*np.pi/3.0]
         for angle in angles:
+            angle_t = torch.tensor(angle, device=device, dtype=torch.float32)
             # Distance from each pixel to the infinite line at this angle
-            dist_to_line = torch.abs(x * np.sin(angle) - y * np.cos(torch.tensor(angle)))
+            dist_to_line = torch.abs(x * torch.sin(angle_t) - y * torch.cos(angle_t))
             # Add a thin exponential spike
             kernel += torch.exp(-dist_to_line / 0.5) * 0.05
 
@@ -150,12 +153,12 @@ class DiffractionAwareFilter(nn.Module):
         return torch.cat([x, self.conv(x)], dim=1)
 
 class DenseGridModel(nn.Module):
-    def __init__(self, K=MAX_CAPACITY_PER_CELL, shape_size=SHAPE_SIZE, cell_size=DEFAULT_CELL_SIZE):
+    def __init__(self, K=MAX_CAPACITY_PER_CELL, shape_size=SHAPE_SIZE, cell_size=DEFAULT_CELL_SIZE, stretch_scale=GLOBAL_STRETCH_SCALE):
         super(DenseGridModel, self).__init__()
         self.K = K
-        # CHANGED: Dropping PCA shape weights in favor of Aleatoric Uncertainty Estimation
-        # Output per slot: [p, dx, dy, m, log_var_x, log_var_y, log_var_m] = 7 channels
+        # Output per slot: [p, dx, dy, asinh_flux, log_var_x, log_var_y, log_var_f] = 7 channels
         self.cell_size = float(cell_size)
+        self.stretch_scale = float(stretch_scale)
         self.num_output_channels = self.K * 7 + 1
 
         # 1. Physics Prior Filter
@@ -164,7 +167,7 @@ class DenseGridModel(nn.Module):
         # 2. Backbone: Full ResNet-34
         resnet = models.resnet34(weights=None)
         self.initial = nn.Sequential(
-            # CHANGED: Now takes 2 channels (Raw Flux + Wavelet Response)
+            # Takes 2 channels (Raw Flux + Wavelet Response)
             nn.Conv2d(2, 64, kernel_size=7, stride=2, padding=3, bias=False),
             resnet.bn1,
             resnet.relu,
@@ -227,18 +230,16 @@ class DenseGridModel(nn.Module):
             dx = torch.sigmoid(star_out[..., 1:2]) * self.cell_size
             dy = torch.sigmoid(star_out[..., 2:3]) * self.cell_size
             
-            # NEW: Predict in log-space, but output raw physical flux
-            raw_log_flux = star_out[..., 3:4]
-            # Cap log flux to ~8.8 million (e^16) instead of 3.5 billion to prevent exponential explosion
-            raw_log_flux = torch.clamp(raw_log_flux, min=-10.0, max=16.0) 
-            flux = torch.exp(raw_log_flux)
+            # FIX: Use Arcsinh for flux instead of Log.
+            # Predicted value is 'raw_asinh_flux'
+            raw_asinh_flux = star_out[..., 3:4]
+            # Safety bound for extreme brights (asinh(1e12/10) ~ 26)
+            raw_asinh_flux = torch.clamp(raw_asinh_flux, min=-2.0, max=30.0) 
+            flux = torch.sinh(raw_asinh_flux) * float(self.stretch_scale)
             
-            # NEW: Uncertainty Estimates (Log-variance)
-            # log_var_x (4), log_var_y (5), log_var_m (6)
+            # Uncertainty Estimates (Log-variance)
             log_vars = star_out[..., 4:7]
-            # SOLUTION: The Safety Net
-            # We limit the clamp to -10.0 (sigma ~ 0.006) to ensure numerical stability in FP16 AMP.
-            # This prevents overflow in the error term while still allowing high confidence.
+            # Limit the clamp to -10.0 (sigma ~ 0.006) to ensure numerical stability in FP16 AMP.
             log_vars = torch.clamp(log_vars, min=-10.0, max=20.0) 
             
             # Background residuals can be negative
@@ -247,7 +248,7 @@ class DenseGridModel(nn.Module):
             return {
                 "stars": torch.cat([p, dx, dy, flux, log_vars], dim=-1),
                 "p_logits": p_logits,
-                "raw_log_flux": raw_log_flux,
+                "raw_asinh_flux": raw_asinh_flux,
                 "log_vars": log_vars,
                 "background": bg
             }
@@ -271,7 +272,6 @@ def compute_nll_loss(pred, target, log_var, beta=0.5):
 def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=5.0, lambda_pos=50.0, lambda_flux=5.0, lambda_bg=0.1, focal_alpha=0.75, focal_gamma=2.0, stretch_scale=GLOBAL_STRETCH_SCALE):
     """
     Refactored loss using Aleatoric Uncertainty Estimation (NLL).
-    Drops shape reconstruction loss in favor of calibrated uncertainty.
     """
     star_preds = preds["stars"]
     bg_preds = preds["background"]
@@ -306,14 +306,15 @@ def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=5.0, lambda_pos=
         pos_target = star_targets[..., 1:3][obj_mask]
         log_var_pos = star_preds[..., 4:6][obj_mask]
         
-        log_flux_pred = preds["raw_log_flux"][obj_mask]
+        # FIX: Align flux loss with Arcsinh stretching
+        asinh_flux_pred = preds["raw_asinh_flux"][obj_mask]
         flux_target = star_targets[..., 3:4][obj_mask]
-        log_flux_target = torch.log(flux_target + 1e-6)
+        asinh_flux_target = torch.asinh(flux_target / float(stretch_scale))
         log_var_flux = star_preds[..., 6:7][obj_mask]
 
         # Calculate NLL Losses
         pos_loss = compute_nll_loss(pos_pred, pos_target, log_var_pos)
-        flux_loss = compute_nll_loss(log_flux_pred, log_flux_target, log_var_flux)
+        flux_loss = compute_nll_loss(asinh_flux_pred, asinh_flux_target, log_var_flux)
     else:
         pos_loss = torch.tensor(0.0, device=star_preds.device)
         flux_loss = torch.tensor(0.0, device=star_preds.device)
