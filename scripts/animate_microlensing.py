@@ -50,6 +50,7 @@ def main():
     # 2. Extract positions and pixel values for the selected event
     positions = []
     net_fluxes = []
+    raw_net_fluxes = []
     total_ap_fluxes = []
     bkg_ap_fluxes = []
     times = []
@@ -103,7 +104,9 @@ def main():
             
             total_ap_fluxes.append(ap_total)
             bkg_ap_fluxes.append(ap_bkg)
-            net_fluxes.append((ap_total - ap_bkg) / ap_correction)
+            raw_net = ap_total - ap_bkg
+            raw_net_fluxes.append(raw_net)
+            net_fluxes.append(raw_net / ap_correction)
             
             try:
                 times.append(model.meta.exposure.start_time.mjd)
@@ -113,6 +116,7 @@ def main():
     times = np.array(times)
     times -= times[0]
     net_fluxes = np.array(net_fluxes)
+    raw_net_fluxes = np.array(raw_net_fluxes)
     total_ap_fluxes = np.array(total_ap_fluxes)
     bkg_ap_fluxes = np.array(bkg_ap_fluxes)
 
@@ -177,6 +181,7 @@ def main():
     # Plot lightcurve components
     ax2.plot(times, total_ap_fluxes, 'k.', markersize=3, alpha=0.3, label='Total in Circle')
     ax2.plot(times, bkg_ap_fluxes, 'r.', markersize=3, alpha=0.3, label='Est. Background')
+    ax2.plot(times, raw_net_fluxes, 'g.', markersize=3, alpha=0.3, label='Raw Net (Inside Circle)')
     lc_net, = ax2.plot([], [], 'b.', markersize=4, label='Corrected Net Flux')
     lc_point, = ax2.plot([], [], 'ro', markersize=6)
     

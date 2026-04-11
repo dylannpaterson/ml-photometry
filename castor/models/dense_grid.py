@@ -253,21 +253,27 @@ class DenseGridModel(nn.Module):
                 "background": bg
             }
 
-def compute_nll_loss(pred, target, log_var, beta=0.5):
+def compute_nll_loss(pred, target, log_var, beta=0.5, weights=None):
     """
-    Calculates Beta-NLL to tame gradient explosions for high-SNR targets.
-    beta=0.5 balances the gradients while strictly preserving the Gaussian likelihood.
+    Calculates Beta-NLL with optional per-sample weighting.
     """
     precision = torch.exp(-log_var)
     # 1. Standard Gaussian NLL
     loss = 0.5 * (precision * (pred - target)**2 + log_var)
     
     # 2. Scale by detached variance^beta
-    # Detaching ensures we don't alter the optimization target for the variance itself
     var_detached = torch.exp(log_var.detach())
     beta_scale = var_detached ** beta
+    weighted_loss = loss * beta_scale
     
-    return (loss * beta_scale).mean()
+    if weights is not None:
+        # Ensure weights match coordinate dimensions
+        if weighted_loss.dim() > weights.dim():
+            weights = weights.unsqueeze(-1)
+        # Weighted mean
+        return (weighted_loss * weights).sum() / (weights.sum() + 1e-9)
+    
+    return weighted_loss.mean()
 
 def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=5.0, lambda_pos=50.0, lambda_flux=5.0, lambda_bg=0.1, focal_alpha=0.75, focal_gamma=2.0, stretch_scale=GLOBAL_STRETCH_SCALE):
     """
@@ -286,11 +292,11 @@ def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=5.0, lambda_pos=
     
     # Object mask uses target p > 0 (Soft Labels)
     obj_mask = star_targets[..., 0] > 0.0
+    p_target = star_targets[..., 0]
     
     # 2. Probability Loss (p) with Focal Loss
     p_pred_probs = torch.clamp(star_preds[..., 0], 1e-7, 1.0 - 1e-7)
     p_pred_logits = preds["p_logits"].squeeze(-1) 
-    p_target = star_targets[..., 0]
     
     bce_loss = F.binary_cross_entropy_with_logits(p_pred_logits, p_target, reduction='none')
     p_t = p_pred_probs * p_target + (1 - p_pred_probs) * (1 - p_target)
@@ -299,25 +305,40 @@ def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=5.0, lambda_pos=
     
     prob_loss = (alpha_t * focal_weight * bce_loss).mean()
     
-    # 3. Regression Losses (Masked)
+    # 3. Regression Losses (Masked & Weighted by p_target)
     if obj_mask.sum() > 0:
         # Unpack predictions
         pos_pred = star_preds[..., 1:3][obj_mask]
         pos_target = star_targets[..., 1:3][obj_mask]
         log_var_pos = star_preds[..., 4:6][obj_mask]
         
-        # FIX: Align flux loss with Arcsinh stretching
+        # Align flux loss with Arcsinh stretching
         asinh_flux_pred = preds["raw_asinh_flux"][obj_mask]
         flux_target = star_targets[..., 3:4][obj_mask]
         asinh_flux_target = torch.asinh(flux_target / float(stretch_scale))
         log_var_flux = star_preds[..., 6:7][obj_mask]
+        
+        # KEY CHANGE: Weight the regression loss by the target probability.
+        # This preserves the aleatoric interpretation while prioritizing clear stars.
+        reg_weights = p_target[obj_mask]
 
-        # Calculate NLL Losses
-        pos_loss = compute_nll_loss(pos_pred, pos_target, log_var_pos)
-        flux_loss = compute_nll_loss(asinh_flux_pred, asinh_flux_target, log_var_flux)
+        # Calculate Weighted NLL Losses
+        pos_loss = compute_nll_loss(pos_pred, pos_target, log_var_pos, weights=reg_weights)
+        flux_loss = compute_nll_loss(asinh_flux_pred, asinh_flux_target, log_var_flux, weights=reg_weights)
     else:
         pos_loss = torch.tensor(0.0, device=star_preds.device)
         flux_loss = torch.tensor(0.0, device=star_preds.device)
+        
+    # 4. Background Loss (Global MSE)
+    bg_loss = F.mse_loss(bg_preds, bg_targets, reduction='mean')
+        
+    total_loss = (lambda_prob * prob_loss + 
+                  lambda_pos * pos_loss + 
+                  lambda_flux * flux_loss +
+                  lambda_bg * bg_loss)
+                  
+                  
+    return total_loss, prob_loss, pos_loss, flux_loss, bg_loss
         
     # 4. Background Loss (Global MSE)
     bg_loss = F.mse_loss(bg_preds, bg_targets, reduction='mean')
