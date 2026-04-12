@@ -86,6 +86,27 @@ def ensure_stage0_data(stage_cfg, data_cfg, config_path):
             
     return True
 
+def get_safe_batch_size(target_batch_size, device):
+    """Detects VRAM and scales batch size to avoid OOM, return (micro_batch, accumulation_steps)."""
+    if device.type != 'cuda':
+        return target_batch_size, 1
+        
+    vram_gb = torch.cuda.get_device_properties(device).total_memory / (1024**3)
+    # ResNet-34 + FPN on 256x256 is roughly 1.5GB per sample in training
+    if vram_gb < 12: # 1080Ti, K80
+        micro_batch = 4
+    elif vram_gb < 20: # T4, RTX 3080
+        micro_batch = 8
+    elif vram_gb < 30: # V100 16GB
+        micro_batch = 16
+    else: # V100 32GB, A100
+        micro_batch = target_batch_size
+        
+    micro_batch = min(micro_batch, target_batch_size)
+    # Ensure micro_batch is a power of 2 or at least consistent
+    acc_steps = max(1, target_batch_size // micro_batch)
+    return micro_batch, acc_steps
+
 def run_train(stage_idx, config, device):
     print(f"--- 🚀 Curriculum Stage {stage_idx}: Training ---")
     stage_key = f"stage{stage_idx}"
@@ -193,13 +214,18 @@ def run_train(stage_idx, config, device):
     batch_size = stage_cfg["batch_size"]
     num_workers = stage_cfg.get("num_workers", 0)
     
+    # NEW: Memory-Aware Dynamic Batch Scaling
+    micro_batch, acc_steps = get_safe_batch_size(batch_size, device)
+    if micro_batch < batch_size:
+        print(f"📟 Memory Safety: Scaling physical batch {batch_size} -> {micro_batch} (Steps: {acc_steps})")
+    
     # Enable hardware optimizations if multiple workers are used
     use_optimizations = num_workers > 0
     prefetch_factor = (4 if stage_idx == 0 else 2) if use_optimizations else None
     
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=batch_size, 
+        batch_size=micro_batch, 
         shuffle=True, 
         num_workers=num_workers,
         pin_memory=use_optimizations,
@@ -209,7 +235,7 @@ def run_train(stage_idx, config, device):
     )
     val_loader = DataLoader(
         val_dataset, 
-        batch_size=batch_size, 
+        batch_size=micro_batch, 
         shuffle=False, 
         num_workers=num_workers,
         pin_memory=use_optimizations,

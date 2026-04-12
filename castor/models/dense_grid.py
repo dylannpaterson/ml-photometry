@@ -192,8 +192,8 @@ class DenseGridModel(nn.Module):
         )
         
         # NEW: Homoscedastic Task Uncertainty Parameters
-        # Indices: 0:Prob, 1:Pos, 2:Flux, 3:BG, 4:Curvature
-        self.log_task_vars = nn.Parameter(torch.zeros(5))
+        # Indices: 0:Prob, 1:Pos, 2:Flux, 3:BG, 4:Curvature, 5:Entropy
+        self.log_task_vars = nn.Parameter(torch.zeros(6))
 
     def forward(self, x):
         # Bottom-up
@@ -242,9 +242,15 @@ class DenseGridModel(nn.Module):
             flux = torch.sinh(raw_asinh_flux) * float(self.stretch_scale)
             
             # Uncertainty Estimates (Log-variance)
-            log_vars = star_out[..., 4:7]
-            # Limit the clamp to -10.0 (sigma ~ 0.006) to ensure numerical stability in FP16 AMP.
-            log_vars = torch.clamp(log_vars, min=-10.0, max=20.0) 
+            # Use Softplus + epsilon to enforce a hard floor on predicted uncertainty
+            # and prevent Gaussian NLL from collapsing to negative infinity.
+            log_vars_raw = star_out[..., 4:7]
+            # 1e-4 floor as suggested by user (log(1e-4) ~= -9.21)
+            vars = F.softplus(log_vars_raw) + 1e-4
+            log_vars = torch.log(vars)
+            
+            # Limit the clamp to max=20.0 to ensure numerical stability in FP16 AMP.
+            log_vars = torch.clamp(log_vars, max=20.0) 
             
             # Background residuals can be negative
             bg = bg_out.permute(0, 2, 3, 1)
@@ -264,6 +270,8 @@ def compute_nll_loss(pred, target, log_var, beta=0.5, weights=None):
     """
     precision = torch.exp(-log_var)
     # 1. Standard Gaussian NLL
+    # Note: Adding a small constant or clamping log_var here helps prevent the "cheat code" 
+    # where the model minimizes the penalty term instead of the error.
     loss = 0.5 * (precision * (pred - target)**2 + log_var)
     
     # 2. Scale by detached variance^beta
@@ -301,6 +309,43 @@ def compute_curvature_loss(bg_pred):
     interior = curvature[:, :, 1:-1, 1:-1]
     
     return torch.mean(interior ** 2)
+
+def compute_relative_entropy_loss(bg_pred):
+    """
+    Calculates the Relative Entropy of the background map against a 
+    spatially varying "background mesh" prior (SExtractor-style).
+    
+    Uses a stable residual-space asymmetric penalty: exp(d) - d - 1.
+    This creates an exponential "wall" against moats (where BG < Mesh)
+    while allowing linear growth for real astrophysical hills (where BG > Mesh).
+    """
+    B, H, W, _ = bg_pred.shape
+    # 1. Background Mesh (The "Astronomer's Low-Pass")
+    x = bg_pred.permute(0, 3, 1, 2)
+    
+    mesh_size = 8
+    kh, kw = H // mesh_size, W // mesh_size
+    
+    with torch.no_grad():
+        # Calculate local medians to be robust to stars and diffraction spikes
+        patches = x.unfold(2, kh, kh).unfold(3, kw, kw) # (B, 1, mesh_size, mesh_size, kh, kw)
+        local_medians = patches.contiguous().view(B, 1, mesh_size, mesh_size, -1).median(dim=-1)[0]
+        
+        # Upsample back to full resolution using bilinear interpolation
+        prior_mesh = F.interpolate(local_medians, size=(H, W), mode='bilinear', align_corners=False)
+
+    # 2. Asymmetric "Moat-Wall" Penalty
+    # d > 0 when bg_pred < prior_mesh (the moat)
+    diff = (prior_mesh - x)
+    
+    # Clamp diff for numerical stability before exp (max 10.0 -> ~22000 penalty)
+    diff_clamped = torch.clamp(diff, max=10.0)
+    
+    # Formulation: exp(d) - d - 1
+    # This is 0 when x == prior_mesh, explodes when x << prior_mesh.
+    penalty_map = torch.exp(diff_clamped) - diff_clamped - 1.0
+    
+    return penalty_map.mean()
 
 def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=1.0, lambda_pos=1.0, lambda_flux=1.0, lambda_bg=1.0, lambda_curvature=1.0, focal_alpha=0.50, focal_gamma=2.0, stretch_scale=GLOBAL_STRETCH_SCALE, log_task_vars=None):
     """
@@ -358,21 +403,28 @@ def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=1.0, lambda_pos=
     # 4. Background Losses
     raw_bg_loss = F.mse_loss(bg_preds, bg_targets, reduction='mean')
     raw_curvature_loss = compute_curvature_loss(bg_preds)
+    raw_entropy_loss = compute_relative_entropy_loss(bg_preds)
     
     # --- TASK UNCERTAINTY WEIGHTING ---
     if log_task_vars is not None:
-        # Weights: 0:Prob, 1:Pos, 2:Flux, 3:BG, 4:Curvature
-        prob_loss = torch.exp(-log_task_vars[0]) * raw_prob_loss + log_task_vars[0]
-        pos_loss = torch.exp(-log_task_vars[1]) * raw_pos_loss + log_task_vars[1]
-        flux_loss = torch.exp(-log_task_vars[2]) * raw_flux_loss + log_task_vars[2]
-        bg_loss = torch.exp(-log_task_vars[3]) * raw_bg_loss + log_task_vars[3]
-        curv_loss = torch.exp(-log_task_vars[4]) * raw_curvature_loss + log_task_vars[4]
+        # HARD FIX: To prevent the homoscedastic "cheat code", we must ensure log_task_vars 
+        # do not become too negative when their respective raw losses are negative.
+        # We clamp log_task_vars to a floor of -4.0 (variance ~0.018).
+        safe_log_task_vars = torch.clamp(log_task_vars, min=-4.0)
+        
+        # Weights: 0:Prob, 1:Pos, 2:Flux, 3:BG, 4:Curvature, 5:Entropy
+        prob_loss = torch.exp(-safe_log_task_vars[0]) * raw_prob_loss + safe_log_task_vars[0]
+        pos_loss = torch.exp(-safe_log_task_vars[1]) * raw_pos_loss + safe_log_task_vars[1]
+        flux_loss = torch.exp(-safe_log_task_vars[2]) * raw_flux_loss + safe_log_task_vars[2]
+        bg_loss = torch.exp(-safe_log_task_vars[3]) * raw_bg_loss + safe_log_task_vars[3]
+        curv_loss = torch.exp(-safe_log_task_vars[4]) * raw_curvature_loss + safe_log_task_vars[4]
+        ent_loss = torch.exp(-safe_log_task_vars[5]) * raw_entropy_loss + safe_log_task_vars[5]
         
         # Final weighted sum (base scales set to 1.0)
-        total_loss = (prob_loss + pos_loss + flux_loss + bg_loss + curv_loss)
+        total_loss = (prob_loss + pos_loss + flux_loss + bg_loss + curv_loss + ent_loss)
     else:
         # Fallback
-        total_loss = (raw_prob_loss + raw_pos_loss + raw_flux_loss + raw_bg_loss + raw_curvature_loss)
-        prob_loss, pos_loss, flux_loss, bg_loss = raw_prob_loss, raw_pos_loss, raw_flux_loss, raw_bg_loss
+        total_loss = (raw_prob_loss + raw_pos_loss + raw_flux_loss + raw_bg_loss + raw_curvature_loss + raw_entropy_loss)
+        prob_loss, pos_loss, flux_loss, bg_loss, ent_loss = raw_prob_loss, raw_pos_loss, raw_flux_loss, raw_bg_loss, raw_entropy_loss
                   
-    return total_loss, prob_loss, pos_loss, flux_loss, bg_loss
+    return total_loss, prob_loss, pos_loss, flux_loss, bg_loss, ent_loss

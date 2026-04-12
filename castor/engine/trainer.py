@@ -34,7 +34,7 @@ class Trainer:
         # 2. Transition to OneCycleLR for faster convergence and local minima escape
         self.scheduler = optim.lr_scheduler.OneCycleLR(
             self.optimizer,
-            max_lr=self.lr * 5.0,
+            max_lr=self.lr * 3.0,
             steps_per_epoch=len(self.train_loader),
             epochs=self.epochs,
             pct_start=0.1, # 10% warmup
@@ -49,6 +49,29 @@ class Trainer:
         self.use_cuda = self.device.type == 'cuda'
         self.scaler = torch.amp.GradScaler('cuda') if self.use_cuda else None
         
+        # NEW: Memory-Aware Dynamic Batch Scaling
+        self.target_batch_size = config.get("training_params", {}).get("BATCH_SIZE", 32)
+        self.micro_batch_size = self.target_batch_size # Default
+        self.accumulation_steps = 1
+        
+        if self.use_cuda:
+            vram_gb = torch.cuda.get_device_properties(self.device).total_memory / (1024**3)
+            # Conservative estimate: ~1.5GB per batch of 256x256 ResNet34
+            if vram_gb < 12: # e.g. K80, 1080Ti
+                self.micro_batch_size = 4
+            elif vram_gb < 20: # e.g. T4, RTX 3080
+                self.micro_batch_size = 8
+            elif vram_gb < 30: # e.g. V100 16GB, A10
+                self.micro_batch_size = 16
+            else: # e.g. V100 32GB, A100
+                self.micro_batch_size = 32
+            
+            # Ensure we don't exceed the configured batch size if it's smaller
+            self.micro_batch_size = min(self.micro_batch_size, self.target_batch_size)
+            self.accumulation_steps = max(1, self.target_batch_size // self.micro_batch_size)
+            
+            print(f"📟 GPU Memory Detected: {vram_gb:.1f}GB | Scaling Micro-batch: {self.micro_batch_size} | Accumulation: {self.accumulation_steps}")
+
         # FIX: Extract loss parameters from root of config instead of data_params
         self.loss_params = config.get("loss_params", {}).copy()
         self.loss_params["stretch_scale"] = config.get("data_params", {}).get("GLOBAL_STRETCH_SCALE", GLOBAL_STRETCH_SCALE)
@@ -83,6 +106,8 @@ class Trainer:
         
         for epoch in range(self.start_epoch, self.epochs):
             self.model.train(); epoch_loss, start_time = 0, time.time()
+            self.optimizer.zero_grad(set_to_none=True)
+            
             for i, batch in enumerate(self.train_loader):
                 if isinstance(batch, dict):
                     images = batch["image"].to(self.device, non_blocking=True)
@@ -113,8 +138,6 @@ class Trainer:
                 
                 images_final = torch.asinh((images_noisy - batch_medians) / self.loss_params["stretch_scale"])
                 
-                self.optimizer.zero_grad(set_to_none=True)
-                
                 # FIX: Disable autocast on CPU to avoid massive slowdown
                 if self.use_cuda:
                     with torch.autocast(device_type='cuda', dtype=torch.float16):
@@ -124,14 +147,17 @@ class Trainer:
                 
                 preds_fp32 = {k: v.float() for k, v in preds.items()}
                 
-                loss, p_loss, po_loss, f_loss, b_loss = compute_grid_loss(
+                loss, p_loss, po_loss, f_loss, b_loss, e_loss = compute_grid_loss(
                     preds_fp32, targets, **self.loss_params,
                     log_task_vars=preds.get("log_task_vars")
                 )
                 
+                # Scale loss by accumulation steps
+                loss = loss / self.accumulation_steps
+                
                 diffraction_reg = self.model.diffraction_filter.get_regularization_loss()
                 reg_loss_val = diffraction_reg.item()
-                reg_loss = self.lambda_diffraction * diffraction_reg
+                reg_loss = (self.lambda_diffraction * diffraction_reg) / self.accumulation_steps
                 loss += reg_loss
 
                 if torch.isnan(loss):
@@ -140,33 +166,39 @@ class Trainer:
                 # 3. Backward Pass
                 if self.scaler:
                     self.scaler.scale(loss).backward()
-                    self.scaler.unscale_(self.optimizer)
                 else:
                     loss.backward()
                 
-                is_finite = True
-                for param in self.model.parameters():
-                    if param.grad is not None and not torch.isfinite(param.grad).all():
-                        is_finite = False; break
-                
-                if is_finite:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
-                
-                if self.scaler:
-                    scale_before = self.scaler.get_scale()
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                    if self.scaler.get_scale() >= scale_before:
+                # Optimizer Step (only every accumulation_steps)
+                if (i + 1) % self.accumulation_steps == 0 or (i + 1) == len(self.train_loader):
+                    if self.scaler:
+                        self.scaler.unscale_(self.optimizer)
+                    
+                    is_finite = True
+                    for param in self.model.parameters():
+                        if param.grad is not None and not torch.isfinite(param.grad).all():
+                            is_finite = False; break
+                    
+                    if is_finite:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
+                    
+                    if self.scaler:
+                        scale_before = self.scaler.get_scale()
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                        if self.scaler.get_scale() >= scale_before:
+                            self.scheduler.step()
+                    else:
+                        self.optimizer.step()
                         self.scheduler.step()
-                else:
-                    self.optimizer.step()
-                    self.scheduler.step()
+                    
+                    self.optimizer.zero_grad(set_to_none=True)
                 
-                epoch_loss += loss.item()
+                epoch_loss += loss.item() * self.accumulation_steps
                 
                 if i % 100 == 0:
                     current_lr = self.optimizer.param_groups[0]['lr']
-                    print(f"Epoch [{epoch+1}/{self.epochs}], Step [{i}/{len(self.train_loader)}], LR: {current_lr:.6f}, Loss: {loss.item():.4f} (P:{p_loss.item():.4f}, Pos:{po_loss.item():.4f}, F:{f_loss.item():.4f}, B:{b_loss.item():.4f}, DReg:{reg_loss_val:.6f})")
+                    print(f"Epoch [{epoch+1}/{self.epochs}], Step [{i}/{len(self.train_loader)}], LR: {current_lr:.6f}, Loss: {loss.item()*self.accumulation_steps:.4f} (P:{p_loss.item():.4f}, Pos:{po_loss.item():.4f}, F:{f_loss.item():.4f}, B:{b_loss.item():.4f}, E:{e_loss.item():.4f}, DReg:{reg_loss_val:.6f})")
 
             avg_epoch_loss = epoch_loss/len(self.train_loader)
             print(f"==> Epoch {epoch+1} Complete | Avg Loss: {avg_epoch_loss:.4f} | Time: {time.time()-start_time:.1f}s")
@@ -239,9 +271,10 @@ class Trainer:
                     preds = self.model(images_final)
                 
                 preds_fp32 = {k: v.float() for k, v in preds.items()}
-                loss, _, _, _, _ = compute_grid_loss(
+                loss, _, _, _, _, _ = compute_grid_loss(
                     preds_fp32, targets, **self.loss_params,
                     log_task_vars=preds.get("log_task_vars")
                 )
                 val_loss += loss.item()
+
         return val_loss / num_batches

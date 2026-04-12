@@ -26,6 +26,7 @@ To develop a machine learning pipeline capable of performing fast, direct point-
     3.  **flux:** Physical Flux. Predicted via an **Asinh-Space Bypass**: The network predicts the flux in Arcsinh space, which is clamped ($[-2.0, 30.0]$) and converted back using Sinh to output physical flux. This aligns the photometry head with the input image distribution and stabilizes learning for faint stars.
     4.  **log_var_x, log_var_y:** Natural log of the astrometric variance ($\sigma_x^2, \sigma_y^2$).
     5.  **log_var_f:** Natural log of the photometric variance ($\sigma_f^2$ in Arcsinh-flux space).
+    *   **Numerical Safety Floor:** To prevent "variance collapse" (where the model drives uncertainty to zero to exploit the $\ln \sigma^2$ penalty), uncertainty predictions are routed through a `Softplus` layer with a hard epsilon floor of $10^{-4}$.
 *   **Background Value (1 per cell):**
     1.  **b:** Residual Background Level. Represents local deviations from the chunk's median sky in stretched space.
 
@@ -56,11 +57,13 @@ A **Feature Pyramid Network (FPN)** merges deep semantic context from the lower 
     *   **p:** Linear (Raw logits during training).
     *   **dx, dy:** Sigmoid $\times \text{cell\_size}$.
     *   **flux:** Bounded Sinh (Asinh-Flux Bypass).
-    *   **log_vars:** Linear (Natural log space allows linear outputs to span $[-\infty, \infty]$ for stability).
+    *   **log_vars:** Bounded Natural Log (Softplus floor + Natural Log ensures outputs never reach $-\infty$).
 
-## 4. The Loss Function: Aleatoric Uncertainty NLL
-Instead of simple regression, the model minimizes the **Gaussian Negative Log-Likelihood (NLL)** for all measurement parameters.
-*   **Total Loss:** $\mathcal{L}_{Total} = \lambda_1 \mathcal{L}_{Prob} + \lambda_2 \mathcal{L}_{Pos\_NLL} + \lambda_3 \mathcal{L}_{Flux\_NLL} + \lambda_4 \mathcal{L}_{BG} + \lambda_5 \mathcal{L}_{DReg}$
+## 4. The Loss Function: Multi-Task Aleatoric Uncertainty
+Instead of simple regression, the model minimizes the **Gaussian Negative Log-Likelihood (NLL)** for all measurement parameters, balanced by a **Homoscedastic Task Uncertainty** framework.
+
+*   **Total Loss:** $\mathcal{L}_{Total} = \sum_{t=1}^{6} \exp(-\sigma_t) \mathcal{L}_t + \sigma_t$
+    *   **Learnable Weights ($\sigma_t$):** The network learns the relative importance of each task (Prob, Pos, Flux, BG, Curvature, Entropy). To prevent mathematical "cheat codes," these weights are clamped to a minimum log-variance of $-4.0$.
 *   **$\mathcal{L}_{Prob}$:** `BCEWithLogitsLoss` with Logarithmic Soft SNR Targets, combined with manual Focal Loss.
 *   **Probability-Weighted Regression:** To prioritize recall while maintaining high precision, $\mathcal{L}_{Pos\_NLL}$ and $\mathcal{L}_{Flux\_NLL}$ are weighted by the **target probability $p$**. Faint stars (low SNR) contribute less to the precision gradients than bright stars, preventing noise from washing out the learned PSF geometry.
 *   **NLL Regression:** For $dx, dy$ and $flux$, the network learns to balance two terms:
@@ -68,8 +71,12 @@ Instead of simple regression, the model minimizes the **Gaussian Negative Log-Li
     2. **The Regularization Term:** $\ln \sigma^2$.
 *   **Beta-NLL Stabilization:** Loss terms are scaled by $(\sigma^2)^\beta$ (with $\beta=0.5$) to prevent gradient explosions for high-SNR targets.
 *   **$\mathcal{L}_{BG}$:** Global MSE for the background residuals.
-*   **Curvature Regularization ($\mathcal{L}_{Curv}$):** To ensure a smooth astrophysical background, the network minimizes the spatial curvature ($\nabla^2 b$) of the background map. This is implemented via a discrete Laplacian convolution with **Interior Masking** (ignoring the 1-pixel boundary) to prevent edge artifacts. This allows for natural large-scale gradients while penalizing sharp, unphysical fluctuations.
+*   **Curvature Regularization ($\mathcal{L}_{Curv}$):** To ensure a smooth astrophysical background, the network minimizes the spatial curvature ($\nabla^2 b$) of the background map. This is implemented via a discrete Laplacian convolution with **Interior Masking** (ignoring the 1-pixel boundary) to prevent edge artifacts.
+*   **Maximum Entropy Regularization ($\mathcal{L}_{Ent}$):** To prevent "moats" (unphysical depressions around bright stars), the network penalizes deviations from a spatially varying **Background Mesh** prior.
+    *   **Mesh Prior:** A SExtractor-style morphological filter extracts local medians using a coarse grid ($8 \times 8$ blocks), upsampled bilinearly to full resolution. This captures real astrophysical gradients (Bulge structure) while remaining immune to stars.
+    *   **Asymmetric Penalty:** Uses an exponential "wall" formulation: $\mathcal{L}_{ent} = \exp(d) - d - 1$, where $d = \text{Mesh} - \text{BG}$. This applies an exploding penalty if the background dips below the local sky level while allowing linear freedom for positive emission.
 *   **$\mathcal{L}_{DReg}$:** L2 regularization for the Diffraction-Aware Filter to prevent it from drifting too far from the initialization prior.
+
 
 ## 5. Success Metrics (Acceptance Criteria)
 | Metric | Target | Description |
