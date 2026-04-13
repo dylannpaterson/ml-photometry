@@ -22,6 +22,7 @@ def discover_mosaics(mosaic_dir):
             meta_path = os.path.join(mosaic_dir, f"{base}_meta.npy")
             lib_path = os.path.join(mosaic_dir, f"{base}_psf_lib.npy")
             cat_path = os.path.join(mosaic_dir, f"{base}_cat.npy")
+            bg_path = os.path.join(mosaic_dir, f"{base}_bg.npy")
             
             if not os.path.exists(meta_path) or not os.path.exists(cat_path):
                 continue
@@ -29,6 +30,7 @@ def discover_mosaics(mosaic_dir):
             meta = np.load(meta_path)
             mosaics.append({
                 'img': os.path.join(mosaic_dir, f),
+                'bg': bg_path if os.path.exists(bg_path) else None,
                 'cat': cat_path,
                 'lib': lib_path if os.path.exists(lib_path) else None,
                 'exp_time': meta[0], 'zp': meta[1], 'sky_mag': meta[2]
@@ -112,6 +114,10 @@ def create_hdf5_datasets_combined(train_mosaic_dir, val_mosaic_dir, train_path, 
                 print(f"  [{m_idx+1}/{len(mosaics)}] {os.path.basename(mosaic['img'])} -> {this_mos_samples} samples")
                 
                 img_data = np.load(mosaic['img'])
+                bg_data = np.load(mosaic['bg']) if mosaic['bg'] else None
+                print(f"DEBUG: Mosaic {mosaic['img']} | bg_data is None: {bg_data is None}")
+                if bg_data is not None:
+                    print(f"DEBUG: bg_data shape: {bg_data.shape}, mean: {bg_data.mean():.4f}, std: {bg_data.std():.4f}")
                 cat_data = np.load(mosaic['cat'])
                 
                 # IMPORTANT: Ensure catalog is sorted by Y for searchsorted
@@ -154,13 +160,20 @@ def create_hdf5_datasets_combined(train_mosaic_dir, val_mosaic_dir, train_path, 
                     if mask_x.any():
                         local_cat = band_cat[mask_x]
                         lx, ly = local_cat['x'] - px, local_cat['y'] - py
-                        local_snrs = snrs[y_start:y_end][mask_x]
+                        local_snrs = local_cat['snr']
                         sort_idx = np.argsort(local_cat['flux'])[::-1]
                         
                         grid_stars = fast_paint_grid(lx, ly, local_cat['flux'], local_snrs, sort_idx, 5.0, grid_size, cell_size, K)
                         target_buffer[:, :, :-1] = grid_stars.reshape(grid_size, grid_size, -1)
 
-                    target_buffer[:, :, -1] = transform.target_bg_to_network(sky_level - chunk_median)
+                    if bg_data is not None:
+                        # Extract 256x256 truth background map and bin to grid_size
+                        bg_chunk = bg_data[py:py+img_size, px:px+img_size]
+                        # Bin bg_chunk (256, 256) -> (grid_size, grid_size)
+                        bg_map = bg_chunk.reshape(grid_size, cell_size, grid_size, cell_size).mean(axis=(1, 3))
+                        target_buffer[:, :, -1] = transform.target_bg_to_network(bg_map + sky_level - chunk_median)
+                    else:
+                        target_buffer[:, :, -1] = transform.target_bg_to_network(sky_level - chunk_median)
                     
                     # 3. Write
                     ds_imgs[global_idx] = signal_tensor
@@ -171,12 +184,13 @@ def create_hdf5_datasets_combined(train_mosaic_dir, val_mosaic_dir, train_path, 
                     global_idx += 1
 
                 # --- CLEANUP THIS MOSAIC ---
-                for f_path in [mosaic['img'], mosaic['cat'], mosaic['lib']]:
+                for f_path in [mosaic['img'], mosaic['bg'], mosaic['cat'], mosaic['lib']]:
                     if f_path and os.path.exists(f_path): os.remove(f_path)
                 meta_f = mosaic['img'].replace("_img.npy", "_meta.npy")
                 if os.path.exists(meta_f): os.remove(meta_f)
                 
                 del img_data, cat_data
+                if bg_data is not None: del bg_data
                 gc.collect()
 
     print(f"✅ Combined HDF5 datasets complete!")

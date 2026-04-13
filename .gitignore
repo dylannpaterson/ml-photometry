@@ -41,3 +41,4 @@ venv.bak/
 *.fits
 *.exp
 animations
+*.gif

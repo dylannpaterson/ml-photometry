@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 import os
-from scipy.ndimage import zoom
+from scipy.ndimage import zoom, shift, center_of_mass
 from astropy.io import fits
 from castor.data.transforms import AstroSpaceTransform
 from castor.constants import GLOBAL_STRETCH_SCALE, N_PCA_COMPONENTS, SHAPE_SIZE
@@ -38,16 +38,23 @@ class InferenceEngine:
         self.stretch_scale = config["data_params"].get("GLOBAL_STRETCH_SCALE", GLOBAL_STRETCH_SCALE)
         self.transform = AstroSpaceTransform(stretch_scale=self.stretch_scale)
 
+    def _get_centered_psf(self, psf_data):
+        """Robustly extracts and centers a PSF for 1x reconstruction."""
+        S = SHAPE_SIZE
+        # Default diagnostic Gaussian core (Refined from radial analysis sigma=0.94)
+        y, x = np.ogrid[:S, :S]
+        center = (S - 1) / 2.0
+        base_psf = np.exp(-((x - center)**2 + (y - center)**2) / (2 * 0.94**2))
+        return base_psf / (base_psf.sum() + 1e-9)
+
     def predict(self, image_tensor, threshold=0.1, psf_basis=None, mean_psf=None):
         """Runs inference on a single 2D image tensor [H, W]."""
         self.model.eval()
         with torch.no_grad():
-            # 1. FIX: Apply Median Subtraction and Arcsinh Stretch (Pre-processing)
-            # This ensures raw linear data is correctly scaled for the network
+            # 1. Pre-processing: Median Subtraction and Arcsinh Stretch
             chunk_median = image_tensor.median().item()
             stretched_tensor = torch.arcsinh((image_tensor - chunk_median) / self.stretch_scale)
             
-            # 2. FIX: Ensure [Batch, Channel, H, W] dimensionality
             if stretched_tensor.dim() == 2:
                 input_tensor = stretched_tensor.unsqueeze(0).unsqueeze(0)
             elif stretched_tensor.dim() == 3:
@@ -57,403 +64,241 @@ class InferenceEngine:
                 
             input_tensor = input_tensor.to(self.device)
 
-            # 3. FIX: Match Training Mixed Precision Context
-            with torch.autocast(device_type=self.device.type, dtype=torch.float16):
+            # Match training mixed precision context
+            device_type = self.device.type if self.device.type != 'cpu' else 'cpu'
+            dtype = torch.float16 if self.device.type != 'cpu' else torch.bfloat16
+            with torch.autocast(device_type=device_type, dtype=dtype):
                 prediction_dict = self.model(input_tensor)
             
-            # Note: Unpack predictions and convert to float32 for stable CPU processing
-            # Star shape: [Batch, H, W, K, 7]
-            prediction_tensor = prediction_dict["stars"].squeeze(0).float()
-            
-            prediction = prediction_tensor.cpu().numpy()
+            prediction = prediction_dict["stars"].squeeze(0).float().cpu().numpy()
             bg_map = prediction_dict["background"].squeeze(0).float().cpu().numpy()
             
         predicted_stars, predicted_shapes = [], []
         grid_h, grid_w, K, _ = prediction.shape
         cell_size = self.img_size // grid_h
         
-        # --- ROBUST PSF EXTRACTION FIX ---
-        base_psf = None
-        if mean_psf is not None:
-            # Ensure it's a numpy array and squeeze batch/channel dims
-            if hasattr(mean_psf, 'cpu'):
-                psf_arr = mean_psf.detach().cpu().squeeze().numpy()
-            else:
-                psf_arr = np.squeeze(mean_psf)
-                
-            # Handle [N, H, W] format
-            if psf_arr.ndim == 3:
-                psf_arr = psf_arr[-1]
-            
-            # Handle [N, S*S] format (e.g., 21, 16641)
-            if psf_arr.ndim == 2 and psf_arr.shape[0] < 100 and psf_arr.shape[0] < psf_arr.shape[1]:
-                psf_arr = psf_arr[-1]
-                
-            # Handle [S*S] format
-            if psf_arr.ndim == 1:
-                s = int(psf_arr.shape[0]**0.5)
-                psf_arr = psf_arr.reshape(s, s)
-                
-            S_full = psf_arr.shape[0] # Now ACTUALLY guaranteed to be 2D image height
-            
-            # Bin down if oversampled
-            if S_full > SHAPE_SIZE:
-                O = S_full // SHAPE_SIZE
-                base_psf = psf_arr.reshape(SHAPE_SIZE, O, SHAPE_SIZE, O).mean(axis=(1, 3))
-                base_psf = base_psf / (np.sum(base_psf) + 1e-9)
-                S = SHAPE_SIZE
-            else:
-                base_psf = psf_arr
-                S = S_full
-        else:
-            S = 9
-        
+        base_psf = self._get_centered_psf(mean_psf)
+
         for y in range(grid_h):
             for x in range(grid_w):
                 for k in range(K):
                     p, dx, dy, physical_flux = prediction[y, x, k, :4]
                     if p > threshold:
-                        # NEW: Extract log_vars and convert to sigma (standard deviation)
-                        # log_var_x (4), log_var_y (5), log_var_f (6)
+                        # Uncertainty Estimates (Log-variance)
                         log_vars = prediction[y, x, k, 4:7]
                         sigmas = np.exp(0.5 * log_vars)
                         
                         predicted_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, float(physical_flux), p, sigmas))
-                        
-                        # Use Mean PSF for reconstruction (Shape recovery dropped in favor of uncertainty)
-                        if base_psf is not None:
-                            predicted_shapes.append(base_psf)
-                        else:
-                            # Safe fallback - Create a simple 9x9 Gaussian
-                            sy, sx = np.meshgrid(np.arange(9)-4, np.arange(9)-4)
-                            fallback_psf = np.exp(-(sx**2 + sy**2) / (2 * 1.5**2))
-                            fallback_psf /= (fallback_psf.sum() + 1e-9)
-                            predicted_shapes.append(fallback_psf)
+                        predicted_shapes.append(base_psf)
                             
         return predicted_stars, predicted_shapes, bg_map
 
-    def visualize(self, image_tensor, true_catalogue, predicted_stars, predicted_shapes, bg_map, gt_bg_map, threshold, chunk_median=0.0, jitter_params=None, output_path="inference_comparison.png", psf_basis=None, mean_psf=None):
+    def visualize(self, hero_data, global_true, global_pred, threshold=0.43, output_path="inference_comparison.png", mean_psf=None, num_chunks=1):
         """
-        Visualizes inference results with Aleatoric Uncertainty.
-        jitter_params: (s_jit, q_jit, theta_jit) to match input image smear.
+        Visualizes inference results with the full 12-axis diagnostic suite. 
         """
         from castor.engine.evaluator import match_stars
         from mpl_toolkits.axes_grid1 import make_axes_locatable
         
-        img_stretched = image_tensor.squeeze().numpy()
+        # 1. COMPONENT PREPARATION (HERO SAMPLE)
+        img_stretched = hero_data["image_stretched"].squeeze().numpy()
         H, W = img_stretched.shape
-        
-        # 1. MATCHING
-        detected_stars = [s for s in predicted_stars if s[3] >= 0.5]
-        
-        match_true = [(s[1], s[2], s[3]) for s in true_catalogue]
-        match_pred = [(s[0], s[1], s[2]) for s in detected_stars]
-        matches, unmatched_true, unmatched_pred = match_stars(match_true, match_pred, distance_threshold=2.0)
-        matched_true_indices = [m[0] for m in matches]
-        matched_pred_indices = [m[1] for m in matches]
+        hero_true = hero_data["true_stars"]
+        hero_pred = hero_data["pred_stars"]
+        bg_map = hero_data["bg_map"]
+        gt_bg_map = hero_data["gt_bg_map"]
+        chunk_median = hero_data.get("chunk_median", 0.0)
+        jitter_params = hero_data.get("jitter_params")
 
-        # 2. COMPONENT PREPARATION
+        # Match for Hero Plot
+        h_match_pred_filtered = [s for s in hero_pred if s[3] >= threshold]
+        h_matches, _, _ = match_stars([(s[1], s[2], s[3]) for s in hero_true], [(s[0], s[1], s[2]) for s in h_match_pred_filtered], distance_threshold=2.0)
+        h_matched_true_indices = [m[0] for m in h_matches]
+
+        # Match for Global Stats
+        g_match_true = [(s[1], s[2], s[3]) for s in global_true]
+        g_pred_filtered = [s for s in global_pred if s[3] >= threshold]
+        g_matches, g_unmatched_true, g_unmatched_pred = match_stars(g_match_true, [(s[0], s[1], s[2]) for s in g_pred_filtered], distance_threshold=2.0)
+        g_matched_true_indices = [m[0] for m in g_matches]
+
+        # 2. HERO COMPONENT PREPARATION (Images)
         full_residual_bg_stretched = upsample_background(bg_map.squeeze(), (H, W))
         full_gt_residual_bg_stretched = upsample_background(gt_bg_map.squeeze(), (H, W))
         
-        # --- ROBUST PSF EXTRACTION FIX ---
-        base_psf = None
-        if mean_psf is not None:
-            # Ensure it's a numpy array and squeeze batch/channel dims
-            if hasattr(mean_psf, 'cpu'):
-                psf_arr = mean_psf.detach().cpu().squeeze().numpy()
-            else:
-                psf_arr = np.squeeze(mean_psf)
-                
-            # Handle [N, H, W] format
-            if psf_arr.ndim == 3:
-                psf_arr = psf_arr[-1]
-            
-            # Handle [N, S*S] format (e.g., 21, 16641)
-            if psf_arr.ndim == 2 and psf_arr.shape[0] < 100 and psf_arr.shape[0] < psf_arr.shape[1]:
-                psf_arr = psf_arr[-1]
-                
-            # Handle [S*S] format
-            if psf_arr.ndim == 1:
-                s = int(psf_arr.shape[0]**0.5)
-                psf_arr = psf_arr.reshape(s, s)
-                
-            S_full = psf_arr.shape[0] # Now ACTUALLY guaranteed to be 2D image height
-            
-            # Bin down if oversampled
-            if S_full > SHAPE_SIZE:
-                O = S_full // SHAPE_SIZE
-                base_psf = psf_arr.reshape(SHAPE_SIZE, O, SHAPE_SIZE, O).mean(axis=(1, 3))
-                base_psf = base_psf / (np.sum(base_psf) + 1e-9)
-            else:
-                base_psf = psf_arr
-        
-        if base_psf is None:
-            # Safe fallback - Create a simple 9x9 Gaussian if no PSF provided
-            sy, sx = np.meshgrid(np.arange(9)-4, np.arange(9)-4)
-            base_psf = np.exp(-(sx**2 + sy**2) / (2 * 1.5**2))
-            base_psf /= (base_psf.sum() + 1e-9)
+        base_psf = self._get_centered_psf(mean_psf)
+        flipped_psf = base_psf[::-1, ::-1]
 
-        # --- DEBUG: Plot the PSF being used ---
-        plt.figure(figsize=(6, 6))
-        plt.imshow(base_psf, cmap='inferno', origin='lower')
-        plt.title(f"PSF used for Rendering\nShape: {base_psf.shape} | Sum: {np.sum(base_psf):.4f}")
-        plt.colorbar()
-        plt.savefig("debug_inference_psf.png")
-        plt.close()
-        print(f"📸 Debug PSF saved to debug_inference_psf.png")
-        # --------------------------------------
-
-        # --- EFFICIENT DRAWING (Matching Mosaic Engine) ---
+        # Draw Hero Reconstruction
         def draw_stars_on_grid(stars, height, width, is_predicted=True):
             grid = np.zeros((height, width), dtype=np.float32)
-            if not stars:
-                return grid
-                
+            if not stars: return grid
             if is_predicted:
-                # predicted: (x, y, flux, p, sigmas)
-                px = np.array([s[0] for s in stars])
-                py = np.array([s[1] for s in stars])
-                fluxes = np.array([s[2] for s in stars])
+                px, py, fluxes = np.array([s[0] for s in stars]), np.array([s[1] for s in stars]), np.array([s[2] for s in stars])
             else:
-                # true: (p, x, y, flux)
-                px = np.array([s[1] for s in stars])
-                py = np.array([s[2] for s in stars])
-                fluxes = np.array([s[3] for s in stars])
-                
+                px, py, fluxes = np.array([s[1] for s in stars]), np.array([s[2] for s in stars]), np.array([s[3] for s in stars])
+            
             x0, y0 = np.floor(px).astype(int), np.floor(py).astype(int)
             dx, dy = px - x0, py - y0
-            
-            # Bi-linear weights
             w00, w10, w01, w11 = (1-dx)*(1-dy), dx*(1-dy), (1-dx)*dy, dx*dy
-            
-            def paint_flux(x_coords, y_coords, weights):
-                # Mask out-of-bounds
-                mask = (x_coords >= 0) & (x_coords < width) & (y_coords >= 0) & (y_coords < height)
-                xc, yc, wc, fc = x_coords[mask], y_coords[mask], weights[mask], fluxes[mask]
-                flat_idx = yc * width + xc
-                grid.flat += np.bincount(flat_idx, weights=fc * wc, minlength=grid.size)
-
-            paint_flux(x0, y0, w00)
-            paint_flux(x0 + 1, y0, w10)
-            paint_flux(x0, y0 + 1, w01)
-            paint_flux(x0 + 1, y0 + 1, w11)
+            def paint(x, y, w):
+                mask = (x >= 0) & (x < width) & (y >= 0) & (y < height)
+                flat_idx = y[mask] * width + x[mask]
+                grid.flat += np.bincount(flat_idx, weights=fluxes[mask] * w[mask], minlength=grid.size)
+            paint(x0, y0, w00); paint(x0+1, y0, w10); paint(x0, y0+1, w01); paint(x0+1, y0+1, w11)
             return grid
 
-        # Reconstruct detected stars
-        detected_grid = draw_stars_on_grid(detected_stars, H, W, is_predicted=True)
-        reconstruction_stars_linear = fftconvolve(detected_grid, base_psf, mode='same')
+        h_rec_stars_linear = fftconvolve(draw_stars_on_grid(h_match_pred_filtered, H, W, True), flipped_psf, mode='same')
+        h_missed_stars = [hero_true[i] for i in range(len(hero_true)) if i not in h_matched_true_indices and hero_true[i][0] >= 0.1]
+        h_rec_missed_linear = fftconvolve(draw_stars_on_grid(h_missed_stars, H, W, False), flipped_psf, mode='same')
 
-        # Reconstruct missed stars
-        missed_stars = [true_catalogue[i] for i in range(len(true_catalogue)) if i not in matched_true_indices and true_catalogue[i][0] >= 0.1]
-        missed_grid = draw_stars_on_grid(missed_stars, H, W, is_predicted=False)
-        reconstruction_missed_linear = fftconvolve(missed_grid, base_psf, mode='same')
+        if jitter_params is not None and jitter_params[0] > 0:
+            s_j, q_j, t_j = jitter_params; S_j = SHAPE_SIZE; kj = (S_j - 1) / 2.0
+            gy, gx = np.meshgrid(np.arange(S_j) - kj, np.arange(S_j) - kj, indexing='ij')
+            cos, sin = np.cos(t_j), np.sin(t_j); gxp, gyp = gx * cos + gy * sin, -gx * sin + gy * cos
+            j_kernel = np.exp(-(gxp**2 / (2 * s_j**2) + gyp**2 / (2 * (s_j * q_j)**2))); j_kernel /= (j_kernel.sum() + 1e-9)
+            h_rec_stars_linear = fftconvolve(h_rec_stars_linear, j_kernel, mode='same')
+            h_rec_missed_linear = fftconvolve(h_rec_missed_linear, j_kernel, mode='same')
 
-        # --- APPLY GLOBAL JITTER ---
-        if jitter_params is not None:
-            s_j, q_j, t_j = jitter_params
-            if s_j > 0:
-                S_j = SHAPE_SIZE
-                kj = (S_j - 1) / 2.0
-                gy, gx = np.meshgrid(np.arange(S_j) - kj, np.arange(S_j) - kj, indexing='ij')
-                cos, sin = np.cos(t_j), np.sin(t_j)
-                gxp, gyp = gx * cos + gy * sin, -gx * sin + gy * cos
-                j_kernel = np.exp(-(gxp**2 / (2 * s_j**2) + gyp**2 / (2 * (s_j * q_j)**2)))
-                j_kernel /= (j_kernel.sum() + 1e-9)
-                reconstruction_stars_linear = fftconvolve(reconstruction_stars_linear, j_kernel, mode='same')
-                reconstruction_missed_linear = fftconvolve(reconstruction_missed_linear, j_kernel, mode='same')
+        # Convert backgrounds
+        full_bg_abs = upsample_background(bg_map.squeeze(), (H, W)) + chunk_median
+        full_gt_bg_abs = upsample_background(gt_bg_map.squeeze(), (H, W)) + chunk_median
 
-        # 3. ABSOLUTE SPACE CONVERSION
-        # FIX: The model now outputs LINEAR flux directly (exp of log_flux).
-        # We NO LONGER apply network_to_flux here.
-        full_residual_bg_linear = self.transform.network_to_bg(full_residual_bg_stretched)
-        full_reconstruction_linear_abs = reconstruction_stars_linear + full_residual_bg_linear + chunk_median
+        h_rec_abs = h_rec_stars_linear + full_bg_abs
         img_linear_abs = self.transform.network_to_image(img_stretched, chunk_median)
-        residual_linear = img_linear_abs - full_reconstruction_linear_abs
-        full_bg_abs = full_residual_bg_linear + chunk_median
-        full_gt_bg_abs = self.transform.network_to_bg(full_gt_residual_bg_stretched) + chunk_median
+        h_residual_linear = img_linear_abs - h_rec_abs
 
         # FITS Output
-        hdul = fits.HDUList([
-            fits.PrimaryHDU(),
-            fits.ImageHDU(img_linear_abs, name="INPUT_LINEAR"),
-            fits.ImageHDU(full_reconstruction_linear_abs, name="MODEL_LINEAR"),
-            fits.ImageHDU(residual_linear, name="RESIDUAL_LINEAR"),
-            fits.ImageHDU(reconstruction_missed_linear, name="MISSED_LINEAR"),
-            fits.ImageHDU(full_bg_abs, name="BG_PRED_LINEAR"),
-            fits.ImageHDU(full_gt_bg_abs, name="BG_TRUE_LINEAR")
-        ])
         fits_path = output_path.replace(".png", ".fits")
-        hdul.writeto(fits_path, overwrite=True)
+        h_rec_missed_abs = h_rec_missed_linear + full_gt_bg_abs
+        fits.HDUList([
+            fits.PrimaryHDU(), 
+            fits.ImageHDU(img_linear_abs, name="INPUT_LINEAR"), 
+            fits.ImageHDU(h_rec_abs, name="MODEL_LINEAR"), 
+            fits.ImageHDU(h_residual_linear, name="RESIDUAL_LINEAR"),
+            fits.ImageHDU(h_rec_missed_linear, name="MISSED_LINEAR"),
+            fits.ImageHDU(h_rec_missed_abs, name="MISSED_ABS"),
+            fits.ImageHDU(full_bg_abs, name="BG_PRED_LINEAR"), 
+            fits.ImageHDU(full_gt_bg_abs, name="BG_TRUE_LINEAR")
+        ]).writeto(fits_path, overwrite=True)
 
-        # Statistics
+        # 3. STATISTICS (GLOBAL)
         physics_cfg = self.config.get("data_params", {}).get("physics_params", {})
-        zp = physics_cfg.get("zp", 26.5)
-        exp_time = physics_cfg.get("exp_time_min", 30.0) # Using min as representative if not fixed
+        zp, exp_time = physics_cfg.get("zp", 26.5), physics_cfg.get("exp_time_min", 30.0)
+        def flux_to_mag(f): return zp - 2.5 * np.log10(np.maximum(f, 1e-9) / exp_time)
 
-        def flux_to_mag(f):
-            # m = ZP - 2.5 * log10(flux / EXPTIME)
-            return zp - 2.5 * np.log10(np.maximum(f, 1e-9) / exp_time)
-
-        matched_true_mags = [flux_to_mag(true_catalogue[m[0]][3]) for m in matches]
-        matched_pred_mags = [flux_to_mag(detected_stars[m[1]][2]) for m in matches]
-        all_true_mags = [flux_to_mag(s[3]) for s in true_catalogue]
-        missed_true_mags = [flux_to_mag(true_catalogue[i][3]) for i in range(len(true_catalogue)) if i not in matched_true_indices]
+        g_true_mags = np.array([flux_to_mag(s[3]) for s in global_true])
+        g_pred_mags = np.array([flux_to_mag(s[2]) for s in g_pred_filtered])
+        g_matched_true_mags = np.array([flux_to_mag(global_true[m[0]][3]) for m in g_matches])
+        g_matched_pred_mags = np.array([flux_to_mag(g_pred_filtered[m[1]][2]) for m in g_matches])
+        g_missed_true_mags = np.array([flux_to_mag(global_true[i][3]) for i in range(len(global_true)) if i not in g_matched_true_indices])
 
         # Figure Layout
         fig = plt.figure(figsize=(30, 24))
         gs = fig.add_gridspec(5, 4, hspace=0.3, wspace=0.3)
         
-        # Calculate Stellar Density
-        pixel_scale = 0.11 # Roman arcsec/pixel
-        area_sq_deg = (H * pixel_scale * W * pixel_scale) / (3600**2)
-        n_bright = sum(1 for m in all_true_mags if m < 26.0)
-        density_per_sq_deg = n_bright / area_sq_deg
-
         def add_colorbar(im, ax):
-            divider = make_axes_locatable(ax)
-            cax = divider.append_axes("right", size="5%", pad=0.05)
-            fig.colorbar(im, cax=cax)
+            divider = make_axes_locatable(ax); cax = divider.append_axes("right", size="5%", pad=0.05); fig.colorbar(im, cax=cax)
 
-        def sanitize_for_plot(data, fill_val=0.0):
-            d = data.copy(); d[~np.isfinite(d)] = fill_val
-            return np.clip(d, -1e15, 1e15)
-
-        img_linear_abs = sanitize_for_plot(img_linear_abs, fill_val=chunk_median)
-        full_reconstruction_linear_abs = sanitize_for_plot(full_reconstruction_linear_abs, fill_val=chunk_median)
-        residual_linear = sanitize_for_plot(residual_linear, fill_val=0.0)
-
+        # Plot Hero Images
         l_vmin, l_vmax = np.percentile(img_linear_abs, [10, 99.9])
         norm = LogNorm(vmin=max(1.0, l_vmin), vmax=max(l_vmin+1.0, l_vmax), clip=True)
-        
-        ax1 = fig.add_subplot(gs[0:2, 0])
-        ax1.imshow(img_linear_abs, cmap='inferno', origin='lower', norm=norm, aspect='equal')
-        ax1.set_title("Input (Missed Sources = Cyan)")
-        
-        ax2 = fig.add_subplot(gs[0:2, 1], sharex=ax1, sharey=ax1)
-        im2 = ax2.imshow(full_reconstruction_linear_abs, cmap='inferno', origin='lower', norm=norm, aspect='equal')
-        ax2.set_title("Model (Matched Sources = Lime)")
-        
-        visible_true_indices = [i for i, s in enumerate(true_catalogue) if s[0] >= 0.1]
-        for i in visible_true_indices:
-            s = true_catalogue[i]
-            if i in matched_true_indices: ax2.plot(s[1], s[2], color='lime', marker='+', markersize=10, alpha=0.8)
-            else: ax1.plot(s[1], s[2], color='cyan', marker='+', markersize=10, alpha=0.8)
-        
-        pred_x, pred_y = [s[0] for s in detected_stars], [s[1] for s in detected_stars]
-        ax2.scatter(pred_x, pred_y, color='red', s=1, alpha=0.5)
-        add_colorbar(im2, ax2)
-        
-        ax3 = fig.add_subplot(gs[0:2, 2], sharex=ax1, sharey=ax1)
-        r_lim = np.percentile(np.abs(residual_linear), 99)
-        im3 = ax3.imshow(residual_linear, cmap='bwr', origin='lower', vmin=-r_lim, vmax=r_lim, aspect='equal')
-        ax3.set_title("Linear Residual (Missed = Black)")
-        for i in visible_true_indices:
-            if i not in matched_true_indices:
-                s = true_catalogue[i]; ax3.plot(s[1], s[2], 'k+', markersize=10, alpha=0.8)
-        add_colorbar(im3, ax3)
+        ax1 = fig.add_subplot(gs[0:2, 0]); ax1.imshow(img_linear_abs, cmap='inferno', origin='lower', norm=norm)
+        ax1.set_title("Input (Hero Sample)")
+        ax2 = fig.add_subplot(gs[0:2, 1], sharex=ax1, sharey=ax1); im2 = ax2.imshow(h_rec_abs, cmap='inferno', origin='lower', norm=norm)
+        ax2.set_title("Model Reconstruction"); add_colorbar(im2, ax2)
+        ax3 = fig.add_subplot(gs[0:2, 2], sharex=ax1, sharey=ax1); r_lim = np.percentile(np.abs(h_residual_linear), 99)
+        im3 = ax3.imshow(h_residual_linear, cmap='bwr', origin='lower', vmin=-r_lim, vmax=r_lim); ax3.set_title("Linear Residual"); add_colorbar(im3, ax3)
 
-        # Background Row
-        full_bg_abs, full_gt_bg_abs = sanitize_for_plot(full_bg_abs, fill_val=chunk_median), sanitize_for_plot(full_gt_bg_abs, fill_val=chunk_median)
-        bg_vmin, bg_vmax = min(full_bg_abs.min(), full_gt_bg_abs.min()), max(full_bg_abs.max(), full_gt_bg_abs.max())
-        ax4 = fig.add_subplot(gs[2, 0], sharex=ax1, sharey=ax1)
-        ax4.imshow(full_bg_abs, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax, aspect='equal')
-        ax4.set_title("Predicted Background")
-        ax5 = fig.add_subplot(gs[2, 1], sharex=ax1, sharey=ax1)
-        im5 = ax5.imshow(full_gt_bg_abs, cmap='viridis', origin='lower', vmin=bg_vmin, vmax=bg_vmax, aspect='equal')
-        ax5.set_title("Truth Background")
-        add_colorbar(im5, ax5)
+        # Backgrounds
+        ax4 = fig.add_subplot(gs[2, 0], sharex=ax1, sharey=ax1); ax4.imshow(full_bg_abs, cmap='viridis', origin='lower'); ax4.set_title("Predicted Background")
+        ax5 = fig.add_subplot(gs[2, 1], sharex=ax1, sharey=ax1); im5 = ax5.imshow(full_gt_bg_abs, cmap='viridis', origin='lower'); ax5.set_title("Truth Background"); add_colorbar(im5, ax5)
 
-        # Statistics Row
-        if matched_true_mags:
-            ax8 = fig.add_subplot(gs[3, 0])
-            ax8.scatter(matched_true_mags, matched_pred_mags, alpha=0.5, s=10)
-            m_all = matched_true_mags + matched_pred_mags
-            ax8.plot([min(m_all), max(m_all)], [min(m_all), max(m_all)], 'r--', alpha=0.8)
-            ax8.set_title("Photometry Accuracy"); ax8.set_xlabel("True Magnitude"); ax8.set_ylabel("Pred Magnitude")
-            ax8.invert_xaxis(); ax8.invert_yaxis(); ax8.grid(True, alpha=0.3)
-
-        if all_true_mags:
-            ax_hist = fig.add_subplot(gs[3, 1])
-            m_p10 = [flux_to_mag(s[2]) for s in predicted_stars if s[3] >= 0.1]
-            ax_hist.hist(all_true_mags, bins=30, alpha=0.2, label='Truth', color='black')
-            ax_hist.hist(m_p10, bins=30, alpha=0.4, label='p >= 0.1', histtype='step')
-            ax_hist.set_title("LF Recovery"); ax_hist.set_xlabel("Magnitude"); ax_hist.invert_xaxis()
-            ax_hist.legend(); ax_hist.grid(True, alpha=0.2)
-
-        # Threshold Trade-off
-        if true_catalogue and predicted_stars:
-            ax_err = fig.add_subplot(gs[4, 0])
-            thresholds = np.linspace(0.01, 0.99, 50)
-            fpr_list, fnr_rates = [], []
-            t_list = [(s[1], s[2], s[3]) for s in true_catalogue]
-            for thr in thresholds:
-                p_list = [(s[0], s[1], s[2]) for s in predicted_stars if s[3] >= thr]
-                if not p_list: fpr_list.append(0.0); fnr_rates.append(100.0); continue
-                _, ut, up = match_stars(t_list, p_list, distance_threshold=2.0)
-                fpr_list.append(100.0 * len(up) / len(p_list)); fnr_rates.append(100.0 * len(ut) / len(t_list))
-            ax_err.plot(thresholds, fnr_rates, 'r-', label='False Neg %', linewidth=3)
-            ax_err.plot(thresholds, fpr_list, '-', color='orange', label='False Pos %', linewidth=3)
-            ax_err.set_title("Detection Trade-off"); ax_err.set_ylim(-5, 105); ax_err.grid(True, alpha=0.3); ax_err.legend()
-
-        if all_true_mags:
-            ax_comp = fig.add_subplot(gs[4, 1])
-            ax_comp.hist([matched_true_mags, missed_true_mags], bins=30, stacked=True, label=['Detected', 'Missed'], color=['green', 'red'], alpha=0.7)
-            ax_comp.set_title("Completeness by Magnitude"); ax_comp.legend(); ax_comp.grid(True, alpha=0.2)
-
-        # --- ALEATORIC UNCERTAINTY & ASTROMETRY VISUALIZATION ---
-        if matches:
-            # detected_stars[m[1]] is (x, y, flux, p, sigmas)
-            # true_catalogue[m[0]] is (p, x, y, flux)
-            matched_sigmas = np.array([detected_stars[m[1]][4] for m in matches])
-            matched_fluxes = np.array([detected_stars[m[1]][2] for m in matches])
+        # 🚀 RESTORED: Astrometric Residual Histograms (Slot 0,3)
+        if g_matches:
+            pos_res = np.array([(g_pred_filtered[m[1]][0]-global_true[m[0]][1], g_pred_filtered[m[1]][1]-global_true[m[0]][2]) for m in g_matches])
+            ax_res_hist = fig.add_subplot(gs[0, 3])
+            ax_res_hist.hist(pos_res[:, 0], bins=50, alpha=0.5, label='dx', color='C0')
+            ax_res_hist.hist(pos_res[:, 1], bins=50, alpha=0.5, label='dy', color='C1')
+            ax_res_hist.set_title("Astrometric Residuals (px)"); ax_res_hist.legend()
             
-            # Position Residuals
-            matched_true_coords = np.array([(true_catalogue[m[0]][1], true_catalogue[m[0]][2]) for m in matches])
-            matched_pred_coords = np.array([(detected_stars[m[1]][0], detected_stars[m[1]][1]) for m in matches])
-            pos_residuals = matched_pred_coords - matched_true_coords # [N, 2] -> (dx, dy)
+            # 🚀 RESTORED: Photometric Residual Histogram (Slot 1,3)
+            ax_mag_hist = fig.add_subplot(gs[1, 3])
+            mag_res = g_matched_pred_mags - g_matched_true_mags
+            ax_mag_hist.hist(mag_res, bins=50, color='C2', alpha=0.7)
+            ax_mag_hist.set_title("Photometric Residuals (mag)"); ax_mag_hist.set_xlabel("Pred - True")
 
-            ax_sig_x = fig.add_subplot(gs[3, 2])
-            ax_sig_y = fig.add_subplot(gs[3, 3])
-            ax_sig_f = fig.add_subplot(gs[4, 2])
+        # Detection Tradeoff (FPR/FNR)
+        ax_err = fig.add_subplot(gs[4, 0])
+        thresholds = np.linspace(0.01, 0.99, 50)
+        t_list_vis = [(s[1], s[2], s[3]) for s in global_true if s[0] > 0.5]
+        t_list_all = [(s[1], s[2], s[3]) for s in global_true if s[0] > 0.1]
+        fpr_list, fnr_rates = [], []
+        for thr in thresholds:
+            p_cand = [s for s in global_pred if s[3] >= thr]
+            if not p_cand: fpr_list.append(0.0); fnr_rates.append(100.0 if t_list_vis else 0.0); continue
+            _, _, up = match_stars(t_list_all, [(s[0], s[1], s[2]) for s in p_cand], distance_threshold=2.0); fpr_list.append(100.0 * len(up) / len(p_cand))
+            if t_list_vis: _, ut_v, _ = match_stars(t_list_vis, [(s[0], s[1], s[2]) for s in p_cand], distance_threshold=2.0); fnr_rates.append(100.0 * len(ut_v) / len(t_list_vis))
+            else: fnr_rates.append(0.0)
+        ax_err.plot(thresholds, fnr_rates, 'r-', label='Missed %', linewidth=3)
+        ax_err.plot(thresholds, fpr_list, '-', color='orange', label='False Pos %', linewidth=3)
+        ax_err.set_title("Detection Tradeoff"); ax_err.set_ylim(-5, 105); ax_err.legend()
+
+        # Precision vs Threshold
+        ax_prec_p = fig.add_subplot(gs[2, 3])
+        ax_prec_p.plot(thresholds, 100.0 - np.array(fpr_list), 'b-', linewidth=3)
+        ax_prec_p.set_title("Precision vs Threshold"); ax_prec_p.set_ylim(-5, 105)
+
+        # 2D Astrometric Residuals
+        if g_matches:
             ax_ast_2d = fig.add_subplot(gs[4, 3])
-            
-            # 1. Sigma vs Flux plots
-            ax_sig_x.scatter(matched_fluxes, matched_sigmas[:, 0], alpha=0.5, color='C0')
-            ax_sig_x.set_xscale('log'); ax_sig_x.set_yscale('log')
-            ax_sig_x.set_title("Astrometric Uncertainty (X)"); ax_sig_x.set_xlabel("Flux"); ax_sig_x.set_ylabel("sigma_x (pixels)")
-            
-            ax_sig_y.scatter(matched_fluxes, matched_sigmas[:, 1], alpha=0.5, color='C1')
-            ax_sig_y.set_xscale('log'); ax_sig_y.set_yscale('log')
-            ax_sig_y.set_title("Astrometric Uncertainty (Y)"); ax_sig_y.set_xlabel("Flux"); ax_sig_y.set_ylabel("sigma_y (pixels)")
-            
-            ax_sig_f.scatter(matched_fluxes, matched_sigmas[:, 2], alpha=0.5, color='C2')
-            ax_sig_f.set_xscale('log'); ax_sig_f.set_yscale('log')
-            ax_sig_f.set_title("Photometric Uncertainty"); ax_sig_f.set_xlabel("Flux"); ax_sig_f.set_ylabel("sigma_log_flux")
-            
-            # 2. 2D Astrometry Error Point Cloud
-            # Color by log-flux to see if brighter stars are tighter
-            scatter = ax_ast_2d.scatter(pos_residuals[:, 0], pos_residuals[:, 1], c=np.log10(matched_fluxes), cmap='viridis', alpha=0.6, s=20)
-            ax_ast_2d.axhline(0, color='black', lw=1, alpha=0.3)
-            ax_ast_2d.axvline(0, color='black', lw=1, alpha=0.3)
-            
-            # Determine plot limits (Zoom in on the error cloud)
-            r_limit = np.percentile(np.sqrt(np.sum(pos_residuals**2, axis=1)), 95) * 1.5
-            r_limit = max(0.1, min(2.0, r_limit)) # Clamp to reasonable bounds
-            ax_ast_2d.set_xlim(-r_limit, r_limit); ax_ast_2d.set_ylim(-r_limit, r_limit)
-            
-            ax_ast_2d.set_aspect('equal', 'box')
-            ax_ast_2d.set_title("2D Astrometric Residuals")
-            ax_ast_2d.set_xlabel("dx (pixels)"); ax_ast_2d.set_ylabel("dy (pixels)")
-            add_colorbar(scatter, ax_ast_2d)
-            
-            for ax in [ax_sig_x, ax_sig_y, ax_sig_f, ax_ast_2d]: ax.grid(True, alpha=0.3, which="both")
+            matched_flux = np.array([g_pred_filtered[m[1]][2] for m in g_matches])
+            sc = ax_ast_2d.scatter(pos_res[:, 0], pos_res[:, 1], c=np.log10(matched_flux), cmap='viridis', alpha=0.4, s=1)
+            ax_ast_2d.set_aspect('equal'); ax_ast_2d.set_title("Astrometric Residuals"); add_colorbar(sc, ax_ast_2d)
+            r_lim = np.percentile(np.sqrt(np.sum(pos_res**2, axis=1)), 95) * 1.5; ax_ast_2d.set_xlim(-r_lim, r_lim); ax_ast_2d.set_ylim(-r_lim, r_lim)
 
-        # Calculate Stellar Density
-        pixel_scale = 0.11 # Roman arcsec/pixel
-        area_sq_deg = (H * pixel_scale * W * pixel_scale) / (3600**2)
-        n_bright = sum(1 for m in all_true_mags if m < 26.0)
-        density_per_sq_deg = n_bright / area_sq_deg
+            # Uncertainty Sigmas
+            matched_sigmas = np.array([g_pred_filtered[m[1]][4] for m in g_matches])
+            ax_sig_x = fig.add_subplot(gs[3, 2]); ax_sig_x.scatter(matched_flux, matched_sigmas[:, 0], alpha=0.2, s=1, color='C0'); ax_sig_x.set_xscale('log'); ax_sig_x.set_yscale('log'); ax_sig_x.set_title("Astrometric Sigma (X)")
+            ax_sig_y = fig.add_subplot(gs[3, 3]); ax_sig_y.scatter(matched_flux, matched_sigmas[:, 1], alpha=0.2, s=1, color='C1'); ax_sig_y.set_xscale('log'); ax_sig_y.set_yscale('log'); ax_sig_y.set_title("Astrometric Sigma (Y)")
+            ax_sig_f = fig.add_subplot(gs[4, 2]); ax_sig_f.scatter(matched_flux, matched_sigmas[:, 2], alpha=0.2, s=1, color='C2'); ax_sig_f.set_xscale('log'); ax_sig_f.set_yscale('log'); ax_sig_f.set_title("Photometric Sigma")
 
-        plt.suptitle(f"Aleatoric Uncertainty & Precision Diagnostic | Stars (m<26): {n_bright} ({density_per_sq_deg:,.0f}/sq.deg) | Predicted: {len(detected_stars)}", fontsize=24)
-        plt.savefig(output_path); print(f"Comparison saved to {output_path}")
+        # Recovery vs True-p
+        ax_rec_p = fig.add_subplot(gs[2, 2]); true_labels = np.array([s[0] for s in global_true]); valid_mask = true_labels > 0.05
+        if np.any(valid_mask):
+            v_labels, is_recovered = true_labels[valid_mask], np.array([1 if i in g_matched_true_indices else 0 for i in range(len(global_true)) if valid_mask[i]])
+            p_bins = np.linspace(0, 1.0, 11); rec_stats = []
+            for i in range(len(p_bins)-1):
+                m = (v_labels >= p_bins[i]) & (v_labels <= p_bins[i+1]) if i == len(p_bins)-2 else (v_labels >= p_bins[i]) & (v_labels < p_bins[i+1])
+                rec_stats.append(100.0 * np.mean(is_recovered[m]) if np.any(m) else np.nan)
+            # Use where='post' with the full bin edges and explicit xlim to ensure the last bin is drawn
+            ax_rec_p.step(p_bins, np.append(rec_stats, rec_stats[-1]), where='post', color='green', linewidth=3)
+            ax_rec_p.set_title("Recovery vs True-p"); ax_rec_p.set_ylim(-5, 105); ax_rec_p.set_xlim(0, 1.0)
+
+        # LF Recovery
+        ax_hist = fig.add_subplot(gs[3, 1])
+        ax_hist.hist(g_true_mags, bins=50, alpha=0.2, color='black', label='Truth')
+        ax_hist.hist(g_pred_mags, bins=50, alpha=0.4, color='blue', label=f'Pred (p>={threshold})')
+        ax_hist.set_title("LF Recovery"); ax_hist.invert_xaxis(); ax_hist.legend()
+        
+        # 🚀 IMPROVED: Completeness vs Magnitude
+        ax_comp = fig.add_subplot(gs[4, 1])
+        mag_bins = np.linspace(18, 28, 21)
+        hist_true, _ = np.histogram(g_true_mags, bins=mag_bins)
+        hist_matched, _ = np.histogram(g_matched_true_mags, bins=mag_bins)
+        ax_comp.bar(mag_bins[:-1], hist_true, width=0.5, alpha=0.3, color='gray', label='Truth', align='edge')
+        ax_comp.bar(mag_bins[:-1], hist_matched, width=0.5, alpha=0.7, color='green', label='Found', align='edge')
+        ax_comp.set_title("Completeness vs Mag"); ax_comp.invert_xaxis(); ax_comp.legend(loc='upper left')
+        
+        # Photometry scatter
+        if g_matches:
+            ax8 = fig.add_subplot(gs[3, 0]); ax8.scatter(g_matched_true_mags, g_matched_pred_mags, alpha=0.3, s=2)
+            # Add y=x line
+            all_mags = np.concatenate([g_matched_true_mags, g_matched_pred_mags])
+            if len(all_mags) > 0:
+                m_min, m_max = np.min(all_mags), np.max(all_mags)
+                ax8.plot([m_min, m_max], [m_min, m_max], 'k--', alpha=0.5, zorder=0)
+            ax8.set_title("Global Photometry"); ax8.invert_xaxis(); ax8.invert_yaxis()
+            ax8.set_xlabel("True Mag"); ax8.set_ylabel("Pred Mag")
+
+        plt.suptitle(f"Global Validation Summary ({num_chunks:,} Chunks) | Predicted: {len(g_pred_filtered):,}", fontsize=24)
+        plt.savefig(output_path); print(f"Global diagnostic saved to {output_path}")

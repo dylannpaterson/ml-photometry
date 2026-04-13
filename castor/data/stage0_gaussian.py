@@ -146,7 +146,11 @@ def generate_mosaic_data(mosaic_size, params, master_psf_library):
 
     # 3. Bi-linear placement of stars onto the grid
     px, py = np.random.uniform(0.5, mosaic_size-1.5, len(fluxes)), np.random.uniform(0.5, mosaic_size-1.5, len(fluxes))
-    full_image_grid = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
+    
+    v_mask = mags < mag_limit
+    
+    fg_grid = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
+    bg_grid = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
     
     x0, y0 = np.floor(px).astype(int), np.floor(py).astype(int)
     dx, dy = px - x0, py - y0
@@ -162,16 +166,24 @@ def generate_mosaic_data(mosaic_size, params, master_psf_library):
         flat_indices = y * mosaic_size + x
         grid.flat += np.bincount(flat_indices, weights=f * w, minlength=grid.size)
 
-    paint_flux(full_image_grid, x0, y0, w00, fluxes)
-    paint_flux(full_image_grid, x0 + 1, y0, w10, fluxes)
-    paint_flux(full_image_grid, x0, y0 + 1, w01, fluxes)
-    paint_flux(full_image_grid, x0 + 1, y0 + 1, w11, fluxes)
+    # Paint Resolved (Foreground)
+    paint_flux(fg_grid, x0[v_mask], y0[v_mask], w00[v_mask], fluxes[v_mask])
+    paint_flux(fg_grid, x0[v_mask] + 1, y0[v_mask], w10[v_mask], fluxes[v_mask])
+    paint_flux(fg_grid, x0[v_mask], y0[v_mask] + 1, w01[v_mask], fluxes[v_mask])
+    paint_flux(fg_grid, x0[v_mask] + 1, y0[v_mask] + 1, w11[v_mask], fluxes[v_mask])
 
-    # 4. Single Convolution
-    full_image = fftconvolve(full_image_grid, psf_1x, mode='same')
+    # Paint Unresolved (Background)
+    paint_flux(bg_grid, x0[~v_mask], y0[~v_mask], w00[~v_mask], fluxes[~v_mask])
+    paint_flux(bg_grid, x0[~v_mask] + 1, y0[~v_mask], w10[~v_mask], fluxes[~v_mask])
+    paint_flux(bg_grid, x0[~v_mask], y0[~v_mask] + 1, w01[~v_mask], fluxes[~v_mask])
+    paint_flux(bg_grid, x0[~v_mask] + 1, y0[~v_mask] + 1, w11[~v_mask], fluxes[~v_mask])
 
-    full_image = np.maximum(0, full_image)
-    v_mask = mags < mag_limit
+    # 4. Separate Convolutions
+    fg_image = fftconvolve(fg_grid, psf_1x, mode='same')
+    bg_image = fftconvolve(bg_grid, psf_1x, mode='same')
+
+    full_image = np.maximum(0, fg_image + bg_image)
+    bg_image = np.maximum(0, bg_image)
     
     # Rigorous SNR
     half = SHAPE_SIZE // 2
@@ -200,7 +212,7 @@ def generate_mosaic_data(mosaic_size, params, master_psf_library):
 
     meta = np.array([exp_time, zp, sky_mag, 0.0, 0.0, 0.0]) # Jitter zeros
 
-    return full_image, structured_cat, meta, psf_lib_save
+    return full_image, bg_image, structured_cat, meta, psf_lib_save
 
 
 class HDF5MosaicDataset(Dataset):

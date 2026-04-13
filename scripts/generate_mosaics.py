@@ -46,13 +46,14 @@ def main():
     # 2. Generation Loop
     for i in range(num):
         start_time = time.time()
-        full_image, structured_cat, meta, psf_lib_save = generate_mosaic_data(
+        full_image, bg_image, structured_cat, meta, psf_lib_save = generate_mosaic_data(
             mosaic_size, params, master_psf_library
         )
         
         # 3. Save Outputs
         base_name = f"mosaic_{i:03d}"
         np.save(os.path.join(out, f"{base_name}_img.npy"), full_image)
+        np.save(os.path.join(out, f"{base_name}_bg.npy"), bg_image)
         np.save(os.path.join(out, f"{base_name}_cat.npy"), structured_cat)
         np.save(os.path.join(out, f"{base_name}_meta.npy"), meta)
         np.save(os.path.join(out, f"{base_name}_psf_lib.npy"), psf_lib_save)

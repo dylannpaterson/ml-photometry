@@ -304,199 +304,137 @@ def run_eval(stage_idx, config, device, checkpoint=None):
 def run_infer(stage_idx, config, device, checkpoint=None):
     from castor.engine.evaluator import match_stars
     from castor.engine.inference import InferenceEngine
+    import random
+    import h5py
     print(f"--- 🛰️ Curriculum Stage {stage_idx}: Inference ---")
     model, psf_lib_ckpt = load_stage_model(stage_idx, device, config, checkpoint)
     if not model: return
 
     engine = InferenceEngine(model, device, config)
     
-    # Stage-specific provider
     if stage_idx == 0:
         from castor.data.stage0_gaussian import HDF5MosaicDataset
         data_cfg = config["data_params"]
         stage_cfg = config["curriculum"]["stage0"]
         config_path = config.get("config_path", "config/config.yaml")
         
-        # Ensure data exists fallback
         if not ensure_stage0_data(stage_cfg, data_cfg, config_path):
             return
             
         val_h5 = os.path.join(stage_cfg["data_dir"], "stage0_val.h5")
         dataset = HDF5MosaicDataset(val_h5)
-        import random
-        idx = random.randint(0, len(dataset) - 1)
-        sample = dataset[idx]
         
-        image_tensor = sample["image"]
-        target = sample["target"]
+        # NEW: Respect CLI --num_chunks argument if provided
+        num_chunks_to_infer = config.get("num_chunks_override", min(20, len(dataset)))
+        print(f"🔭 Running Global Inference over {num_chunks_to_infer} chunks...")
         
-        # --- Robust PSF Basis Loading ---
-        # Priority: Checkpoint embedded library > Local .pt file > Dataset sample
-        psf_lib_data = None
-        if psf_lib_ckpt is not None:
-            print("📂 Using PSF basis embedded in model checkpoint...")
-            psf_lib_data = psf_lib_ckpt
-        elif os.path.exists("stage0_psf_basis.pt"):
-            print(f"📂 Loading PSF basis from stage0_psf_basis.pt...")
-            psf_lib_data = torch.load("stage0_psf_basis.pt", map_location="cpu")
-        elif os.path.exists("master_psf_library.pt"):
-            print(f"📂 Loading PSF basis from master_psf_library.pt...")
-            psf_lib_data = torch.load("master_psf_library.pt", map_location="cpu")
-        else:
-            psf_lib_data = sample["psf_library"]
-            
-        # Extract mean_psf and basis robustly
-        mean_psf = None
-        psf_basis = None
+        global_true = []
+        global_pred = []
+        hero_data = None
         
-        if isinstance(psf_lib_data, dict):
-            mean_psf = psf_lib_data.get('mean_psf')
-            # Basis might not be in all formats, but we try
-            if 'eigen_psfs' in psf_lib_data:
-                psf_basis = psf_lib_data['eigen_psfs']
-        elif isinstance(psf_lib_data, (list, tuple)):
-            # Assuming (eigen, weights, mean)
-            psf_basis = psf_lib_data[0]
-            mean_psf = psf_lib_data[2] if len(psf_lib_data) > 2 else psf_lib_data[-1]
-        elif torch.is_tensor(psf_lib_data) or isinstance(psf_lib_data, np.ndarray):
-            data = psf_lib_data if isinstance(psf_lib_data, np.ndarray) else psf_lib_data.cpu().numpy()
-            data = np.squeeze(data)
-            
-            # Handle [N_PCA+1, H*W] or [H, W]
-            if data.ndim == 2:
-                mean_psf = data
-            elif data.ndim == 1:
-                s = int(data.shape[0]**0.5)
-                mean_psf = data.reshape(s, s)
-            else:
-                # [N_PCA+1, H, W] or [N_PCA+1, H*W]
-                psf_basis = data[:-1]
-                mean_psf = data[-1]
-                if mean_psf.ndim == 1:
-                    s = int(mean_psf.shape[0]**0.5)
-                    mean_psf = mean_psf.reshape(s, s)
-                    psf_basis = psf_basis.reshape(-1, s, s)
+        # Robust PSF Extraction logic (shared for all chunks)
+        # We'll use the one from the first sample or checkpoint
+        master_mean_psf = None
+        master_psf_basis = None
 
-        # Ensure mean_psf is numpy and 2D
-        if torch.is_tensor(mean_psf):
-            mean_psf = mean_psf.detach().cpu().numpy()
-        
-        # Bin down if oversampled
-        S_full = mean_psf.shape[0]
-        if S_full > SHAPE_SIZE:
-            O = S_full // SHAPE_SIZE
-            mean_psf = mean_psf.reshape(SHAPE_SIZE, O, SHAPE_SIZE, O).mean(axis=(1, 3))
-            if psf_basis is not None:
-                psf_basis = psf_basis.reshape(-1, S_full, S_full)
-                psf_basis = psf_basis.reshape(-1, SHAPE_SIZE, O, SHAPE_SIZE, O).mean(axis=(2, 4))
-
-        # Normalize
-        mean_psf = mean_psf / (np.sum(mean_psf) + 1e-9)
-        if psf_basis is not None:
-            # Flatten basis if needed for engine.predict compatibility
-            psf_basis = psf_basis.reshape(-1, SHAPE_SIZE * SHAPE_SIZE)
-        # -------------------------
-        
-        # --- THE FIX: Apply Live Noise and Stretch ---
-        stretch_scale = data_cfg.get("GLOBAL_STRETCH_SCALE", 10.0)
-        
-        img_pos = torch.clamp(image_tensor, min=0.0)
-        img_noisy = torch.poisson(img_pos)
-        img_noisy += torch.randn_like(img_noisy) * 5.0  # Read noise
-        
-        # Calculate the median of the NOISY image to center the stretch
-        noisy_median = img_noisy.median().item()
-        
-        # Apply the Arcsinh stretch (Network Space)
-        img_stretched = torch.arcsinh((img_noisy - noisy_median) / stretch_scale)
-        # ---------------------------------------------
-        
-        # Extract true stars from the target grid for visualization
-        true_stars = []
-        cell_size = dataset.cell_size
-        grid_size = dataset.grid_size
-        K = dataset.K
-        
-        # target shape is (grid_size, grid_size, K*4 + 1)
-        target_grid = target[:, :, :-1].view(grid_size, grid_size, K, -1).numpy()
-        gt_bg_map = target[:, :, -1:].numpy()
-        
-        for y in range(grid_size):
-            for x in range(grid_size):
-                for k in range(K):
-                    slot = target_grid[y, x, k]
-                    tp = slot[0]
-                    # NEW: For visualization, we keep stars with visible labels
-                    if tp > 0.0:
-                        tdx, tdy, raw_flux = slot[1], slot[2], slot[3]
-                        
-                        tgx = (x * cell_size) + tdx
-                        tgy = (y * cell_size) + tdy
-                        # [p, dx, dy, flux]
-                        true_stars.append((tp, tgx, tgy, float(raw_flux)))
-        
-        print(f"DEBUG: Found {len(true_stars)} stars with non-zero objectness labels in the chunk.")
-        # Pass PCA reconstruction components to predict
-        # FIX: Pass raw linear noisy image, as predict() handles its own stretch
-        predicted_stars, predicted_shapes, bg_map = engine.predict(
-            img_noisy, 
-            psf_basis=psf_basis, 
-            mean_psf=mean_psf
-        )
-        
-        # --- THE FIX: Extract Jitter for Visualization ---
-        # Metadata: [exp_time, zp, sky_mag, s_jit, q_jit, theta_jit]
-        # We need the last 3 values for the reconstruction to not look "blocky" (sharp)
-        try:
-            with h5py.File(val_h5, 'r') as f:
-                # Get the metadata for the specific mosaic index
-                # We need a way to link sample index to mosaic index
-                # For now, we assume the dataset returns metadata or we check common filenames
-                # Fallback: Check if metadata is available in the sample
-                if "meta" in sample:
-                    meta = sample["meta"]
-                    jitter_params = (meta[3], meta[4], meta[5])
+        for idx in range(num_chunks_to_infer):
+            sample = dataset[idx]
+            image_tensor = sample["image"]
+            target = sample["target"]
+            
+            # --- One-time PSF extraction ---
+            if master_mean_psf is None:
+                psf_lib_data = psf_lib_ckpt if psf_lib_ckpt is not None else sample["psf_library"]
+                if isinstance(psf_lib_data, dict):
+                    master_mean_psf = psf_lib_data.get('mean_psf')
+                    master_psf_basis = psf_lib_data.get('eigen_psfs')
+                elif isinstance(psf_lib_data, (list, tuple)):
+                    master_psf_basis = psf_lib_data[0]
+                    master_mean_psf = psf_lib_data[2] if len(psf_lib_data) > 2 else psf_lib_data[-1]
                 else:
-                    jitter_params = None
-        except:
-            jitter_params = None
-        # -------------------------------------------------
-        
-        # DEBUG: Print normalization stats
-        # Note: predicted_stars elements are (x, y, flux, p, sigmas)
-        # match_stars expects (x, y, flux) for matching
-        match_true = [(s[1], s[2], s[3]) for s in true_stars]
-        match_pred = [(s[0], s[1], s[2]) for s in predicted_stars]
-        matches, _, _ = match_stars(match_true, match_pred)
-        if matches:
-            ratios = []
-            print("\n--- Normalization Diagnostic ---")
-            for i in range(len(matches)):
-                t_idx, p_idx, _ = matches[i]
-                t_flux = true_stars[t_idx][3]
-                p_flux = predicted_stars[p_idx][2]
-                ratios.append(p_flux / t_flux)
-                if i < 5:
-                    print(f"Star {i}: True Flux={t_flux:7.1f}, Pred Flux={p_flux:7.1f}, Ratio={ratios[-1]:.3f}")
+                    data = psf_lib_data if isinstance(psf_lib_data, np.ndarray) else psf_lib_data.cpu().numpy()
+                    data = np.squeeze(data)
+                    if data.ndim == 2: master_mean_psf = data
+                    elif data.ndim == 1: master_mean_psf = data.reshape(int(data.shape[0]**0.5), -1)
+                    else:
+                        master_psf_basis = data[:-1]
+                        master_mean_psf = data[-1]
+                        if master_mean_psf.ndim == 1:
+                            s = int(master_mean_psf.shape[0]**0.5)
+                            master_mean_psf = master_mean_psf.reshape(s, s)
+                            master_psf_basis = master_psf_basis.reshape(-1, s, s)
+
+                if torch.is_tensor(master_mean_psf): master_mean_psf = master_mean_psf.detach().cpu().numpy()
+                S_full = master_mean_psf.shape[0]
+                if S_full > SHAPE_SIZE:
+                    O = S_full // SHAPE_SIZE
+                    master_mean_psf = master_mean_psf.reshape(SHAPE_SIZE, O, SHAPE_SIZE, O).mean(axis=(1, 3))
+                    if master_psf_basis is not None:
+                        master_psf_basis = master_psf_basis.reshape(-1, S_full, S_full)
+                        master_psf_basis = master_psf_basis.reshape(-1, SHAPE_SIZE, O, SHAPE_SIZE, O).mean(axis=(2, 4))
+                master_mean_psf /= (np.sum(master_mean_psf) + 1e-9)
+                if master_psf_basis is not None: master_psf_basis = master_psf_basis.reshape(-1, SHAPE_SIZE * SHAPE_SIZE)
+
+            # --- Physical Prep ---
+            stretch_scale = data_cfg.get("GLOBAL_STRETCH_SCALE", 10.0)
+            img_pos = torch.clamp(image_tensor, min=0.0)
+            img_noisy = torch.poisson(img_pos)
+            img_noisy += torch.randn_like(img_noisy) * 5.0
+            noisy_median = img_noisy.median().item()
+            img_stretched = torch.arcsinh((img_noisy - noisy_median) / stretch_scale)
+
+            # Predict
+            pred_stars, _, bg_map = engine.predict(img_noisy, threshold=0.0, psf_basis=master_psf_basis, mean_psf=master_mean_psf)
             
-            print(f"\nMean Ratio (Pred/True): {np.mean(ratios):.4f}")
-            print(f"Median Ratio:           {np.median(ratios):.4f}")
-            print(f"Std Dev of Ratio:       {np.std(ratios):.4f}")
-        else:
-            print("\n--- Normalization Diagnostic: No matches found ---")
+            # Extract Truth
+            true_stars = []
+            cell_size, grid_size, K = dataset.cell_size, dataset.grid_size, dataset.K
+            target_grid = target[:, :, :-1].view(grid_size, grid_size, K, -1).numpy()
+            gt_bg_map = target[:, :, -1:].numpy()
             
+            for y in range(grid_size):
+                for x in range(grid_size):
+                    for k in range(K):
+                        slot = target_grid[y, x, k]
+                        if slot[0] > 0.0:
+                            true_stars.append((slot[0], (x * cell_size) + slot[1], (y * cell_size) + slot[2], float(slot[3])))
+
+            # Aggregate with Global Offset to prevent overlap during global matching
+            offset = idx * 10000.0
+            for s in true_stars:
+                global_true.append((s[0], s[1] + offset, s[2] + offset, s[3]))
+            for s in pred_stars:
+                # pred_stars elements are (x, y, flux, p, sigmas)
+                global_pred.append((s[0] + offset, s[1] + offset, s[2], s[3], s[4]))
+
+            # Capture Hero Data (first chunk)
+            if idx == 0:
+                jitter_params = None
+                try:
+                    if "meta" in sample:
+                        meta = sample["meta"]
+                        jitter_params = (meta[3], meta[4], meta[5])
+                except: pass
+                
+                hero_data = {
+                    "image_stretched": img_stretched,
+                    "true_stars": true_stars,
+                    "pred_stars": pred_stars,
+                    "bg_map": bg_map,
+                    "gt_bg_map": gt_bg_map,
+                    "chunk_median": noisy_median,
+                    "jitter_params": jitter_params
+                }
+                print(f"📸 Captured Hero Sample with {len(true_stars)} stars.")
+
+        # Final Global Visualization
         engine.visualize(
-            img_stretched, 
-            true_stars, 
-            predicted_stars, 
-            predicted_shapes, 
-            bg_map, 
-            gt_bg_map, 
-            threshold=0.5, 
-            chunk_median=noisy_median,
-            jitter_params=jitter_params,
-            psf_basis=psf_basis,
-            mean_psf=mean_psf
+            hero_data,
+            global_true,
+            global_pred,
+            threshold=0.43,
+            mean_psf=master_mean_psf,
+            num_chunks=num_chunks_to_infer
         )
     else:
         print(f"⚠️ Specialized inference for stage {stage_idx} not yet implemented.")
@@ -518,8 +456,9 @@ def run_analyze(stage_idx, config, device, checkpoint=None):
             
         val_h5 = os.path.join(stage_cfg["data_dir"], "stage0_val.h5")
         dataset = HDF5MosaicDataset(val_h5)
+        num_chunks = config.get("num_chunks_override", 20)
         analyzer = ThresholdAnalyzer(model, device, dataset)
-        analyzer.run_analysis(num_chunks=20)
+        analyzer.run_analysis(num_chunks=num_chunks)
     else:
         print(f"⚠️ Specialized analysis for stage {stage_idx} not yet implemented.")
 
@@ -529,10 +468,13 @@ def main():
     parser.add_argument("action", choices=["train", "eval", "infer", "analyze"], help="Action to perform")
     parser.add_argument("--config", default="config/config.yaml", help="Path to config file")
     parser.add_argument("--checkpoint", default=None, help="Path to specific model checkpoint")
+    parser.add_argument("--num_chunks", type=int, default=None, help="Number of chunks for inference/analysis")
     
     args = parser.parse_args()
     config = load_config(args.config)
     config["config_path"] = args.config # Store for sub-scripts
+    if args.num_chunks:
+        config["num_chunks_override"] = args.num_chunks
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")

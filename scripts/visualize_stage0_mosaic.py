@@ -12,6 +12,7 @@ from castor.constants import GLOBAL_STRETCH_SCALE, SHAPE_SIZE, N_PCA_COMPONENTS
 
 def visualize_mosaic_optimized(mosaic_idx=0, data_dir="data/bulge_stage0_full/mosaics"):
     img_path = os.path.join(data_dir, f"mosaic_{mosaic_idx:03d}_img.npy")
+    bg_path = os.path.join(data_dir, f"mosaic_{mosaic_idx:03d}_bg.npy")
     cat_path = os.path.join(data_dir, f"mosaic_{mosaic_idx:03d}_cat.npy")
     meta_path = os.path.join(data_dir, f"mosaic_{mosaic_idx:03d}_meta.npy")
     lib_path = os.path.join(data_dir, f"mosaic_{mosaic_idx:03d}_psf_lib.npy")
@@ -22,6 +23,7 @@ def visualize_mosaic_optimized(mosaic_idx=0, data_dir="data/bulge_stage0_full/mo
 
     # 1. Load Data
     star_signal = np.load(img_path)
+    bg_image = np.load(bg_path) if os.path.exists(bg_path) else np.zeros_like(star_signal)
     structured_cat = np.load(cat_path)
     meta = np.load(meta_path)
     
@@ -54,6 +56,7 @@ def visualize_mosaic_optimized(mosaic_idx=0, data_dir="data/bulge_stage0_full/mo
     chunk_median = np.median(img_noisy)
     transform = AstroSpaceTransform(stretch_scale=GLOBAL_STRETCH_SCALE)
     network_input = transform.image_to_network(img_noisy, chunk_median)
+    bg_stretched = transform.target_bg_to_network(bg_image + sky_level - chunk_median)
 
     # --- 2. Rigorous SNR Extraction ---
     # We use the SNR from the catalog if available
@@ -86,14 +89,19 @@ def visualize_mosaic_optimized(mosaic_idx=0, data_dir="data/bulge_stage0_full/mo
     # 3. Create Plot
     fig = plt.figure(figsize=(24, 12))
     
-    ax0 = plt.subplot2grid((2, 3), (0, 0), rowspan=2, colspan=2)
+    ax0 = plt.subplot2grid((2, 4), (0, 0), rowspan=2, colspan=2)
     im0 = ax0.imshow(network_input, cmap='magma', vmin=np.percentile(network_input, 1), vmax=np.percentile(network_input, 99.9))
-    ax0.set_title(f"Seamless Mosaic (1024x1024)\n{len(targets_x):,} Targets (SNR >= 5) | Median: {chunk_median:.0f}")
+    ax0.set_title(f"Full Mosaic (1024x1024)\n{len(targets_x):,} Targets (SNR >= 5)")
     plt.colorbar(im0, ax=ax0, fraction=0.046, pad=0.04)
+
+    ax_bg = plt.subplot2grid((2, 4), (0, 2), rowspan=1, colspan=1)
+    im_bg = ax_bg.imshow(bg_stretched, cmap='magma', vmin=np.percentile(bg_stretched, 1), vmax=np.percentile(bg_stretched, 99.9))
+    ax_bg.set_title("Truth Background Map\n(Unresolved Stars)")
+    plt.colorbar(im_bg, ax=ax_bg, fraction=0.046, pad=0.04)
     
     zoom_size = 256
     zx, zy = 400, 400
-    ax1 = plt.subplot2grid((2, 3), (0, 2))
+    ax1 = plt.subplot2grid((2, 4), (1, 2))
     crop = network_input[zy:zy+zoom_size, zx:zx+zoom_size]
     im1 = ax1.imshow(crop, cmap='magma')
     ax1.set_title("Target Selection (SNR >= 5)\nZoomed 256x256")
@@ -102,7 +110,7 @@ def visualize_mosaic_optimized(mosaic_idx=0, data_dir="data/bulge_stage0_full/mo
                 (targets_y >= zy) & (targets_y < zy + zoom_size)
     ax1.scatter(targets_x[zoom_mask] - zx, targets_y[zoom_mask] - zy, s=30, edgecolors='cyan', facecolors='none', alpha=0.6)
     
-    ax2 = plt.subplot2grid((2, 3), (1, 2))
+    ax2 = plt.subplot2grid((2, 4), (0, 3), rowspan=2)
     hist_range = (12, 30)
     ax2.hist(structured_cat['mag'], bins=50, range=hist_range, color='gray', alpha=0.3, label='Culled Pop')
     ax2.hist(snr2_mag, bins=50, range=hist_range, color='orange', alpha=0.5, label='SNR > 2')
@@ -140,6 +148,7 @@ def visualize_mosaic_optimized(mosaic_idx=0, data_dir="data/bulge_stage0_full/mo
     primary_hdu = fits.PrimaryHDU(img_noisy, header=header)
     clean_hdu = fits.ImageHDU(star_signal, name='CLEAN_PHYSICS', header=header)
     stretched_hdu = fits.ImageHDU(network_input, name='NETWORK_INPUT', header=header)
+    bg_hdu = fits.ImageHDU(bg_image, name='TRUTH_BG', header=header)
     
     h, w_size = star_signal.shape
     star_map, _, _ = np.histogram2d(
@@ -148,6 +157,10 @@ def visualize_mosaic_optimized(mosaic_idx=0, data_dir="data/bulge_stage0_full/mo
         range=[[0, h], [0, w_size]]
     )
     star_hdu = fits.ImageHDU(star_map.astype(np.float32), name='STAR_DENSITY', header=header)
+    
+    hdul = fits.HDUList([primary_hdu, clean_hdu, stretched_hdu, bg_hdu, star_hdu])
+    hdul.writeto(fits_path, overwrite=True)
+    print(f"✅ Mosaic saved to FITS with WCS: {fits_path}")
     
     hdul = fits.HDUList([primary_hdu, clean_hdu, stretched_hdu, star_hdu])
     hdul.writeto(fits_path, overwrite=True)
