@@ -47,7 +47,7 @@ class InferenceEngine:
         base_psf = np.exp(-((x - center)**2 + (y - center)**2) / (2 * 0.94**2))
         return base_psf / (base_psf.sum() + 1e-9)
 
-    def predict(self, image_tensor, threshold=0.1, psf_basis=None, mean_psf=None):
+    def predict(self, image_tensor, threshold=0.1, psf_basis=None, mean_psf=None, prior_map=None):
         """Runs inference on a single 2D image tensor [H, W]."""
         self.model.eval()
         with torch.no_grad():
@@ -63,12 +63,28 @@ class InferenceEngine:
                 input_tensor = stretched_tensor
                 
             input_tensor = input_tensor.to(self.device)
+            
+            # Handle Prior Map
+            if prior_map is not None:
+                if isinstance(prior_map, np.ndarray):
+                    prior_tensor = torch.from_numpy(prior_map).float()
+                else:
+                    prior_tensor = prior_map.float()
+                
+                if prior_tensor.dim() == 2:
+                    prior_tensor = prior_tensor.unsqueeze(0).unsqueeze(0)
+                elif prior_tensor.dim() == 3:
+                    prior_tensor = prior_tensor.unsqueeze(0)
+                
+                prior_tensor = prior_tensor.to(self.device)
+            else:
+                prior_tensor = None
 
             # Match training mixed precision context
             device_type = self.device.type if self.device.type != 'cpu' else 'cpu'
             dtype = torch.float16 if self.device.type != 'cpu' else torch.bfloat16
             with torch.autocast(device_type=device_type, dtype=dtype):
-                prediction_dict = self.model(input_tensor)
+                prediction_dict = self.model(input_tensor, prior=prior_tensor)
             
             prediction = prediction_dict["stars"].squeeze(0).float().cpu().numpy()
             bg_map = prediction_dict["background"].squeeze(0).float().cpu().numpy()

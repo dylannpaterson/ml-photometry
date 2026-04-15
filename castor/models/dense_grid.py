@@ -167,8 +167,8 @@ class DenseGridModel(nn.Module):
         # 2. Backbone: Full ResNet-34
         resnet = models.resnet34(weights=None)
         self.initial = nn.Sequential(
-            # Takes 2 channels (Raw Flux + Wavelet Response)
-            nn.Conv2d(2, 64, kernel_size=7, stride=2, padding=3, bias=False),
+            # 3 Channels: Raw Image, Physics Filter, Confidence Prior
+            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
             resnet.bn1,
             resnet.relu,
             resnet.maxpool, # Stride 4, Output 64x64
@@ -195,13 +195,25 @@ class DenseGridModel(nn.Module):
         # Indices: 0:Prob, 1:Pos, 2:Flux, 3:BG, 4:Curvature, 5:Entropy
         self.log_task_vars = nn.Parameter(torch.zeros(6))
 
-    def forward(self, x):
+    def forward(self, x, prior=None):
+        """
+        Args:
+            x: Raw input image (B, 1, H, W)
+            prior: Confidence map (B, 1, H, W), values [0, 1]. 
+                  If None, a zero prior is used.
+        """
         # Bottom-up
-        # 1. Pass through trainable physics prior (Outputs 2 channels)
+        # 1. Pass through trainable physics prior (Outputs 2 channels: Raw, Filtered)
         x_physics = self.diffraction_filter(x)
         
-        # 2. Feed 2-channel input into ResNet
-        c0 = self.initial(x_physics)
+        # 2. Add the 3rd channel: Confidence Prior
+        if prior is None:
+            prior = torch.zeros_like(x)
+        
+        x_combined = torch.cat([x_physics, prior], dim=1)
+        
+        # 3. Feed 3-channel input into ResNet
+        c0 = self.initial(x_combined)
         c1 = self.layer1(c0)
         c2 = self.layer2(c1)
         c3 = self.layer3(c2)

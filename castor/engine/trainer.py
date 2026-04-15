@@ -1,12 +1,13 @@
 import torch
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import os
 import time
 import re
 import numpy as np
 from castor.models.dense_grid import compute_grid_loss, DenseGridModel
-from castor.constants import GLOBAL_STRETCH_SCALE
+from castor.constants import GLOBAL_STRETCH_SCALE, DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL
 
 def find_latest_checkpoint(checkpoint_dir="checkpoints", prefix="stage0"):
     if not os.path.exists(checkpoint_dir): return None, 0
@@ -21,6 +22,100 @@ def find_latest_checkpoint(checkpoint_dir="checkpoints", prefix="stage0"):
                 if epoch > latest_epoch:
                     latest_epoch, latest_file = epoch, os.path.join(checkpoint_dir, f)
     return latest_file, latest_epoch
+
+def render_confidence_prior(targets, img_size, cell_size, K, sigma=1.0):
+    """
+    Renders a confidence prior map from target grid on-the-fly.
+    targets shape: [Batch, GridH, GridW, K*7 + 1]
+    """
+    B, GH, GW, _ = targets.shape
+    device = targets.device
+    
+    # 1. Extract star slots: [B, GH, GW, K, 7]
+    # Minor Optimization: num_params = (targets.shape[-1] - 1) // K
+    num_params = (targets.shape[-1] - 1) // K
+    star_targets = targets[..., :-1].view(B, GH, GW, K, num_params)
+    p_targets = star_targets[..., 0] # [B, GH, GW, K]
+    dx_targets = star_targets[..., 1]
+    dy_targets = star_targets[..., 2]
+    
+    # 2. Create Global Coordinate Grid
+    prior_map = torch.zeros((B, 1, img_size, img_size), device=device)
+    
+    # To keep it fast, we only render the strongest star in each cell if multiple exist,
+    # or we can iterate K. Given K is small (3), we can iterate.
+    
+    y_coords = torch.arange(img_size, device=device).view(1, img_size, 1)
+    x_coords = torch.arange(img_size, device=device).view(1, 1, img_size)
+    
+    # Optimization: Use a smaller window around each cell or just vectorized gaussian
+    # For now, let's use a simpler approach: paint into the grid.
+    
+    for k in range(K):
+        mask = p_targets[..., k] > 0.1
+        if not mask.any(): continue
+        
+        # Get indices where mask is true
+        batch_idx, grid_y, grid_x = torch.where(mask)
+        p_vals = p_targets[batch_idx, grid_y, grid_x, k]
+        dx = dx_targets[batch_idx, grid_y, grid_x, k]
+        dy = dy_targets[batch_idx, grid_y, grid_x, k]
+        
+        # Global positions
+        center_x = grid_x * cell_size + dx
+        center_y = grid_y * cell_size + dy
+        
+        # For a truly fast on-the-fly render in PyTorch, we use a vectorized approach
+        # but limited to a small bounding box to avoid OOM/Slowdown.
+        # However, for a 256x256 image, we can just do it simply if n_stars is not too high.
+        
+        # Simple rendering for now: 
+        # (This is a placeholder for a more optimized C++/CUDA kernel if needed)
+        for i in range(len(batch_idx)):
+            bi = batch_idx[i]
+            cx, cy = center_x[i], center_y[i]
+            pv = p_vals[i]
+            
+            # 5-sigma bounding box
+            r = int(5 * sigma)
+            x0, x1 = max(0, int(cx - r)), min(img_size, int(cx + r + 1))
+            y0, y1 = max(0, int(cy - r)), min(img_size, int(cy + r + 1))
+            
+            window_x = torch.arange(x0, x1, device=device)
+            window_y = torch.arange(y0, y1, device=device).view(-1, 1)
+            
+            dist_sq = (window_x - cx)**2 + (window_y - cy)**2
+            patch = pv * torch.exp(-dist_sq / (2 * sigma**2))
+            
+            # Use max to avoid "over-exposure" if Gaussians overlap in the prior
+            prior_map[bi, 0, y0:y1, x0:x1] = torch.max(prior_map[bi, 0, y0:y1, x0:x1], patch)
+            
+    # --- INJECT POISON (False Positives) ---
+    # Teach the network to ignore the prior if the raw image is empty
+    num_poison = 5  # Add 5 fake stars per batch image
+    
+    for bi in range(B):
+        # Random coordinates
+        px = torch.randint(0, img_size, (num_poison,), device=device).float()
+        py = torch.randint(0, img_size, (num_poison,), device=device).float()
+        
+        # High synthetic confidence to really test the network's skepticism
+        pp = torch.empty(num_poison, device=device).uniform_(0.5, 0.95)
+        
+        for i in range(num_poison):
+            cx, cy, pv = px[i], py[i], pp[i]
+            r = int(5 * sigma)
+            x0, x1 = max(0, int(cx - r)), min(img_size, int(cx + r + 1))
+            y0, y1 = max(0, int(cy - r)), min(img_size, int(cy + r + 1))
+            
+            window_x = torch.arange(x0, x1, device=device)
+            window_y = torch.arange(y0, y1, device=device).view(-1, 1)
+            dist_sq = (window_x - cx)**2 + (window_y - cy)**2
+            
+            fake_patch = pv * torch.exp(-dist_sq / (2 * sigma**2))
+            prior_map[bi, 0, y0:y1, x0:x1] = torch.max(prior_map[bi, 0, y0:y1, x0:x1], fake_patch)
+            
+    return prior_map
 
 class Trainer:
     def __init__(self, model, train_loader, val_loader, config, device, epochs=100, lr=0.0001, checkpoint_prefix="stage0"):
@@ -104,6 +199,12 @@ class Trainer:
     def train(self):
         print(f"Starting Training [{self.checkpoint_prefix}]: {self.epochs} epochs")
         
+        # Get params for prior rendering
+        img_size = self.config["data_params"]["image_size"]
+        # Stage-specific cell size if available, else default
+        cell_size = self.config["curriculum"].get(self.checkpoint_prefix, {}).get("cell_size", DEFAULT_CELL_SIZE)
+        K = self.config["data_params"].get("max_capacity_per_cell", MAX_CAPACITY_PER_CELL)
+
         for epoch in range(self.start_epoch, self.epochs):
             self.model.train(); epoch_loss, start_time = 0, time.time()
             self.optimizer.zero_grad(set_to_none=True)
@@ -138,12 +239,38 @@ class Trainer:
                 
                 images_final = torch.asinh((images_noisy - batch_medians) / self.loss_params["stretch_scale"])
                 
+                # --- LIVE CONFIDENCE PRIOR GENERATION ---
+                # We use a partial subset of targets to simulate a "known" prior
+                # For training, we can randomly drop stars or add noise to positions
+                with torch.no_grad():
+                    # NEW: Replace pure randomness with Probability-Weighted Survival
+                    # Bright stars (p ~ 1.0) have a 95% chance to survive.
+                    # Faint stars (p ~ 0.2) have a low chance to survive.
+                    B, GH, GW, _ = targets.shape
+                    num_params = (targets.shape[-1] - 1) // K
+                    st_view_orig = targets[..., :-1].view(B, GH, GW, K, num_params)
+                    p_targets = st_view_orig[..., 0]
+                    
+                    survival_chance = p_targets * 0.9 + 0.05 
+                    prior_mask = torch.rand_like(p_targets) < survival_chance
+                    
+                    partial_targets = targets.clone()
+                    # Zero out stars not in the prior
+                    st_view = partial_targets[..., :-1].view(B, GH, GW, K, num_params)
+                    st_view[~prior_mask] = 0.0
+                    
+                    # NEW: Add position wobble to prior (0.4 px std)
+                    # The absolute geometry will handle it gracefully even if it crosses cell boundaries.
+                    st_view[..., 1:3] += torch.randn_like(st_view[..., 1:3]) * 0.4
+                    
+                    prior_map = render_confidence_prior(partial_targets, img_size, cell_size, K)
+
                 # FIX: Disable autocast on CPU to avoid massive slowdown
                 if self.use_cuda:
                     with torch.autocast(device_type='cuda', dtype=torch.float16):
-                        preds = self.model(images_final)
+                        preds = self.model(images_final, prior=prior_map)
                 else:
-                    preds = self.model(images_final)
+                    preds = self.model(images_final, prior=prior_map)
                 
                 preds_fp32 = {k: v.float() for k, v in preds.items()}
                 
@@ -245,6 +372,11 @@ class Trainer:
         self.model.eval(); val_loss = 0
         num_batches = len(self.val_loader)
         if num_batches == 0: return 0.0
+        
+        img_size = self.config["data_params"]["image_size"]
+        cell_size = self.config["curriculum"].get(self.checkpoint_prefix, {}).get("cell_size", DEFAULT_CELL_SIZE)
+        K = self.config["data_params"].get("max_capacity_per_cell", MAX_CAPACITY_PER_CELL)
+
         with torch.no_grad():
             for batch in self.val_loader:
                 if isinstance(batch, dict):
@@ -264,11 +396,14 @@ class Trainer:
                     batch_medians = images_noisy.view(images_noisy.shape[0], -1).median(dim=1)[0].view(-1, 1, 1, 1)
                 images_final = torch.asinh((images_noisy - batch_medians) / self.loss_params["stretch_scale"])
                 
+                # Zero prior for validation to see if it can recover stars without help
+                prior_zeros = torch.zeros_like(images_final)
+
                 if self.use_cuda:
                     with torch.autocast(device_type='cuda', dtype=torch.float16):
-                        preds = self.model(images_final)
+                        preds = self.model(images_final, prior=prior_zeros)
                 else:
-                    preds = self.model(images_final)
+                    preds = self.model(images_final, prior=prior_zeros)
                 
                 preds_fp32 = {k: v.float() for k, v in preds.items()}
                 loss, _, _, _, _, _ = compute_grid_loss(
