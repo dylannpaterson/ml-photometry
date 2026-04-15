@@ -112,13 +112,13 @@ class InferenceEngine:
 
         # Match for Hero Plot
         h_match_pred_filtered = [s for s in hero_pred if s[3] >= threshold]
-        h_matches, _, _ = match_stars([(s[1], s[2], s[3]) for s in hero_true], [(s[0], s[1], s[2]) for s in h_match_pred_filtered], distance_threshold=2.0)
+        h_matches, _, _ = match_stars([(s[1], s[2], s[3]) for s in hero_true], [(s[0], s[1], s[2]) for s in h_match_pred_filtered], distance_threshold=1.0)
         h_matched_true_indices = [m[0] for m in h_matches]
 
         # Match for Global Stats
         g_match_true = [(s[1], s[2], s[3]) for s in global_true]
         g_pred_filtered = [s for s in global_pred if s[3] >= threshold]
-        g_matches, g_unmatched_true, g_unmatched_pred = match_stars(g_match_true, [(s[0], s[1], s[2]) for s in g_pred_filtered], distance_threshold=2.0)
+        g_matches, g_unmatched_true, g_unmatched_pred = match_stars(g_match_true, [(s[0], s[1], s[2]) for s in g_pred_filtered], distance_threshold=1.0)
         g_matched_true_indices = [m[0] for m in g_matches]
 
         # 2. HERO COMPONENT PREPARATION (Images)
@@ -236,8 +236,8 @@ class InferenceEngine:
         for thr in thresholds:
             p_cand = [s for s in global_pred if s[3] >= thr]
             if not p_cand: fpr_list.append(0.0); fnr_rates.append(100.0 if t_list_vis else 0.0); continue
-            _, _, up = match_stars(t_list_all, [(s[0], s[1], s[2]) for s in p_cand], distance_threshold=2.0); fpr_list.append(100.0 * len(up) / len(p_cand))
-            if t_list_vis: _, ut_v, _ = match_stars(t_list_vis, [(s[0], s[1], s[2]) for s in p_cand], distance_threshold=2.0); fnr_rates.append(100.0 * len(ut_v) / len(t_list_vis))
+            _, _, up = match_stars(t_list_all, [(s[0], s[1], s[2]) for s in p_cand], distance_threshold=1.0); fpr_list.append(100.0 * len(up) / len(p_cand))
+            if t_list_vis: _, ut_v, _ = match_stars(t_list_vis, [(s[0], s[1], s[2]) for s in p_cand], distance_threshold=1.0); fnr_rates.append(100.0 * len(ut_v) / len(t_list_vis))
             else: fnr_rates.append(0.0)
         ax_err.plot(thresholds, fnr_rates, 'r-', label='Missed %', linewidth=3)
         ax_err.plot(thresholds, fpr_list, '-', color='orange', label='False Pos %', linewidth=3)

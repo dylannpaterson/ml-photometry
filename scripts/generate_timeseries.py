@@ -133,7 +133,9 @@ def main():
     
     original_wcs = ris_wcs.get_wcs(template.meta)
     sca_center_x, sca_center_y = (mosaic_size - 1) / 2.0, (mosaic_size - 1) / 2.0
-    ref_ra, ref_dec = original_wcs.xyToradec(sca_center_x, sca_center_y, units=galsim.degrees)
+    # Romanisim uses 1-indexed coordinates for its WFI_CEN definition.
+    # To correctly center the SCA at the intended RA/Dec, we must use (center + 1).
+    ref_ra, ref_dec = original_wcs.xyToradec(sca_center_x + 1, sca_center_y + 1, units=galsim.degrees)
     print(f"📍 Sky Reference Point (SCA 1 Center): RA {ref_ra:.5f}, DEC {ref_dec:.5f}")
 
     if os.path.exists(args.psf_library):
@@ -228,13 +230,26 @@ def main():
         )
         
         model = template.copy()
+        # CRITICAL: Clear stale WCS object so fill_in_parameters and get_wcs use updated wcsinfo
+        if 'wcs' in model.meta:
+            del model.meta['wcs']
+            
         ris_wcs.fill_in_parameters(
             model.meta, 
             SkyCoord(epoch_ra, epoch_dec, unit='deg', frame='icrs'), 
             boresight=False, 
             pa_aper=pa_aper
         )
-        curr_wcs = ris_wcs.get_wcs(model.meta)
+        
+        # PERFECT FIX: Re-generate the WCS object and attach it to the metadata
+        # so that it is saved into the ASDF and Pollux loads the correct one.
+        curr_wcs_gs = ris_wcs.get_wcs(model.meta)
+        if hasattr(curr_wcs_gs, 'wcs'):
+            model.meta['wcs'] = curr_wcs_gs.wcs
+        else:
+            model.meta['wcs'] = curr_wcs_gs
+            
+        curr_wcs = curr_wcs_gs
         
         current_fluxes = fluxes_base.copy()
         current_event_data = []

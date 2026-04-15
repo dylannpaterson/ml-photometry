@@ -5,7 +5,7 @@ from scipy.spatial import cKDTree
 from castor.data.transforms import AstroSpaceTransform
 from castor.constants import MAX_CAPACITY_PER_CELL, GLOBAL_STRETCH_SCALE, N_PCA_COMPONENTS
 
-def match_stars(true_stars, pred_stars, distance_threshold=2.0, flux_threshold_dex=0.5):
+def match_stars(true_stars, pred_stars, distance_threshold=1.0, flux_threshold_dex=0.5):
     """
     Matches predicted stars to true stars using a Bright-to-Faint priority strategy.
     
@@ -156,7 +156,7 @@ class Evaluator:
                             if p > threshold:
                                 pred_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, float(physical_flux_pred), p))
                 
-                matches, unmatched_true, unmatched_pred = match_stars(true_stars, pred_stars, distance_threshold=2.0)
+                matches, unmatched_true, unmatched_pred = match_stars(true_stars, pred_stars, distance_threshold=1.0)
                 
                 all_tp += len(matches)
                 all_fp += len(unmatched_pred)
