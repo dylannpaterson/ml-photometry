@@ -1,0 +1,26 @@
+run_config:
+  resume_from_checkpoint: false
+  force_regenerate_data: true
+
+curriculum:
+  stage0:
+    name: "Smoke Test Stage 0"
+    data_dir: "data/smoke_test"
+    epochs: 1
+    batch_size: 16
+    learning_rate: 0.0001
+    num_workers: 0
+    resume_from_last_stage: false
+    cell_size: 4
+    mosaic_params:
+      num_mosaics: 1
+      mosaic_size: 1024
+
+data_params:
+  num_train_samples: 100
+  num_val_samples: 50
+  min_stars: 100
+  max_stars: 200
+  image_size: 256
+  max_capacity_per_cell: 3
+  shape_size: 129

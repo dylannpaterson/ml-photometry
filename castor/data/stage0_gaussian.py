@@ -4,6 +4,7 @@ from torch.utils.data import Dataset
 import os
 import h5py
 from scipy.signal import fftconvolve
+from scipy.ndimage import map_coordinates
 from castor.data.transforms import AstroSpaceTransform
 from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, GLOBAL_STRETCH_SCALE, SHAPE_SIZE, N_PCA_COMPONENTS
 
@@ -12,7 +13,6 @@ def generate_field_realistic_psf_library(num_psfs=100, grid_size=127, oversample
     print(f"📡 Generating Master OPTICAL PSF Library ({num_psfs} PSFs, {oversample}x oversampled)...")
     S = grid_size * oversample
     library = np.zeros((num_psfs, S, S), dtype=np.float32)
-    # Correct center for perfect alignment: (S-1)/2.0
     center = (S - 1) / 2.0
     optical_template = None
     if os.path.exists("roman_psf_prior_4x.pt"):
@@ -118,10 +118,30 @@ def calculate_safe_magnitude_cutoff(exp_time, zp, sky_mag, read_noise=5.0, sigma
     min_flux = (-b + np.sqrt(b**2 - 4*a*c)) / (2*a)
     return zp - 2.5 * np.log10(min_flux / exp_time)
 
+def generate_dust_cirrus(img_size, amplitude):
+    """Generates fractal dust noise with P(k) ~ k^-3 power spectrum."""
+    fx = np.fft.fftfreq(img_size)
+    fy = np.fft.fftfreq(img_size)
+    kx, ky = np.meshgrid(fx, fy)
+    k = np.sqrt(kx**2 + ky**2)
+    k[0, 0] = 1e-9 
+    
+    noise_fft = (np.random.normal(size=(img_size, img_size)) + 
+                 1j * np.random.normal(size=(img_size, img_size)))
+    
+    noise_fft *= k**(-1.5)
+    noise_fft[0, 0] = 0.0 
+    
+    dust_map = np.real(np.fft.ifft2(noise_fft))
+    dust_map -= dust_map.min()
+    dust_map /= (dust_map.max() + 1e-9)
+    return dust_map * amplitude
+
 def generate_mosaic_data(mosaic_size, params, master_psf_library):
     """
     Simplified Stage 0 Engine: Uses a single physical PSF from the library.
     Employs bi-linear interpolation for sub-pixel placement.
+    Includes realistic Dust Extinction (Multiplicative) and Extended Sources.
     """
     area_ratio = (mosaic_size / params['image_size'])**2
     exp_time, zp, sky_mag = np.random.uniform(30.0, 90.0), 26.5, 22.0
@@ -135,85 +155,120 @@ def generate_mosaic_data(mosaic_size, params, master_psf_library):
     
     # 1. Select a single Physical PSF from the library
     repr_idx = np.random.randint(0, len(master_psf_library))
-    repr_psf_4x = master_psf_library[repr_idx] # Shape: (516, 516) for SHAPE_SIZE=129
-
-    # 2. Binning for 1x PSF (Centered at SHAPE_SIZE//2)
-    # Since repr_psf_4x is centered at (516-1)/2 = 257.5, 
-    # the 1x binning at index 64 covers [256, 257, 258, 259], 
-    # which is perfectly centered at 257.5.
+    repr_psf_4x = master_psf_library[repr_idx] 
     psf_1x = repr_psf_4x.reshape(SHAPE_SIZE, O, SHAPE_SIZE, O).mean(axis=(1, 3))
     psf_1x /= (np.sum(psf_1x) + 1e-9)
 
-    # 3. Bi-linear placement of stars onto the grid
+    # 2. Placement
     px, py = np.random.uniform(0.5, mosaic_size-1.5, len(fluxes)), np.random.uniform(0.5, mosaic_size-1.5, len(fluxes))
     
-    v_mask = mags < mag_limit
+    # 3. NEW: Multiplicative Dust Extinction Logic
+    sky_level = (10 ** (-0.4 * (sky_mag - zp))) * (0.11**2) * exp_time
+    if np.random.rand() < 0.7:
+        print("🌫️ Adding realistic Interstellar Cirrus (Dust) to mosaic...")
+        raw_dust = generate_dust_cirrus(mosaic_size, 1.0)
+
+        # Realistic Galactic Bulge Extinction: Up to 5.0 mags in Roman NIR filters
+        max_extinction = np.random.uniform(0.2, 5.0)
+        transmission_map = 10 ** (-0.4 * raw_dust * max_extinction)
+        
+        star_transmissions = map_coordinates(transmission_map, [py, px], order=1, mode='nearest')
+        apparent_fluxes = fluxes * star_transmissions
+        apparent_mags = mags - 2.5 * np.log10(star_transmissions + 1e-9)
+        
+        # Split Sky Background: Only the background component is extincted
+        frac_bg = 0.60
+        sky_foreground = sky_level * (1.0 - frac_bg)
+        sky_background_attenuated = (sky_level * frac_bg) * transmission_map
+        total_sky_map = sky_foreground + sky_background_attenuated
+
+        # Additive Emission: Simulates scattering in dense dust (P(k)~k^-3)
+        # Scaled up for higher extinction regions
+        additive_dust_emission = raw_dust * np.random.uniform(20, 100)
+    else:
+        transmission_map = np.ones((mosaic_size, mosaic_size), dtype=np.float32)
+        apparent_fluxes = fluxes.copy()
+        apparent_mags = mags.copy()
+        total_sky_map = np.full((mosaic_size, mosaic_size), sky_level, dtype=np.float32)
+        additive_dust_emission = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
+    
+    # 4. Filter resolved stars using apparent magnitude
+    v_mask = apparent_mags < mag_limit
     
     fg_grid = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
     bg_grid = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
     
     x0, y0 = np.floor(px).astype(int), np.floor(py).astype(int)
     dx, dy = px - x0, py - y0
+    w00, w10, w01, w11 = (1 - dx) * (1 - dy), dx * (1 - dy), (1 - dx) * dy, dx * dy
     
-    # Weights for the 4 nearest pixels
-    w00 = (1 - dx) * (1 - dy)
-    w10 = dx * (1 - dy)
-    w01 = (1 - dx) * dy
-    w11 = dx * dy
-    
-    # Efficient grid painting
     def paint_flux(grid, x, y, w, f):
         flat_indices = y * mosaic_size + x
         grid.flat += np.bincount(flat_indices, weights=f * w, minlength=grid.size)
 
-    # Paint Resolved (Foreground)
-    paint_flux(fg_grid, x0[v_mask], y0[v_mask], w00[v_mask], fluxes[v_mask])
-    paint_flux(fg_grid, x0[v_mask] + 1, y0[v_mask], w10[v_mask], fluxes[v_mask])
-    paint_flux(fg_grid, x0[v_mask], y0[v_mask] + 1, w01[v_mask], fluxes[v_mask])
-    paint_flux(fg_grid, x0[v_mask] + 1, y0[v_mask] + 1, w11[v_mask], fluxes[v_mask])
+    paint_flux(fg_grid, x0[v_mask], y0[v_mask], w00[v_mask], apparent_fluxes[v_mask])
+    paint_flux(fg_grid, x0[v_mask] + 1, y0[v_mask], w10[v_mask], apparent_fluxes[v_mask])
+    paint_flux(fg_grid, x0[v_mask], y0[v_mask] + 1, w01[v_mask], apparent_fluxes[v_mask])
+    paint_flux(fg_grid, x0[v_mask] + 1, y0[v_mask] + 1, w11[v_mask], apparent_fluxes[v_mask])
 
-    # Paint Unresolved (Background)
-    paint_flux(bg_grid, x0[~v_mask], y0[~v_mask], w00[~v_mask], fluxes[~v_mask])
-    paint_flux(bg_grid, x0[~v_mask] + 1, y0[~v_mask], w10[~v_mask], fluxes[~v_mask])
-    paint_flux(bg_grid, x0[~v_mask], y0[~v_mask] + 1, w01[~v_mask], fluxes[~v_mask])
-    paint_flux(bg_grid, x0[~v_mask] + 1, y0[~v_mask] + 1, w11[~v_mask], fluxes[~v_mask])
+    paint_flux(bg_grid, x0[~v_mask], y0[~v_mask], w00[~v_mask], apparent_fluxes[~v_mask])
+    paint_flux(bg_grid, x0[~v_mask] + 1, y0[~v_mask], w10[~v_mask], apparent_fluxes[~v_mask])
+    paint_flux(bg_grid, x0[~v_mask], y0[~v_mask] + 1, w01[~v_mask], apparent_fluxes[~v_mask])
+    paint_flux(bg_grid, x0[~v_mask] + 1, y0[~v_mask] + 1, w11[~v_mask], apparent_fluxes[~v_mask])
 
-    # 4. Separate Convolutions
+    # 5. Physics: Convolutions
     fg_image = fftconvolve(fg_grid, psf_1x, mode='same')
     bg_image = fftconvolve(bg_grid, psf_1x, mode='same')
 
-    full_image = np.maximum(0, fg_image + bg_image)
-    bg_image = np.maximum(0, bg_image)
+    # 6. Add Extended Sources (Extincted)
+    num_extended = np.random.randint(0, 4)
+    ext_image = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
+    if num_extended > 0:
+        y_idx, x_idx = np.meshgrid(np.arange(mosaic_size), np.arange(mosaic_size), indexing='ij')
+        for _ in range(num_extended):
+            ex, ey = np.random.uniform(0, mosaic_size), np.random.uniform(0, mosaic_size)
+            eflux = np.random.uniform(5000, 30000)
+            esigma = np.random.uniform(3.0, 10.0)
+            eq = np.random.uniform(0.3, 0.8)
+            etheta = np.random.uniform(0, np.pi)
+            cos_t, sin_t = np.cos(etheta), np.sin(etheta)
+            xp = (x_idx - ex) * cos_t + (y_idx - ey) * sin_t
+            yp = -(x_idx - ex) * sin_t + (y_idx - ey) * cos_t
+            ext_blob = np.exp(-(xp**2 / (2 * esigma**2) + yp**2 / (2 * (esigma * eq)**2)))
+            ext_image += (eflux / (ext_blob.sum() + 1e-9)) * ext_blob
+        ext_image *= transmission_map
+
+    # 7. Final Image Composition
+    full_image = np.maximum(0, fg_image + bg_image + ext_image + total_sky_map + additive_dust_emission)
     
-    # Rigorous SNR
+    # 8. Rigorous SNR using local sky values
     half = SHAPE_SIZE // 2
     N_eff = 1.0 / (np.sum(psf_1x**2) + 1e-9)
-    actual_pixel_values = full_image[np.clip(y0[v_mask], 0, mosaic_size-1), np.clip(x0[v_mask], 0, mosaic_size-1)]
     star_peak_val = psf_1x[half, half]
-    sky_level = (10 ** (-0.4 * (sky_mag - zp))) * (0.11**2) * exp_time
-    confusion_light = np.maximum(0.0, actual_pixel_values - (fluxes[v_mask] * star_peak_val))
-    noise_variance = fluxes[v_mask] + N_eff * (sky_level + confusion_light + 25.0)
-    snrs = fluxes[v_mask] / np.sqrt(noise_variance)
+    
+    local_sky = map_coordinates(total_sky_map + additive_dust_emission, [py[v_mask], px[v_mask]], order=1, mode='nearest')
+    actual_pixel_values = full_image[np.clip(y0[v_mask], 0, mosaic_size-1), np.clip(x0[v_mask], 0, mosaic_size-1)]
+    confusion_light = np.maximum(0.0, actual_pixel_values - (apparent_fluxes[v_mask] * star_peak_val))
+    noise_variance = apparent_fluxes[v_mask] + N_eff * (local_sky + confusion_light + 25.0)
+    snrs = apparent_fluxes[v_mask] / np.sqrt(noise_variance)
     
     cat_dtype = [('x', 'f4'), ('y', 'f4'), ('flux', 'f4'), ('mag', 'f4'), ('snr', 'f4')]
-    
-    # Sort catalog by Y for searchsorted compatibility in HDF5 conversion
     sort_y = np.argsort(py[v_mask])
     structured_cat = np.zeros(np.sum(v_mask), dtype=cat_dtype)
     structured_cat['x'] = px[v_mask][sort_y]
     structured_cat['y'] = py[v_mask][sort_y]
-    structured_cat['flux'] = fluxes[v_mask][sort_y]
-    structured_cat['mag'] = mags[v_mask][sort_y]
+    structured_cat['flux'] = apparent_fluxes[v_mask][sort_y]
+    structured_cat['mag'] = apparent_mags[v_mask][sort_y]
     structured_cat['snr'] = snrs[sort_y]
     
-    # Save in (N_PCA + 1, S*S) format for compatibility with inference and HDF5 structure
     psf_lib_save = np.zeros((N_PCA_COMPONENTS + 1, SHAPE_SIZE * SHAPE_SIZE), dtype=np.float32)
     psf_lib_save[-1] = psf_1x.flatten()
+    meta = np.array([exp_time, zp, sky_mag, 0.0, 0.0, 0.0])
 
-    meta = np.array([exp_time, zp, sky_mag, 0.0, 0.0, 0.0]) # Jitter zeros
+    # For the background truth, we want everything EXCEPT the resolved stars
+    truth_bg_map = bg_image + ext_image + total_sky_map + additive_dust_emission
 
-    return full_image, bg_image, structured_cat, meta, psf_lib_save
-
+    return full_image, truth_bg_map, structured_cat, meta, psf_lib_save
 
 class HDF5MosaicDataset(Dataset):
     def __init__(self, h5_path, image_size=256):

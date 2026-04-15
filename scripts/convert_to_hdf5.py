@@ -145,10 +145,11 @@ def create_hdf5_datasets_combined(train_mosaic_dir, val_mosaic_dir, train_path, 
                     py = np.random.randint(0, my - img_size)
                     px = np.random.randint(0, mx - img_size)
                     
-                    # 1. Physics
+                    # 1. Physics: The clean scene already contains the (attenuated) sky and dust.
+                    # We just extract the chunk and clip/tensorize.
                     star_signal = img_data[py:py+img_size, px:px+img_size]
-                    chunk_median = np.median(star_signal) + sky_level
-                    signal_tensor = np.expand_dims(np.clip(star_signal + sky_level, 0, None), axis=0).astype(np.float32)
+                    chunk_median = np.median(star_signal)
+                    signal_tensor = np.expand_dims(np.clip(star_signal, 0, None), axis=0).astype(np.float32)
                     
                     # 2. Target Painting
                     y_start = np.searchsorted(cat_data['y'], py)
@@ -163,16 +164,17 @@ def create_hdf5_datasets_combined(train_mosaic_dir, val_mosaic_dir, train_path, 
                         local_snrs = local_cat['snr']
                         sort_idx = np.argsort(local_cat['flux'])[::-1]
                         
+                        # Catalog fluxes are already APPARENT (attenuated by dust)
                         grid_stars = fast_paint_grid(lx, ly, local_cat['flux'], local_snrs, sort_idx, 5.0, grid_size, cell_size, K)
                         target_buffer[:, :, :-1] = grid_stars.reshape(grid_size, grid_size, -1)
 
                     if bg_data is not None:
-                        # Extract 256x256 truth background map and bin to grid_size
+                        # Extract truth background map (includes attenuated sky + dust emission)
                         bg_chunk = bg_data[py:py+img_size, px:px+img_size]
-                        # Bin bg_chunk (256, 256) -> (grid_size, grid_size)
                         bg_map = bg_chunk.reshape(grid_size, cell_size, grid_size, cell_size).mean(axis=(1, 3))
-                        target_buffer[:, :, -1] = transform.target_bg_to_network(bg_map + sky_level - chunk_median)
+                        target_buffer[:, :, -1] = transform.target_bg_to_network(bg_map - chunk_median)
                     else:
+                        # Fallback (should not happen with new engine)
                         target_buffer[:, :, -1] = transform.target_bg_to_network(sky_level - chunk_median)
                     
                     # 3. Write

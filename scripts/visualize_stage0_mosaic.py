@@ -49,14 +49,19 @@ def visualize_mosaic_optimized(mosaic_idx=0, data_dir="data/bulge_stage0_full/mo
 
     exp_time, zp, sky_mag = meta[0], meta[1], meta[2]
     sky_level = (10 ** (-0.4 * (sky_mag - zp))) * (0.11**2) * exp_time
-    
-    img_noisy = np.random.poisson(np.maximum(star_signal + sky_level, 0)).astype(np.float32)
+
+    # --- 2. Simulation Logic ---
+    # NOTE: `star_signal` already contains the clean physical scene including attenuated sky and dust emission.
+    # We only add Poisson noise and read noise for visualization.
+    img_noisy = np.random.poisson(np.maximum(star_signal, 0)).astype(np.float32)
     img_noisy += np.random.normal(0, 5.0, size=img_noisy.shape)
     
     chunk_median = np.median(img_noisy)
     transform = AstroSpaceTransform(stretch_scale=GLOBAL_STRETCH_SCALE)
     network_input = transform.image_to_network(img_noisy, chunk_median)
-    bg_stretched = transform.target_bg_to_network(bg_image + sky_level - chunk_median)
+    
+    # Background stretch: `bg_image` already includes the full truth background map.
+    bg_stretched = transform.target_bg_to_network(bg_image - chunk_median)
 
     # --- 2. Rigorous SNR Extraction ---
     # We use the SNR from the catalog if available
@@ -69,7 +74,7 @@ def visualize_mosaic_optimized(mosaic_idx=0, data_dir="data/bulge_stage0_full/mo
         x0, y0 = np.floor(px).astype(int), np.floor(py).astype(int)
         actual_pixel_values = star_signal[y0, x0]
         local_background = np.maximum(0, actual_pixel_values - fluxes * 0.2) 
-        noise_var = fluxes + eff_area * (sky_level + local_background + 25.0)
+        noise_var = fluxes + eff_area * (local_background + 25.0) # local_background includes sky
         snrs = fluxes / np.sqrt(noise_var)
     
     # Identify model targets
