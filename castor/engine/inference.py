@@ -29,6 +29,55 @@ def upsample_background(bg_map, target_size):
     yy, xx = np.meshgrid(np.arange(H), np.arange(W), indexing='ij')
     return interp((yy, xx))
 
+def generate_custom_inference_prior(star_catalog, img_size, sigma=1.0, device='cpu'):
+    """
+    Generates a 2D prior map for inference testing.
+    
+    Args:
+        star_catalog: List of (x, y, p) tuples. 
+        img_size: Size of the image (H, W).
+        sigma: Gaussian spread of the confidence.
+    """
+    prior_map = torch.zeros((img_size, img_size), device=device)
+    if not star_catalog:
+        return prior_map.cpu().numpy()
+        
+    # Convert to tensors
+    catalog = torch.tensor(star_catalog, device=device)
+    cx, cy, p = catalog[:, 0], catalog[:, 1], catalog[:, 2]
+    
+    # Bounding box limits
+    r = int(5 * sigma)
+    patch_size = 2 * r + 1
+    
+    local_coords = torch.arange(-r, r + 1, device=device)
+    local_y, local_x = torch.meshgrid(local_coords, local_coords, indexing='ij')
+    
+    cx_int, cy_int = cx.round().long(), cy.round().long()
+    
+    patch_y = cy_int.view(-1, 1, 1) + local_y.view(1, patch_size, patch_size)
+    patch_x = cx_int.view(-1, 1, 1) + local_x.view(1, patch_size, patch_size)
+    
+    dist_sq = (patch_x.float() - cx.view(-1, 1, 1))**2 + \
+              (patch_y.float() - cy.view(-1, 1, 1))**2
+              
+    patches = p.view(-1, 1, 1) * torch.exp(-dist_sq / (2 * sigma**2))
+    
+    # Mask out-of-bounds pixels
+    valid_mask = (patch_x >= 0) & (patch_x < img_size) & (patch_y >= 0) & (patch_y < img_size)
+    
+    valid_y = patch_y[valid_mask]
+    valid_x = patch_x[valid_mask]
+    valid_patches = patches[valid_mask]
+    
+    # Fast Scatter Reduction
+    flat_indices = valid_y * img_size + valid_x
+    prior_flat = prior_map.view(-1)
+    prior_flat.scatter_reduce_(0, flat_indices, valid_patches, reduce="amax", include_self=True)
+    
+    # Return as a numpy array since your InferenceEngine converts it to a tensor internally
+    return prior_map.view(img_size, img_size).cpu().numpy()
+
 class InferenceEngine:
     def __init__(self, model, device, config):
         self.model = model
@@ -125,6 +174,7 @@ class InferenceEngine:
         gt_bg_map = hero_data["gt_bg_map"]
         chunk_median = hero_data.get("chunk_median", 0.0)
         jitter_params = hero_data.get("jitter_params")
+        prior_map = hero_data.get("prior_map")
 
         # Match for Hero Plot
         h_match_pred_filtered = [s for s in hero_pred if s[3] >= threshold]
@@ -136,10 +186,6 @@ class InferenceEngine:
         g_pred_filtered = [s for s in global_pred if s[3] >= threshold]
         g_matches, g_unmatched_true, g_unmatched_pred = match_stars(g_match_true, [(s[0], s[1], s[2]) for s in g_pred_filtered], distance_threshold=1.0)
         g_matched_true_indices = [m[0] for m in g_matches]
-
-        # 2. HERO COMPONENT PREPARATION (Images)
-        full_residual_bg_stretched = upsample_background(bg_map.squeeze(), (H, W))
-        full_gt_residual_bg_stretched = upsample_background(gt_bg_map.squeeze(), (H, W))
         
         base_psf = self._get_centered_psf(mean_psf)
         flipped_psf = base_psf[::-1, ::-1]
@@ -175,9 +221,14 @@ class InferenceEngine:
             h_rec_stars_linear = fftconvolve(h_rec_stars_linear, j_kernel, mode='same')
             h_rec_missed_linear = fftconvolve(h_rec_missed_linear, j_kernel, mode='same')
 
-        # Convert backgrounds
-        full_bg_abs = upsample_background(bg_map.squeeze(), (H, W)) + chunk_median
-        full_gt_bg_abs = upsample_background(gt_bg_map.squeeze(), (H, W)) + chunk_median
+
+        # Convert backgrounds (properly un-stretching them)
+        full_bg_stretched = upsample_background(bg_map.squeeze(), (H, W))
+        full_gt_bg_stretched = upsample_background(gt_bg_map.squeeze(), (H, W))
+
+        # Pass through the transform to reverse arcsinh and add the median
+        full_bg_abs = self.transform.network_to_image(full_bg_stretched, chunk_median)
+        full_gt_bg_abs = self.transform.network_to_image(full_gt_bg_stretched, chunk_median)
 
         h_rec_abs = h_rec_stars_linear + full_bg_abs
         img_linear_abs = self.transform.network_to_image(img_stretched, chunk_median)
@@ -186,7 +237,8 @@ class InferenceEngine:
         # FITS Output
         fits_path = output_path.replace(".png", ".fits")
         h_rec_missed_abs = h_rec_missed_linear + full_gt_bg_abs
-        fits.HDUList([
+        
+        hdul = fits.HDUList([
             fits.PrimaryHDU(), 
             fits.ImageHDU(img_linear_abs, name="INPUT_LINEAR"), 
             fits.ImageHDU(h_rec_abs, name="MODEL_LINEAR"), 
@@ -195,7 +247,10 @@ class InferenceEngine:
             fits.ImageHDU(h_rec_missed_abs, name="MISSED_ABS"),
             fits.ImageHDU(full_bg_abs, name="BG_PRED_LINEAR"), 
             fits.ImageHDU(full_gt_bg_abs, name="BG_TRUE_LINEAR")
-        ]).writeto(fits_path, overwrite=True)
+        ])
+        if prior_map is not None:
+            hdul.append(fits.ImageHDU(prior_map, name="PRIOR_MAP"))
+        hdul.writeto(fits_path, overwrite=True)
 
         # 3. STATISTICS (GLOBAL)
         physics_cfg = self.config.get("data_params", {}).get("physics_params", {})
@@ -210,7 +265,7 @@ class InferenceEngine:
 
         # Figure Layout
         fig = plt.figure(figsize=(30, 24))
-        gs = fig.add_gridspec(5, 4, hspace=0.3, wspace=0.3)
+        gs = fig.add_gridspec(6, 4, hspace=0.3, wspace=0.3)
         
         def add_colorbar(im, ax):
             divider = make_axes_locatable(ax); cax = divider.append_axes("right", size="5%", pad=0.05); fig.colorbar(im, cax=cax)
@@ -225,11 +280,17 @@ class InferenceEngine:
         ax3 = fig.add_subplot(gs[0:2, 2], sharex=ax1, sharey=ax1); r_lim = np.percentile(np.abs(h_residual_linear), 99)
         im3 = ax3.imshow(h_residual_linear, cmap='bwr', origin='lower', vmin=-r_lim, vmax=r_lim); ax3.set_title("Linear Residual"); add_colorbar(im3, ax3)
 
+        # 🚀 Prior Map
+        if prior_map is not None:
+            ax_prior = fig.add_subplot(gs[2, 2], sharex=ax1, sharey=ax1)
+            im_prior = ax_prior.imshow(prior_map, cmap='magma', origin='lower', vmin=0, vmax=1)
+            ax_prior.set_title("Inference Prior Map"); add_colorbar(im_prior, ax_prior)
+
         # Backgrounds
         ax4 = fig.add_subplot(gs[2, 0], sharex=ax1, sharey=ax1); ax4.imshow(full_bg_abs, cmap='viridis', origin='lower'); ax4.set_title("Predicted Background")
         ax5 = fig.add_subplot(gs[2, 1], sharex=ax1, sharey=ax1); im5 = ax5.imshow(full_gt_bg_abs, cmap='viridis', origin='lower'); ax5.set_title("Truth Background"); add_colorbar(im5, ax5)
 
-        # 🚀 RESTORED: Astrometric Residual Histograms (Slot 0,3)
+        # Astrometric Residual Histograms
         if g_matches:
             pos_res = np.array([(g_pred_filtered[m[1]][0]-global_true[m[0]][1], g_pred_filtered[m[1]][1]-global_true[m[0]][2]) for m in g_matches])
             ax_res_hist = fig.add_subplot(gs[0, 3])
@@ -237,7 +298,7 @@ class InferenceEngine:
             ax_res_hist.hist(pos_res[:, 1], bins=50, alpha=0.5, label='dy', color='C1')
             ax_res_hist.set_title("Astrometric Residuals (px)"); ax_res_hist.legend()
             
-            # 🚀 RESTORED: Photometric Residual Histogram (Slot 1,3)
+            # Photometric Residual Histogram
             ax_mag_hist = fig.add_subplot(gs[1, 3])
             mag_res = g_matched_pred_mags - g_matched_true_mags
             ax_mag_hist.hist(mag_res, bins=50, color='C2', alpha=0.7)
@@ -266,27 +327,26 @@ class InferenceEngine:
 
         # 2D Astrometric Residuals
         if g_matches:
-            ax_ast_2d = fig.add_subplot(gs[4, 3])
+            ax_ast_2d = fig.add_subplot(gs[5, 3])
             matched_flux = np.array([g_pred_filtered[m[1]][2] for m in g_matches])
-            sc = ax_ast_2d.scatter(pos_res[:, 0], pos_res[:, 1], c=np.log10(matched_flux), cmap='viridis', alpha=0.4, s=1)
+            sc = ax_ast_2d.scatter(pos_res[:, 0], pos_res[:, 1], c=np.log10(np.maximum(matched_flux, 1e-9)), cmap='viridis', alpha=0.4, s=1)
             ax_ast_2d.set_aspect('equal'); ax_ast_2d.set_title("Astrometric Residuals"); add_colorbar(sc, ax_ast_2d)
             r_lim = np.percentile(np.sqrt(np.sum(pos_res**2, axis=1)), 95) * 1.5; ax_ast_2d.set_xlim(-r_lim, r_lim); ax_ast_2d.set_ylim(-r_lim, r_lim)
 
             # Uncertainty Sigmas
             matched_sigmas = np.array([g_pred_filtered[m[1]][4] for m in g_matches])
-            ax_sig_x = fig.add_subplot(gs[3, 2]); ax_sig_x.scatter(matched_flux, matched_sigmas[:, 0], alpha=0.2, s=1, color='C0'); ax_sig_x.set_xscale('log'); ax_sig_x.set_yscale('log'); ax_sig_x.set_title("Astrometric Sigma (X)")
-            ax_sig_y = fig.add_subplot(gs[3, 3]); ax_sig_y.scatter(matched_flux, matched_sigmas[:, 1], alpha=0.2, s=1, color='C1'); ax_sig_y.set_xscale('log'); ax_sig_y.set_yscale('log'); ax_sig_y.set_title("Astrometric Sigma (Y)")
-            ax_sig_f = fig.add_subplot(gs[4, 2]); ax_sig_f.scatter(matched_flux, matched_sigmas[:, 2], alpha=0.2, s=1, color='C2'); ax_sig_f.set_xscale('log'); ax_sig_f.set_yscale('log'); ax_sig_f.set_title("Photometric Sigma")
+            ax_sig_x = fig.add_subplot(gs[4, 2]); ax_sig_x.scatter(matched_flux, matched_sigmas[:, 0], alpha=0.2, s=1, color='C0'); ax_sig_x.set_xscale('log'); ax_sig_x.set_yscale('log'); ax_sig_x.set_title("Astrometric Sigma (X)")
+            ax_sig_y = fig.add_subplot(gs[4, 3]); ax_sig_y.scatter(matched_flux, matched_sigmas[:, 1], alpha=0.2, s=1, color='C1'); ax_sig_y.set_xscale('log'); ax_sig_y.set_yscale('log'); ax_sig_y.set_title("Astrometric Sigma (Y)")
+            ax_sig_f = fig.add_subplot(gs[5, 2]); ax_sig_f.scatter(matched_flux, matched_sigmas[:, 2], alpha=0.2, s=1, color='C2'); ax_sig_f.set_xscale('log'); ax_sig_f.set_yscale('log'); ax_sig_f.set_title("Photometric Sigma")
 
         # Recovery vs True-p
-        ax_rec_p = fig.add_subplot(gs[2, 2]); true_labels = np.array([s[0] for s in global_true]); valid_mask = true_labels > 0.05
+        ax_rec_p = fig.add_subplot(gs[3, 2]); true_labels = np.array([s[0] for s in global_true]); valid_mask = true_labels > 0.05
         if np.any(valid_mask):
             v_labels, is_recovered = true_labels[valid_mask], np.array([1 if i in g_matched_true_indices else 0 for i in range(len(global_true)) if valid_mask[i]])
             p_bins = np.linspace(0, 1.0, 11); rec_stats = []
             for i in range(len(p_bins)-1):
                 m = (v_labels >= p_bins[i]) & (v_labels <= p_bins[i+1]) if i == len(p_bins)-2 else (v_labels >= p_bins[i]) & (v_labels < p_bins[i+1])
                 rec_stats.append(100.0 * np.mean(is_recovered[m]) if np.any(m) else np.nan)
-            # Use where='post' with the full bin edges and explicit xlim to ensure the last bin is drawn
             ax_rec_p.step(p_bins, np.append(rec_stats, rec_stats[-1]), where='post', color='green', linewidth=3)
             ax_rec_p.set_title("Recovery vs True-p"); ax_rec_p.set_ylim(-5, 105); ax_rec_p.set_xlim(0, 1.0)
 
@@ -296,7 +356,7 @@ class InferenceEngine:
         ax_hist.hist(g_pred_mags, bins=50, alpha=0.4, color='blue', label=f'Pred (p>={threshold})')
         ax_hist.set_title("LF Recovery"); ax_hist.invert_xaxis(); ax_hist.legend()
         
-        # 🚀 IMPROVED: Completeness vs Magnitude
+        # Completeness vs Magnitude
         ax_comp = fig.add_subplot(gs[4, 1])
         mag_bins = np.linspace(18, 28, 21)
         hist_true, _ = np.histogram(g_true_mags, bins=mag_bins)
@@ -308,7 +368,6 @@ class InferenceEngine:
         # Photometry scatter
         if g_matches:
             ax8 = fig.add_subplot(gs[3, 0]); ax8.scatter(g_matched_true_mags, g_matched_pred_mags, alpha=0.3, s=2)
-            # Add y=x line
             all_mags = np.concatenate([g_matched_true_mags, g_matched_pred_mags])
             if len(all_mags) > 0:
                 m_min, m_max = np.min(all_mags), np.max(all_mags)

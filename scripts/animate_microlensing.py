@@ -178,10 +178,10 @@ def main():
     
     fig.text(0.5, 0.05, param_text, ha='center', fontsize=10, bbox=dict(facecolor='white', alpha=0.5))
 
-    # Plot lightcurve components
-    ax2.plot(times, total_ap_fluxes, 'k.', markersize=3, alpha=0.3, label='Total in Circle')
-    ax2.plot(times, bkg_ap_fluxes, 'r.', markersize=3, alpha=0.3, label='Est. Background')
-    ax2.plot(times, raw_net_fluxes, 'g.', markersize=3, alpha=0.3, label='Raw Net (Inside Circle)')
+    # Plot lightcurve components (initialize as empty for animation)
+    lc_total, = ax2.plot([], [], 'k.', markersize=3, alpha=0.3, label='Total in Circle')
+    lc_bkg, = ax2.plot([], [], 'r.', markersize=3, alpha=0.3, label='Est. Background')
+    lc_raw_net, = ax2.plot([], [], 'g.', markersize=3, alpha=0.3, label='Raw Net (Inside Circle)')
     lc_net, = ax2.plot([], [], 'b.', markersize=4, label='Corrected Net Flux')
     lc_point, = ax2.plot([], [], 'ro', markersize=6)
     
@@ -211,14 +211,19 @@ def main():
         dx, dy = px - x_min , py - y_min 
         ap_patch.set_center((dx, dy)); an_in_patch.set_center((dx, dy)); an_out_patch.set_center((dx, dy))
         
+        # Update all lightcurve components
+        lc_total.set_data(times[:frame+1], total_ap_fluxes[:frame+1])
+        lc_bkg.set_data(times[:frame+1], bkg_ap_fluxes[:frame+1])
+        lc_raw_net.set_data(times[:frame+1], raw_net_fluxes[:frame+1])
         lc_net.set_data(times[:frame+1], net_fluxes[:frame+1])
+        
         lc_point.set_data([times[frame]], [net_fluxes[frame]])
         if ml_params.get('t0', 'N/A') != 'N/A':
             a_actual = paczynski_magnification(times[:frame+1], ml_params['t0'], ml_params['tE'], ml_params['u0'])
             mag_points.set_data(times[:frame+1], a_actual)
         
         ax1.set_xlabel(f"Frame {frame} | Time {times[frame]:.2f}d")
-        return im_plot, ap_patch, an_in_patch, an_out_patch, lc_net, lc_point, mag_points
+        return im_plot, ap_patch, an_in_patch, an_out_patch, lc_total, lc_bkg, lc_raw_net, lc_net, lc_point, mag_points
 
     print(f"📽️ Encoding animation to {args.out}...")
     ani = FuncAnimation(fig, update, frames=len(asdf_files), blit=True)

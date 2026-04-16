@@ -26,95 +26,107 @@ def find_latest_checkpoint(checkpoint_dir="checkpoints", prefix="stage0"):
 def render_confidence_prior(targets, img_size, cell_size, K, sigma=1.0):
     """
     Renders a confidence prior map from target grid on-the-fly.
+    Fully vectorized to avoid CPU-to-GPU kernel launch bottlenecks.
     targets shape: [Batch, GridH, GridW, K*7 + 1]
     """
     B, GH, GW, _ = targets.shape
     device = targets.device
     
-    # 1. Extract star slots: [B, GH, GW, K, 7]
-    # Minor Optimization: num_params = (targets.shape[-1] - 1) // K
+    # 1. Extract targets
     num_params = (targets.shape[-1] - 1) // K
     star_targets = targets[..., :-1].view(B, GH, GW, K, num_params)
-    p_targets = star_targets[..., 0] # [B, GH, GW, K]
+    p_targets = star_targets[..., 0]
     dx_targets = star_targets[..., 1]
     dy_targets = star_targets[..., 2]
     
-    # 2. Create Global Coordinate Grid
+    # Flatten across spatial and K dimensions: [B, GH*GW*K]
+    p_flat = p_targets.reshape(B, -1)
+    dx_flat = dx_targets.reshape(B, -1)
+    dy_flat = dy_targets.reshape(B, -1)
+    
+    # 2. Create Global Coordinate Grid (Fast Generation)
+    grid_y, grid_x = torch.meshgrid(
+        torch.arange(GH, device=device), 
+        torch.arange(GW, device=device), 
+        indexing='ij'
+    )
+    # Expand to match K capacities and flatten
+    grid_y = grid_y.unsqueeze(-1).expand(-1, -1, K).reshape(-1)
+    grid_x = grid_x.unsqueeze(-1).expand(-1, -1, K).reshape(-1)
+    
+    # Absolute center coordinates
+    center_x = grid_x.unsqueeze(0) * cell_size + dx_flat
+    center_y = grid_y.unsqueeze(0) * cell_size + dy_flat
+    
+    # Filter active stars to avoid computing blank cells
+    mask = p_flat > 0.1
+    batch_idx, star_idx = torch.where(mask)
+    
+    active_cx = center_x[batch_idx, star_idx]
+    active_cy = center_y[batch_idx, star_idx]
+    active_p  = p_flat[batch_idx, star_idx]
+    
+    # --- INJECT POISON (False Positives) ---
+    # Vectorized random generation for the whole batch
+    num_poison = 5
+    poison_batch_idx = torch.arange(B, device=device).view(-1, 1).expand(-1, num_poison).reshape(-1)
+    poison_cx = torch.rand((B * num_poison,), device=device) * img_size
+    poison_cy = torch.rand((B * num_poison,), device=device) * img_size
+    poison_p = torch.empty((B * num_poison,), device=device).uniform_(0.5, 0.95)
+    
+    # Combine true targets and poison
+    all_batch_idx = torch.cat([batch_idx, poison_batch_idx])
+    all_cx = torch.cat([active_cx, poison_cx])
+    all_cy = torch.cat([active_cy, poison_cy])
+    all_p = torch.cat([active_p, poison_p])
+    
+    # Initialize the batch prior map
     prior_map = torch.zeros((B, 1, img_size, img_size), device=device)
     
-    # To keep it fast, we only render the strongest star in each cell if multiple exist,
-    # or we can iterate K. Given K is small (3), we can iterate.
-    
-    y_coords = torch.arange(img_size, device=device).view(1, img_size, 1)
-    x_coords = torch.arange(img_size, device=device).view(1, 1, img_size)
-    
-    # Optimization: Use a smaller window around each cell or just vectorized gaussian
-    # For now, let's use a simpler approach: paint into the grid.
-    
-    for k in range(K):
-        mask = p_targets[..., k] > 0.1
-        if not mask.any(): continue
+    if len(all_cx) > 0:
+        # 3. Parallelized Bounding Box Construction
+        r = int(5 * sigma)
+        patch_size = 2 * r + 1
         
-        # Get indices where mask is true
-        batch_idx, grid_y, grid_x = torch.where(mask)
-        p_vals = p_targets[batch_idx, grid_y, grid_x, k]
-        dx = dx_targets[batch_idx, grid_y, grid_x, k]
-        dy = dy_targets[batch_idx, grid_y, grid_x, k]
+        local_coords = torch.arange(-r, r + 1, device=device)
+        local_y, local_x = torch.meshgrid(local_coords, local_coords, indexing='ij')
         
-        # Global positions
-        center_x = grid_x * cell_size + dx
-        center_y = grid_y * cell_size + dy
+        # Snap center to integer to anchor the patch window (prevents grid snapping errors)
+        cx_int = all_cx.round().long()
+        cy_int = all_cy.round().long()
         
-        # For a truly fast on-the-fly render in PyTorch, we use a vectorized approach
-        # but limited to a small bounding box to avoid OOM/Slowdown.
-        # However, for a 256x256 image, we can just do it simply if n_stars is not too high.
+        # Grid coordinates for all patches [N, patch_size, patch_size]
+        patch_y = cy_int.view(-1, 1, 1) + local_y.view(1, patch_size, patch_size)
+        patch_x = cx_int.view(-1, 1, 1) + local_x.view(1, patch_size, patch_size)
         
-        # Simple rendering for now: 
-        # (This is a placeholder for a more optimized C++/CUDA kernel if needed)
-        for i in range(len(batch_idx)):
-            bi = batch_idx[i]
-            cx, cy = center_x[i], center_y[i]
-            pv = p_vals[i]
-            
-            # 5-sigma bounding box
-            r = int(5 * sigma)
-            x0, x1 = max(0, int(cx - r)), min(img_size, int(cx + r + 1))
-            y0, y1 = max(0, int(cy - r)), min(img_size, int(cy + r + 1))
-            
-            window_x = torch.arange(x0, x1, device=device)
-            window_y = torch.arange(y0, y1, device=device).view(-1, 1)
-            
-            dist_sq = (window_x - cx)**2 + (window_y - cy)**2
-            patch = pv * torch.exp(-dist_sq / (2 * sigma**2))
-            
-            # Use max to avoid "over-exposure" if Gaussians overlap in the prior
-            prior_map[bi, 0, y0:y1, x0:x1] = torch.max(prior_map[bi, 0, y0:y1, x0:x1], patch)
-            
-    # --- INJECT POISON (False Positives) ---
-    # Teach the network to ignore the prior if the raw image is empty
-    num_poison = 5  # Add 5 fake stars per batch image
-    
-    for bi in range(B):
-        # Random coordinates
-        px = torch.randint(0, img_size, (num_poison,), device=device).float()
-        py = torch.randint(0, img_size, (num_poison,), device=device).float()
+        # 4. Exact Sub-Pixel Distance Computation 
+        # Calculate true distance from the floating-point center to maintain precision
+        dist_sq = (patch_x.float() - all_cx.view(-1, 1, 1))**2 + \
+                  (patch_y.float() - all_cy.view(-1, 1, 1))**2
+                  
+        patches = all_p.view(-1, 1, 1) * torch.exp(-dist_sq / (2 * sigma**2))
         
-        # High synthetic confidence to really test the network's skepticism
-        pp = torch.empty(num_poison, device=device).uniform_(0.5, 0.95)
+        # Mask out-of-bounds pixels naturally
+        valid_mask = (patch_x >= 0) & (patch_x < img_size) & (patch_y >= 0) & (patch_y < img_size)
         
-        for i in range(num_poison):
-            cx, cy, pv = px[i], py[i], pp[i]
-            r = int(5 * sigma)
-            x0, x1 = max(0, int(cx - r)), min(img_size, int(cx + r + 1))
-            y0, y1 = max(0, int(cy - r)), min(img_size, int(cy + r + 1))
-            
-            window_x = torch.arange(x0, x1, device=device)
-            window_y = torch.arange(y0, y1, device=device).view(-1, 1)
-            dist_sq = (window_x - cx)**2 + (window_y - cy)**2
-            
-            fake_patch = pv * torch.exp(-dist_sq / (2 * sigma**2))
-            prior_map[bi, 0, y0:y1, x0:x1] = torch.max(prior_map[bi, 0, y0:y1, x0:x1], fake_patch)
-            
+        # Extract only the valid pixels mapping to the image
+        valid_b = all_batch_idx.view(-1, 1, 1).expand(-1, patch_size, patch_size)[valid_mask]
+        valid_y = patch_y[valid_mask]
+        valid_x = patch_x[valid_mask]
+        valid_patches = patches[valid_mask]
+        
+        # 5. Fast Scatter Reduction
+        # Flattened 1D target indices for the entire batch mapping
+        flat_indices = valid_b * (img_size * img_size) + valid_y * img_size + valid_x
+        prior_flat = prior_map.view(-1)
+        
+        # Scatter the patches in parallel. `amax` takes the max value where patches overlap.
+        # Note: scatter_reduce_ is natively supported in PyTorch >= 1.12
+        prior_flat.scatter_reduce_(0, flat_indices, valid_patches, reduce="amax", include_self=True)
+        
+        # Reshape back to BxCxHxW
+        prior_map = prior_flat.view(B, 1, img_size, img_size)
+        
     return prior_map
 
 class Trainer:
@@ -153,13 +165,13 @@ class Trainer:
             vram_gb = torch.cuda.get_device_properties(self.device).total_memory / (1024**3)
             # Conservative estimate: ~1.5GB per batch of 256x256 ResNet34
             if vram_gb < 12: # e.g. K80, 1080Ti
-                self.micro_batch_size = 4
-            elif vram_gb < 20: # e.g. T4, RTX 3080
                 self.micro_batch_size = 8
-            elif vram_gb < 30: # e.g. V100 16GB, A10
+            elif vram_gb < 16: # e.g. T4, RTX 3080
                 self.micro_batch_size = 16
-            else: # e.g. V100 32GB, A100
+            elif vram_gb < 24: # e.g. V100 16GB, RTX 3090/4090
                 self.micro_batch_size = 32
+            else: # e.g. V100 32GB, A100
+                self.micro_batch_size = 64
             
             # Ensure we don't exceed the configured batch size if it's smaller
             self.micro_batch_size = min(self.micro_batch_size, self.target_batch_size)

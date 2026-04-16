@@ -45,17 +45,6 @@ def generate_field_realistic_psf_library(num_psfs=100, grid_size=127, oversample
         library[i] = psf / (psf.sum() + 1e-9)
     return library
 
-def _compute_eigen_psfs(large_library, n_components=10):
-    """Performs PCA on the library to extract basis components."""
-    N, H, W = large_library.shape
-    data = torch.from_numpy(large_library).float().view(N, H * W)
-    mean_psf = data.mean(dim=0)
-    centered_data = data - mean_psf
-    U, S, V = torch.pca_lowrank(centered_data, q=n_components)
-    eigen_psfs = V.t().view(n_components, H, W).numpy()
-    psf_weights = (U * S).numpy() 
-    return eigen_psfs, psf_weights, mean_psf.view(H, W).numpy()
-
 def fast_paint_grid(lx, ly, fluxes, snrs, sort_idx, min_snr, grid_size, cell_size, K):
     """Highly optimized target grid painter."""
     grid_stars = np.zeros((grid_size, grid_size, K, 4), dtype=np.float32)

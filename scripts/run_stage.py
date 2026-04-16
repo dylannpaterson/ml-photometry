@@ -90,23 +90,21 @@ def get_safe_batch_size(target_batch_size, device):
     """Detects VRAM and scales batch size to avoid OOM, return (micro_batch, accumulation_steps)."""
     if device.type != 'cuda':
         return target_batch_size, 1
-        
+
     vram_gb = torch.cuda.get_device_properties(device).total_memory / (1024**3)
-    # ResNet-34 + FPN on 256x256 is roughly 1.5GB per sample in training
-    if vram_gb < 12: # 1080Ti, K80
-        micro_batch = 4
-    elif vram_gb < 20: # T4, RTX 3080
-        micro_batch = 8
-    elif vram_gb < 30: # V100 16GB
+    # ResNet-34 + FPN on 256x256 is lightweight (~100MB per sample)
+    if vram_gb < 8:
         micro_batch = 16
-    else: # V100 32GB, A100
-        micro_batch = target_batch_size
-        
+    elif vram_gb < 12:
+        micro_batch = 32
+    elif vram_gb < 16:
+        micro_batch = 64
+    else:
+        micro_batch = 128
+
     micro_batch = min(micro_batch, target_batch_size)
-    # Ensure micro_batch is a power of 2 or at least consistent
     acc_steps = max(1, target_batch_size // micro_batch)
     return micro_batch, acc_steps
-
 def run_train(stage_idx, config, device):
     print(f"--- 🚀 Curriculum Stage {stage_idx}: Training ---")
     stage_key = f"stage{stage_idx}"
@@ -303,12 +301,12 @@ def run_eval(stage_idx, config, device, checkpoint=None):
 
 def run_infer(stage_idx, config, device, checkpoint=None):
     from castor.engine.evaluator import match_stars
-    from castor.engine.inference import InferenceEngine
+    from castor.engine.inference import InferenceEngine, generate_custom_inference_prior
     import random
     import h5py
     print(f"--- 🛰️ Curriculum Stage {stage_idx}: Inference ---")
     model, psf_lib_ckpt = load_stage_model(stage_idx, device, config, checkpoint)
-    if not model: return
+    if model is None: return
 
     engine = InferenceEngine(model, device, config)
     
@@ -326,14 +324,21 @@ def run_infer(stage_idx, config, device, checkpoint=None):
         
         # NEW: Respect CLI --num_chunks argument if provided
         num_chunks_to_infer = config.get("num_chunks_override", min(20, len(dataset)))
-        print(f"🔭 Running Global Inference over {num_chunks_to_infer} chunks...")
+        print(f"🔭 Running Global Inference over {num_chunks_to_infer} chunks (Standard + Oracle)...")
         
+        # Four sets of aggregations
         global_true = []
-        global_pred = []
-        hero_data = None
+        global_pred_flat = []
+        global_pred_oracle = []
+        global_pred_oracle_p43 = []
+        global_pred_oracle_p100 = []
+        
+        hero_data_flat = None
+        hero_data_oracle = None
+        hero_data_oracle_p43 = None
+        hero_data_oracle_p100 = None
         
         # Robust PSF Extraction logic (shared for all chunks)
-        # We'll use the one from the first sample or checkpoint
         master_mean_psf = None
         master_psf_basis = None
 
@@ -383,11 +388,8 @@ def run_infer(stage_idx, config, device, checkpoint=None):
             noisy_median = img_noisy.median().item()
             img_stretched = torch.arcsinh((img_noisy - noisy_median) / stretch_scale)
 
-            # Predict
-            pred_stars, _, bg_map = engine.predict(img_noisy, threshold=0.0, psf_basis=master_psf_basis, mean_psf=master_mean_psf)
-            
-            # Extract Truth
-            true_stars = []
+            # Extract Truth for this chunk
+            true_stars_chunk = []
             cell_size, grid_size, K = dataset.cell_size, dataset.grid_size, dataset.K
             target_grid = target[:, :, :-1].view(grid_size, grid_size, K, -1).numpy()
             gt_bg_map = target[:, :, -1:].numpy()
@@ -397,15 +399,38 @@ def run_infer(stage_idx, config, device, checkpoint=None):
                     for k in range(K):
                         slot = target_grid[y, x, k]
                         if slot[0] > 0.0:
-                            true_stars.append((slot[0], (x * cell_size) + slot[1], (y * cell_size) + slot[2], float(slot[3])))
+                            true_stars_chunk.append((slot[0], (x * cell_size) + slot[1], (y * cell_size) + slot[2], float(slot[3])))
+
+            # 1. Standard Prediction (Flat Prior)
+            pred_stars_flat, _, bg_map_flat = engine.predict(img_noisy, threshold=0.0, psf_basis=master_psf_basis, mean_psf=master_mean_psf)
+            
+            # 2. Oracle Prediction (Perfect Prior - All Stars)
+            perfect_catalog = [(s[1], s[2], s[0]) for s in true_stars_chunk]
+            oracle_prior_map = generate_custom_inference_prior(perfect_catalog, img_size=image_tensor.shape[-1], sigma=1.5, device=device)
+            pred_stars_oracle, _, bg_map_oracle = engine.predict(img_noisy, threshold=0.0, psf_basis=master_psf_basis, mean_psf=master_mean_psf, prior_map=oracle_prior_map)
+
+            # 3. Oracle Prediction (p >= 0.43)
+            perfect_catalog_p43 = [(s[1], s[2], s[0]) for s in true_stars_chunk if s[0] >= 0.43]
+            oracle_prior_map_p43 = generate_custom_inference_prior(perfect_catalog_p43, img_size=image_tensor.shape[-1], sigma=1.5, device=device)
+            pred_stars_oracle_p43, _, bg_map_oracle_p43 = engine.predict(img_noisy, threshold=0.0, psf_basis=master_psf_basis, mean_psf=master_mean_psf, prior_map=oracle_prior_map_p43)
+
+            # 4. Oracle Prediction (p >= 1.0)
+            perfect_catalog_p100 = [(s[1], s[2], s[0]) for s in true_stars_chunk if s[0] >= 1.0]
+            oracle_prior_map_p100 = generate_custom_inference_prior(perfect_catalog_p100, img_size=image_tensor.shape[-1], sigma=1.5, device=device)
+            pred_stars_oracle_p100, _, bg_map_oracle_p100 = engine.predict(img_noisy, threshold=0.0, psf_basis=master_psf_basis, mean_psf=master_mean_psf, prior_map=oracle_prior_map_p100)
 
             # Aggregate with Global Offset to prevent overlap during global matching
             offset = idx * 10000.0
-            for s in true_stars:
+            for s in true_stars_chunk:
                 global_true.append((s[0], s[1] + offset, s[2] + offset, s[3]))
-            for s in pred_stars:
-                # pred_stars elements are (x, y, flux, p, sigmas)
-                global_pred.append((s[0] + offset, s[1] + offset, s[2], s[3], s[4]))
+            for s in pred_stars_flat:
+                global_pred_flat.append((s[0] + offset, s[1] + offset, s[2], s[3], s[4]))
+            for s in pred_stars_oracle:
+                global_pred_oracle.append((s[0] + offset, s[1] + offset, s[2], s[3], s[4]))
+            for s in pred_stars_oracle_p43:
+                global_pred_oracle_p43.append((s[0] + offset, s[1] + offset, s[2], s[3], s[4]))
+            for s in pred_stars_oracle_p100:
+                global_pred_oracle_p100.append((s[0] + offset, s[1] + offset, s[2], s[3], s[4]))
 
             # Capture Hero Data (first chunk)
             if idx == 0:
@@ -416,26 +441,37 @@ def run_infer(stage_idx, config, device, checkpoint=None):
                         jitter_params = (meta[3], meta[4], meta[5])
                 except: pass
                 
-                hero_data = {
+                hero_data_flat = {
                     "image_stretched": img_stretched,
-                    "true_stars": true_stars,
-                    "pred_stars": pred_stars,
-                    "bg_map": bg_map,
+                    "true_stars": true_stars_chunk,
+                    "pred_stars": pred_stars_flat,
+                    "bg_map": bg_map_flat,
                     "gt_bg_map": gt_bg_map,
                     "chunk_median": noisy_median,
                     "jitter_params": jitter_params
                 }
-                print(f"📸 Captured Hero Sample with {len(true_stars)} stars.")
+                hero_data_oracle = hero_data_flat.copy()
+                hero_data_oracle["pred_stars"] = pred_stars_oracle
+                hero_data_oracle["bg_map"] = bg_map_oracle
+                hero_data_oracle["prior_map"] = oracle_prior_map
 
-        # Final Global Visualization
-        engine.visualize(
-            hero_data,
-            global_true,
-            global_pred,
-            threshold=0.43,
-            mean_psf=master_mean_psf,
-            num_chunks=num_chunks_to_infer
-        )
+                hero_data_oracle_p43 = hero_data_flat.copy()
+                hero_data_oracle_p43["pred_stars"] = pred_stars_oracle_p43
+                hero_data_oracle_p43["bg_map"] = bg_map_oracle_p43
+                hero_data_oracle_p43["prior_map"] = oracle_prior_map_p43
+
+                hero_data_oracle_p100 = hero_data_flat.copy()
+                hero_data_oracle_p100["pred_stars"] = pred_stars_oracle_p100
+                hero_data_oracle_p100["bg_map"] = bg_map_oracle_p100
+                hero_data_oracle_p100["prior_map"] = oracle_prior_map_p100
+
+                print(f"📸 Captured Hero Sample with {len(true_stars_chunk)} stars.")
+
+        # Final Global Visualizations
+        engine.visualize(hero_data_flat, global_true, global_pred_flat, threshold=0.43, output_path="inference_comparison_flat.png", mean_psf=master_mean_psf, num_chunks=num_chunks_to_infer)
+        engine.visualize(hero_data_oracle, global_true, global_pred_oracle, threshold=0.43, output_path="inference_comparison_oracle.png", mean_psf=master_mean_psf, num_chunks=num_chunks_to_infer)
+        engine.visualize(hero_data_oracle_p43, global_true, global_pred_oracle_p43, threshold=0.43, output_path="inference_comparison_oracle_p43.png", mean_psf=master_mean_psf, num_chunks=num_chunks_to_infer)
+        engine.visualize(hero_data_oracle_p100, global_true, global_pred_oracle_p100, threshold=0.43, output_path="inference_comparison_oracle_p100.png", mean_psf=master_mean_psf, num_chunks=num_chunks_to_infer)
     else:
         print(f"⚠️ Specialized inference for stage {stage_idx} not yet implemented.")
 
