@@ -6,44 +6,77 @@ import h5py
 from scipy.signal import fftconvolve
 from scipy.ndimage import map_coordinates
 from castor.data.transforms import AstroSpaceTransform
-from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, GLOBAL_STRETCH_SCALE, SHAPE_SIZE, N_PCA_COMPONENTS
+from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, GLOBAL_STRETCH_SCALE, SHAPE_SIZE
 
-def generate_field_realistic_psf_library(num_psfs=100, grid_size=127, oversample=4):
-    """Generates a master optical library with oversampling."""
-    print(f"📡 Generating Master OPTICAL PSF Library ({num_psfs} PSFs, {oversample}x oversampled)...")
-    S = grid_size * oversample
-    library = np.zeros((num_psfs, S, S), dtype=np.float32)
-    center = (S - 1) / 2.0
-    optical_template = None
-    if os.path.exists("roman_psf_prior_4x.pt"):
-        try:
-            optical_template = torch.load("roman_psf_prior_4x.pt", map_location='cpu', weights_only=False).numpy()
-            if optical_template.shape[0] != S:
-                from scipy.ndimage import zoom
-                scale = S / optical_template.shape[0]
-                optical_template = zoom(optical_template, scale, order=3)
-        except Exception as e: print(f"⚠️ Oversampled PSF Load Failed: {e}")
+# Ensure STPSF_PATH is set for stpsf tool
+if 'STPSF_PATH' not in os.environ:
+    # Default location where stpsf downloads data if not found
+    default_path = os.path.expanduser('~/data/stpsf-data')
+    if os.path.exists(default_path):
+        os.environ['STPSF_PATH'] = default_path
 
-    y, x = np.meshgrid(np.arange(S) - center, np.arange(S) - center, indexing='ij')
-    for i in range(num_psfs):
-        fx, fy = np.random.uniform(-2048, 2048), np.random.uniform(-2048, 2048)
-        r_norm = np.sqrt(fx**2 + fy**2) / 2896.0
-        q_opt = np.random.uniform(0.9, 1.0) - (0.1 * r_norm)
-        theta = np.arctan2(fy, fx) + np.random.normal(0, 0.1)
-        cos, sin = np.cos(theta), np.sin(theta)
-        xp, yp = x * cos + y * sin, -x * sin + y * cos
-        s_opt = 0.45 * oversample 
-        opt_core = np.exp(-(xp**2 / (2 * s_opt**2) + yp**2 / (2 * (s_opt * q_opt)**2)))
-        opt_core /= (opt_core.sum() + 1e-9)
-        if optical_template is not None:
-            from scipy.ndimage import rotate
-            rotated = rotate(optical_template, np.random.uniform(0, 360), reshape=False, order=3, mode='constant', cval=0.0)
-            psf = fftconvolve(rotated, opt_core, mode='same')
+def generate_stpsf_roman_psf(grid_size=129, oversample=4):
+    """
+    Generates a realistic Roman PSF on the fly using the stpsf (Space Telescope PSF) tool.
+    Randomizes the detector (SCA) and position for variety.
+    """
+    try:
+        import stpsf
+    except ImportError:
+        # Fallback to a simplified analytical model if stpsf is not available
+        return _generate_fallback_psf(grid_size, oversample)
+
+    inst = stpsf.WFI()
+    
+    # Randomize Filter (Common Roman NIR filters)
+    filters = ['F062', 'F087', 'F106', 'F129', 'F146', 'F158', 'F184', 'F213']
+    inst.filter = np.random.choice(filters)
+    
+    # Randomize Detector (WFI01 to WFI18)
+    inst.detector = np.random.choice(inst.detector_list)
+    
+    # Randomize Position on the 4096x4096detector
+    inst.detector_position = (np.random.uniform(4, 4092), np.random.uniform(4, 4092))
+    
+    # Calculate PSF
+    # fov_pixels=grid_size means the FOV will match grid_size detector pixels
+    psf_hdu = inst.calc_psf(fov_pixels=grid_size, oversample=oversample)
+    psf_data = psf_hdu[0].data.astype(np.float32)
+    
+    # Ensure exact expected shape (grid_size * oversample)
+    expected_s = grid_size * oversample
+    if psf_data.shape[0] != expected_s:
+        # Crop or pad to match
+        s = psf_data.shape[0]
+        if s > expected_s:
+            start = (s - expected_s) // 2
+            psf_data = psf_data[start:start+expected_s, start:start+expected_s]
         else:
-            psf = opt_core
-        psf = np.maximum(0, psf)
-        library[i] = psf / (psf.sum() + 1e-9)
-    return library
+            pad = (expected_s - s) // 2
+            psf_data = np.pad(psf_data, ((pad, expected_s-s-pad), (pad, expected_s-s-pad)))
+
+    return psf_data / (psf_data.sum() + 1e-9)
+
+def _generate_fallback_psf(grid_size, oversample):
+    """Simplified Roman-like PSF with core and diffraction spikes."""
+    S = grid_size * oversample
+    center = (S - 1) / 2.0
+    y, x = np.meshgrid(np.arange(S) - center, np.arange(S) - center, indexing='ij')
+    
+    sigma = np.random.uniform(1.6, 2.0)
+    q = np.random.uniform(0.9, 1.0)
+    theta = np.random.uniform(0, np.pi)
+    cos, sin = np.cos(theta), np.sin(theta)
+    xp, yp = x * cos + y * sin, -x * sin + y * cos
+    psf = np.exp(-(xp**2 / (2 * sigma**2) + yp**2 / (2 * (sigma * q)**2)))
+    
+    spike_angles = [theta + i * np.pi / 3 for i in range(3)]
+    for angle in spike_angles:
+        dist_to_line = np.abs(x * np.sin(angle) - y * np.cos(angle))
+        psf += np.exp(-dist_to_line / 0.8) * 0.05
+        
+    psf = np.maximum(0, psf)
+    return psf / (psf.sum() + 1e-9)
 
 def fast_paint_grid(lx, ly, fluxes, snrs, sort_idx, min_snr, grid_size, cell_size, K):
     """Highly optimized target grid painter."""
@@ -101,7 +134,7 @@ def sample_bulge_magnitudes(n_total, rc_mag, rc_sigma, rc_enhancement=3.0, m_min
 def calculate_safe_magnitude_cutoff(exp_time, zp, sky_mag, read_noise=5.0, sigma=1.5, snr_cutoff=1.0):
     pixel_scale = 0.11
     sky_level = (10 ** (-0.4 * (sky_mag - zp))) * (pixel_scale**2) * exp_time
-    n_pix = 12.0 # Matched filter area for Roman
+    n_pix = 12.0 
     bg_variance = n_pix * (sky_level + read_noise**2)
     a, b, c = 1.0, -(snr_cutoff**2), -(snr_cutoff**2) * bg_variance
     min_flux = (-b + np.sqrt(b**2 - 4*a*c)) / (2*a)
@@ -126,11 +159,10 @@ def generate_dust_cirrus(img_size, amplitude):
     dust_map /= (dust_map.max() + 1e-9)
     return dust_map * amplitude
 
-def generate_mosaic_data(mosaic_size, params, master_psf_library):
+def generate_mosaic_data(mosaic_size, params):
     """
-    Simplified Stage 0 Engine: Uses a single physical PSF from the library.
+    Simplified Stage 0 Engine: Uses a random Roman PSF generated on the fly.
     Employs bi-linear interpolation for sub-pixel placement.
-    Includes realistic Dust Extinction (Multiplicative) and Extended Sources.
     """
     area_ratio = (mosaic_size / params['image_size'])**2
     exp_time, zp, sky_mag = np.random.uniform(30.0, 90.0), 26.5, 22.0
@@ -140,24 +172,21 @@ def generate_mosaic_data(mosaic_size, params, master_psf_library):
     mags = sample_bulge_magnitudes(n_stars_total, np.random.uniform(14.5, 16.5), np.random.uniform(0.2, 0.5), np.random.uniform(5.0, 15.0), m_min=12.0, m_max=32.0, gamma=np.random.uniform(0.25, 0.35))
     fluxes = exp_time * (10 ** (-0.4 * (mags - zp)))
     
-    O = 4 # Oversampling
+    O = 4 
     
-    # 1. Select a single Physical PSF from the library
-    repr_idx = np.random.randint(0, len(master_psf_library))
-    repr_psf_4x = master_psf_library[repr_idx] 
+    # 1. Generate a random Roman PSF on the fly using Space Telescope tools (stpsf)
+    repr_psf_4x = generate_stpsf_roman_psf(SHAPE_SIZE, oversample=O)
     psf_1x = repr_psf_4x.reshape(SHAPE_SIZE, O, SHAPE_SIZE, O).mean(axis=(1, 3))
     psf_1x /= (np.sum(psf_1x) + 1e-9)
 
     # 2. Placement
     px, py = np.random.uniform(0.5, mosaic_size-1.5, len(fluxes)), np.random.uniform(0.5, mosaic_size-1.5, len(fluxes))
     
-    # 3. NEW: Multiplicative Dust Extinction Logic
+    # 3. Dust Extinction
     sky_level = (10 ** (-0.4 * (sky_mag - zp))) * (0.11**2) * exp_time
     if np.random.rand() < 0.7:
         print("🌫️ Adding realistic Interstellar Cirrus (Dust) to mosaic...")
         raw_dust = generate_dust_cirrus(mosaic_size, 1.0)
-
-        # Realistic Galactic Bulge Extinction: Up to 5.0 mags in Roman NIR filters
         max_extinction = np.random.uniform(0.2, 5.0)
         transmission_map = 10 ** (-0.4 * raw_dust * max_extinction)
         
@@ -165,14 +194,10 @@ def generate_mosaic_data(mosaic_size, params, master_psf_library):
         apparent_fluxes = fluxes * star_transmissions
         apparent_mags = mags - 2.5 * np.log10(star_transmissions + 1e-9)
         
-        # Split Sky Background: Only the background component is extincted
         frac_bg = 0.60
         sky_foreground = sky_level * (1.0 - frac_bg)
         sky_background_attenuated = (sky_level * frac_bg) * transmission_map
         total_sky_map = sky_foreground + sky_background_attenuated
-
-        # Additive Emission: Simulates scattering in dense dust (P(k)~k^-3)
-        # Scaled up for higher extinction regions
         additive_dust_emission = raw_dust * np.random.uniform(20, 100)
     else:
         transmission_map = np.ones((mosaic_size, mosaic_size), dtype=np.float32)
@@ -181,7 +206,6 @@ def generate_mosaic_data(mosaic_size, params, master_psf_library):
         total_sky_map = np.full((mosaic_size, mosaic_size), sky_level, dtype=np.float32)
         additive_dust_emission = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
     
-    # 4. Filter resolved stars using apparent magnitude
     v_mask = apparent_mags < mag_limit
     
     fg_grid = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
@@ -205,32 +229,13 @@ def generate_mosaic_data(mosaic_size, params, master_psf_library):
     paint_flux(bg_grid, x0[~v_mask], y0[~v_mask] + 1, w01[~v_mask], apparent_fluxes[~v_mask])
     paint_flux(bg_grid, x0[~v_mask] + 1, y0[~v_mask] + 1, w11[~v_mask], apparent_fluxes[~v_mask])
 
-    # 5. Physics: Convolutions
     fg_image = fftconvolve(fg_grid, psf_1x, mode='same')
     bg_image = fftconvolve(bg_grid, psf_1x, mode='same')
 
-    # 6. Add Extended Sources (Extincted)
-    num_extended = np.random.randint(0, 4)
-    ext_image = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
-    if num_extended > 0:
-        y_idx, x_idx = np.meshgrid(np.arange(mosaic_size), np.arange(mosaic_size), indexing='ij')
-        for _ in range(num_extended):
-            ex, ey = np.random.uniform(0, mosaic_size), np.random.uniform(0, mosaic_size)
-            eflux = np.random.uniform(5000, 30000)
-            esigma = np.random.uniform(3.0, 10.0)
-            eq = np.random.uniform(0.3, 0.8)
-            etheta = np.random.uniform(0, np.pi)
-            cos_t, sin_t = np.cos(etheta), np.sin(etheta)
-            xp = (x_idx - ex) * cos_t + (y_idx - ey) * sin_t
-            yp = -(x_idx - ex) * sin_t + (y_idx - ey) * cos_t
-            ext_blob = np.exp(-(xp**2 / (2 * esigma**2) + yp**2 / (2 * (esigma * eq)**2)))
-            ext_image += (eflux / (ext_blob.sum() + 1e-9)) * ext_blob
-        ext_image *= transmission_map
-
-    # 7. Final Image Composition
-    full_image = np.maximum(0, fg_image + bg_image + ext_image + total_sky_map + additive_dust_emission)
+    # 6. Final Image Composition
+    full_image = np.maximum(0, fg_image + bg_image + total_sky_map + additive_dust_emission)
     
-    # 8. Rigorous SNR using local sky values
+    # 7. SNR and Truth
     half = SHAPE_SIZE // 2
     N_eff = 1.0 / (np.sum(psf_1x**2) + 1e-9)
     star_peak_val = psf_1x[half, half]
@@ -250,14 +255,10 @@ def generate_mosaic_data(mosaic_size, params, master_psf_library):
     structured_cat['mag'] = apparent_mags[v_mask][sort_y]
     structured_cat['snr'] = snrs[sort_y]
     
-    psf_lib_save = np.zeros((N_PCA_COMPONENTS + 1, SHAPE_SIZE * SHAPE_SIZE), dtype=np.float32)
-    psf_lib_save[-1] = psf_1x.flatten()
     meta = np.array([exp_time, zp, sky_mag, 0.0, 0.0, 0.0])
+    truth_bg_map = bg_image + total_sky_map + additive_dust_emission
 
-    # For the background truth, we want everything EXCEPT the resolved stars
-    truth_bg_map = bg_image + ext_image + total_sky_map + additive_dust_emission
-
-    return full_image, truth_bg_map, structured_cat, meta, psf_lib_save
+    return full_image, truth_bg_map, structured_cat, meta, psf_1x
 
 class HDF5MosaicDataset(Dataset):
     def __init__(self, h5_path, image_size=256):
@@ -268,7 +269,6 @@ class HDF5MosaicDataset(Dataset):
         
         with h5py.File(self.h5_path, 'r') as f:
             self.length = len(f['images'])
-            self.psf_library = torch.from_numpy(f['psf_libraries'][0]).float() if 'psf_libraries' in f else None
 
     def __len__(self): return self.length
 
@@ -278,4 +278,5 @@ class HDF5MosaicDataset(Dataset):
         target = torch.from_numpy(self.file['targets'][idx]).float()
         median = float(self.file['chunk_medians'][idx])
         meta = self.file['metas'][idx] if 'metas' in self.file else np.zeros(6, dtype=np.float32)
-        return {"image": img, "target": target, "psf_library": self.psf_library, "chunk_median": median, "meta": meta}
+        # Return a single mean PSF or None if we don't need it per-sample here
+        return {"image": img, "target": target, "chunk_median": median, "meta": meta}
