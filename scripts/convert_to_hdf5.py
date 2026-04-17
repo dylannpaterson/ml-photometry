@@ -7,7 +7,7 @@ import gc
 import shutil
 from castor.data.stage0_gaussian import fast_paint_grid
 from castor.data.transforms import AstroSpaceTransform
-from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE, N_PCA_COMPONENTS
+from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE
 
 def discover_mosaics(mosaic_dir):
     """Discovers and metadata-loads mosaics in a directory."""
@@ -20,7 +20,6 @@ def discover_mosaics(mosaic_dir):
         if f.endswith("_img.npy"):
             base = f.replace("_img.npy", "")
             meta_path = os.path.join(mosaic_dir, f"{base}_meta.npy")
-            lib_path = os.path.join(mosaic_dir, f"{base}_psf_lib.npy")
             cat_path = os.path.join(mosaic_dir, f"{base}_cat.npy")
             bg_path = os.path.join(mosaic_dir, f"{base}_bg.npy")
             
@@ -32,7 +31,6 @@ def discover_mosaics(mosaic_dir):
                 'img': os.path.join(mosaic_dir, f),
                 'bg': bg_path if os.path.exists(bg_path) else None,
                 'cat': cat_path,
-                'lib': lib_path if os.path.exists(lib_path) else None,
                 'exp_time': meta[0], 'zp': meta[1], 'sky_mag': meta[2]
             })
     return mosaics
@@ -41,10 +39,8 @@ def create_hdf5_datasets_combined(train_mosaic_dir, val_mosaic_dir, train_path, 
     cell_size = DEFAULT_CELL_SIZE
     grid_size = img_size // cell_size
     K = MAX_CAPACITY_PER_CELL
-    N_PCA = N_PCA_COMPONENTS
     transform = AstroSpaceTransform(stretch_scale=GLOBAL_STRETCH_SCALE)
     
-    # CHANGED: PCA weights are no longer part of the target grid.
     # Target per slot: [p, dx, dy, flux] = 4 channels
     target_shape = (grid_size, grid_size, K * 4 + 1)
     
@@ -62,43 +58,18 @@ def create_hdf5_datasets_combined(train_mosaic_dir, val_mosaic_dir, train_path, 
     print(f"Found {len(train_mosaics)} train and {len(val_mosaics)} val mosaics. Creating HDF5 databases...")
     os.makedirs(os.path.dirname(train_path), exist_ok=True)
 
-    # --- OPTIONAL: CALCULATE GLOBAL PCA STD FROM TRAIN SPLIT ---
-    print("🛰️ Checking for PCA weights in catalogs...")
-    first_cat = np.load(train_mosaics[0]['cat'])
-    has_weights = all(f'w{i}' in first_cat.dtype.names for i in range(N_PCA))
-    
-    if has_weights:
-        print("🛰️ Calculating Global PCA StdDev from training catalogs...")
-        all_weights = []
-        for mosaic in train_mosaics:
-            cat = np.load(mosaic['cat'])
-            weights = np.column_stack([cat[f'w{i}'] for i in range(N_PCA)])
-            all_weights.append(weights)
-        global_weights_std = np.std(np.concatenate(all_weights, axis=0), axis=0) + 1e-8
-        print(f"🛰️ Global PCA StdDev: {global_weights_std}")
-    else:
-        print("🛰️ No PCA weights found (Simplified Engine). Using dummy std.")
-        global_weights_std = np.ones(N_PCA, dtype=np.float32)
-    # -----------------------------------------------------
-
     with h5py.File(train_path, 'w') as h5_train, h5py.File(val_path, 'w') as h5_val:
-        # Save standard deviation as attribute
-        h5_train.attrs['global_weights_std'] = global_weights_std
-        h5_val.attrs['global_weights_std'] = global_weights_std
-
         # 1. Setup Train Datasets
         tr_imgs = h5_train.create_dataset("images", (train_samples, 1, img_size, img_size), dtype='float32', chunks=(1, 1, img_size, img_size), compression="lzf")
         tr_tgts = h5_train.create_dataset("targets", (train_samples, *target_shape), dtype='float32', chunks=(1, *target_shape), compression="lzf")
         tr_meds = h5_train.create_dataset("chunk_medians", (train_samples,), dtype='float32')
         tr_meta = h5_train.create_dataset("metas", (train_samples, 6), dtype='float32')
-        tr_psfs = None # Allocated dynamically
         
         # 2. Setup Val Datasets
         val_imgs = h5_val.create_dataset("images", (val_samples, 1, img_size, img_size), dtype='float32', chunks=(1, 1, img_size, img_size), compression="lzf")
         val_tgts = h5_val.create_dataset("targets", (val_samples, *target_shape), dtype='float32', chunks=(1, *target_shape), compression="lzf")
         val_meds = h5_val.create_dataset("chunk_medians", (val_samples,), dtype='float32')
         val_meta = h5_val.create_dataset("metas", (val_samples, 6), dtype='float32')
-        val_psfs = None
 
         # --- PROCESS EACH SPLIT INDEPENDENTLY ---
         for split_name, mosaics, split_samples, ds_imgs, ds_tgts, ds_meds, ds_meta, is_val in [
@@ -115,9 +86,6 @@ def create_hdf5_datasets_combined(train_mosaic_dir, val_mosaic_dir, train_path, 
                 
                 img_data = np.load(mosaic['img'])
                 bg_data = np.load(mosaic['bg']) if mosaic['bg'] else None
-                print(f"DEBUG: Mosaic {mosaic['img']} | bg_data is None: {bg_data is None}")
-                if bg_data is not None:
-                    print(f"DEBUG: bg_data shape: {bg_data.shape}, mean: {bg_data.mean():.4f}, std: {bg_data.std():.4f}")
                 cat_data = np.load(mosaic['cat'])
                 
                 # IMPORTANT: Ensure catalog is sorted by Y for searchsorted
@@ -126,32 +94,20 @@ def create_hdf5_datasets_combined(train_mosaic_dir, val_mosaic_dir, train_path, 
                 
                 meta_path = mosaic['img'].replace("_img.npy", "_meta.npy")
                 meta_data = np.load(meta_path) if os.path.exists(meta_path) else np.zeros(6, dtype=np.float32)
-                psf_lib = np.load(mosaic['lib']) if mosaic['lib'] else np.zeros((N_PCA + 1, SHAPE_SIZE * SHAPE_SIZE), dtype=np.float32)
-
-                # Dynamic PSF library allocation
-                if is_val and val_psfs is None:
-                    val_psfs = h5_val.create_dataset("psf_libraries", (val_samples, *psf_lib.shape), dtype='float32', chunks=(1, *psf_lib.shape), compression="lzf")
-                elif not is_val and tr_psfs is None:
-                    tr_psfs = h5_train.create_dataset("psf_libraries", (train_samples, *psf_lib.shape), dtype='float32', chunks=(1, *psf_lib.shape), compression="lzf")
 
                 pixel_scale = 0.11
                 sky_level = (10 ** (-0.4 * (mosaic['sky_mag'] - mosaic['zp']))) * (pixel_scale**2) * mosaic['exp_time']
                 my, mx = img_data.shape
                 snrs = cat_data['snr']
                 
-                ds_psfs_current = val_psfs if is_val else tr_psfs
-
                 for _ in range(this_mos_samples):
                     py = np.random.randint(0, my - img_size)
                     px = np.random.randint(0, mx - img_size)
                     
-                    # 1. Physics: The clean scene already contains the (attenuated) sky and dust.
-                    # We just extract the chunk and clip/tensorize.
                     star_signal = img_data[py:py+img_size, px:px+img_size]
                     chunk_median = np.median(star_signal)
                     signal_tensor = np.expand_dims(np.clip(star_signal, 0, None), axis=0).astype(np.float32)
                     
-                    # 2. Target Painting
                     y_start = np.searchsorted(cat_data['y'], py)
                     y_end = np.searchsorted(cat_data['y'], py + img_size)
                     band_cat = cat_data[y_start:y_end]
@@ -164,29 +120,24 @@ def create_hdf5_datasets_combined(train_mosaic_dir, val_mosaic_dir, train_path, 
                         local_snrs = local_cat['snr']
                         sort_idx = np.argsort(local_cat['flux'])[::-1]
                         
-                        # Catalog fluxes are already APPARENT (attenuated by dust)
                         grid_stars = fast_paint_grid(lx, ly, local_cat['flux'], local_snrs, sort_idx, 5.0, grid_size, cell_size, K)
                         target_buffer[:, :, :-1] = grid_stars.reshape(grid_size, grid_size, -1)
 
                     if bg_data is not None:
-                        # Extract truth background map (includes attenuated sky + dust emission)
                         bg_chunk = bg_data[py:py+img_size, px:px+img_size]
                         bg_map = bg_chunk.reshape(grid_size, cell_size, grid_size, cell_size).mean(axis=(1, 3))
                         target_buffer[:, :, -1] = transform.target_bg_to_network(bg_map - chunk_median)
                     else:
-                        # Fallback (should not happen with new engine)
                         target_buffer[:, :, -1] = transform.target_bg_to_network(sky_level - chunk_median)
                     
-                    # 3. Write
                     ds_imgs[global_idx] = signal_tensor
                     ds_tgts[global_idx] = target_buffer
                     ds_meds[global_idx] = chunk_median
-                    ds_psfs_current[global_idx] = psf_lib
                     ds_meta[global_idx] = meta_data
                     global_idx += 1
 
                 # --- CLEANUP THIS MOSAIC ---
-                for f_path in [mosaic['img'], mosaic['bg'], mosaic['cat'], mosaic['lib']]:
+                for f_path in [mosaic['img'], mosaic['bg'], mosaic['cat']]:
                     if f_path and os.path.exists(f_path): os.remove(f_path)
                 meta_f = mosaic['img'].replace("_img.npy", "_meta.npy")
                 if os.path.exists(meta_f): os.remove(meta_f)

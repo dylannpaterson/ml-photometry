@@ -135,10 +135,10 @@ class Trainer:
         self.config, self.device, self.checkpoint_prefix = config, device, checkpoint_prefix
         self.epochs, self.lr = epochs, lr
         
-        # 1. Transition to AdamW for better weight decay handling
+        # 1. AdamW Optimizer
         self.optimizer = optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=1e-4)
         
-        # 2. Transition to OneCycleLR for faster convergence and local minima escape
+        # 2. OneCycleLR Scheduler
         self.scheduler = optim.lr_scheduler.OneCycleLR(
             self.optimizer,
             max_lr=self.lr * 3.0,
@@ -150,7 +150,6 @@ class Trainer:
         )
         
         self.start_epoch = 0
-        self.psf_library = None
         
         # FIX: Only use GradScaler on CUDA. CPU GradScaler is generally unnecessary and adds overhead.
         self.use_cuda = self.device.type == 'cuda'
@@ -201,9 +200,6 @@ class Trainer:
                 if 'scaler_state_dict' in ckpt and self.scaler:
                     self.scaler.load_state_dict(ckpt['scaler_state_dict'])
                     print("✅ Restored GradScaler state.")
-                if 'psf_library' in ckpt:
-                    self.psf_library = ckpt['psf_library']
-                    print("✅ Restored PSF library from checkpoint.")
                 self.start_epoch = ckpt.get('epoch', self.start_epoch - 1) + 1
             else:
                 self.model.load_state_dict(ckpt)
@@ -225,16 +221,6 @@ class Trainer:
                 if isinstance(batch, dict):
                     images = batch["image"].to(self.device, non_blocking=True)
                     targets = batch["target"].to(self.device, non_blocking=True).float()
-                    psf_library = batch["psf_library"].to(self.device, non_blocking=True)
-                    
-                    if self.psf_library is None:
-                        raw_lib = psf_library.detach().cpu().squeeze()
-                        if raw_lib.dim() == 2:
-                            raw_lib = raw_lib.unsqueeze(0)
-                        elif raw_lib.dim() > 3:
-                            raw_lib = raw_lib.view(-1, raw_lib.shape[-2], raw_lib.shape[-1])
-                        normalized_lib = raw_lib / (raw_lib.sum(dim=(-2, -1), keepdim=True) + 1e-9)
-                        self.psf_library = normalized_lib
                 else:
                     images, targets = batch
                     images, targets = images.to(self.device, non_blocking=True), targets.to(self.device, non_blocking=True).float()
@@ -252,12 +238,7 @@ class Trainer:
                 images_final = torch.asinh((images_noisy - batch_medians) / self.loss_params["stretch_scale"])
                 
                 # --- LIVE CONFIDENCE PRIOR GENERATION ---
-                # We use a partial subset of targets to simulate a "known" prior
-                # For training, we can randomly drop stars or add noise to positions
                 with torch.no_grad():
-                    # NEW: Replace pure randomness with Probability-Weighted Survival
-                    # Bright stars (p ~ 1.0) have a 95% chance to survive.
-                    # Faint stars (p ~ 0.2) have a low chance to survive.
                     B, GH, GW, _ = targets.shape
                     num_params = (targets.shape[-1] - 1) // K
                     st_view_orig = targets[..., :-1].view(B, GH, GW, K, num_params)
@@ -267,17 +248,16 @@ class Trainer:
                     prior_mask = torch.rand_like(p_targets) < survival_chance
                     
                     partial_targets = targets.clone()
-                    # Zero out stars not in the prior
                     st_view = partial_targets[..., :-1].view(B, GH, GW, K, num_params)
                     st_view[~prior_mask] = 0.0
-                    
-                    # NEW: Add position wobble to prior (0.4 px std)
-                    # The absolute geometry will handle it gracefully even if it crosses cell boundaries.
                     st_view[..., 1:3] += torch.randn_like(st_view[..., 1:3]) * 0.4
                     
                     prior_map = render_confidence_prior(partial_targets, img_size, cell_size, K)
 
-                # FIX: Disable autocast on CPU to avoid massive slowdown
+                # 15% chance to drop the entire prior map
+                if torch.rand(1).item() < 0.15:
+                    prior_map = torch.zeros_like(prior_map)
+
                 if self.use_cuda:
                     with torch.autocast(device_type='cuda', dtype=torch.float16):
                         preds = self.model(images_final, prior=prior_map)
@@ -348,22 +328,18 @@ class Trainer:
                 continue 
 
             os.makedirs("checkpoints", exist_ok=True)
-            if self.psf_library is not None and not os.path.exists("master_psf_library.pt"):
-                torch.save(self.psf_library, "master_psf_library.pt")
-
             checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': self.model.state_dict(),
                 'optimizer_state_dict': self.optimizer.state_dict(),
                 'scheduler_state_dict': self.scheduler.state_dict(),
                 'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,
-                'val_loss': val_loss,
-                'psf_library': self.psf_library
+                'val_loss': val_loss
             }
             torch.save(checkpoint, os.path.join("checkpoints", f"{self.checkpoint_prefix}_epoch_{epoch+1}.pth"))
             self._prune_checkpoints()
         
-        final_ckpt = {'model_state_dict': self.model.state_dict(), 'psf_library': self.psf_library}
+        final_ckpt = {'model_state_dict': self.model.state_dict()}
         torch.save(final_ckpt, os.path.join("checkpoints", f"{self.checkpoint_prefix}_final.pth"))
 
     def _prune_checkpoints(self, keep_last=10):
@@ -385,10 +361,6 @@ class Trainer:
         num_batches = len(self.val_loader)
         if num_batches == 0: return 0.0
         
-        img_size = self.config["data_params"]["image_size"]
-        cell_size = self.config["curriculum"].get(self.checkpoint_prefix, {}).get("cell_size", DEFAULT_CELL_SIZE)
-        K = self.config["data_params"].get("max_capacity_per_cell", MAX_CAPACITY_PER_CELL)
-
         with torch.no_grad():
             for batch in self.val_loader:
                 if isinstance(batch, dict):
@@ -408,7 +380,6 @@ class Trainer:
                     batch_medians = images_noisy.view(images_noisy.shape[0], -1).median(dim=1)[0].view(-1, 1, 1, 1)
                 images_final = torch.asinh((images_noisy - batch_medians) / self.loss_params["stretch_scale"])
                 
-                # Zero prior for validation to see if it can recover stars without help
                 prior_zeros = torch.zeros_like(images_final)
 
                 if self.use_cuda:

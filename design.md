@@ -100,8 +100,7 @@ To achieved maximum throughput and minimum disk footprint, the pipeline uses a h
 The pipeline uses a multi-stage curriculum to build a robust foundation model for space-based point source recovery.
 
 ### Stage 0: Gaussian Pre-training (The "Physics & Crowding Prior" Phase)
-*   **Objective:** Teach the model the Dense Grid prediction format, sub-pixel localization, and crowding recoverability using Gaussian PSFs with global jitter simulation.
-*   **Global Jitter Augmentation:** Introduces a dynamic "Global Jitter" pass applying asymmetric Gaussian convolution (parameterized by $s_{jit}$, $q_{jit}$, and $\theta_{jit}$) to simulate varying optical smear.
+*   **Objective:** Teach the model the Dense Grid prediction format, sub-pixel localization, and crowding recoverability using realistic Roman PSFs generated on-the-fly.
 *   **Data:** Vectorized synthetic images generated via a NumPy/Numba or JAX renderer. Star fluxes and counts are drawn from a realistic Dynamic Bulge Luminosity Function.
 *   **Goal:** Reach competency in detection and flux recovery in hyper-dense fields before introducing complex optical diffraction artifacts.
 

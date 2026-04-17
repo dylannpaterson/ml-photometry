@@ -6,7 +6,7 @@ import os
 from scipy.ndimage import zoom, shift, center_of_mass
 from astropy.io import fits
 from castor.data.transforms import AstroSpaceTransform
-from castor.constants import GLOBAL_STRETCH_SCALE, N_PCA_COMPONENTS, SHAPE_SIZE
+from castor.constants import GLOBAL_STRETCH_SCALE, SHAPE_SIZE, DEFAULT_CELL_SIZE
 from scipy.signal import fftconvolve
 
 def upsample_background(bg_map, target_size):
@@ -32,11 +32,6 @@ def upsample_background(bg_map, target_size):
 def generate_custom_inference_prior(star_catalog, img_size, sigma=1.0, device='cpu'):
     """
     Generates a 2D prior map for inference testing.
-    
-    Args:
-        star_catalog: List of (x, y, p) tuples. 
-        img_size: Size of the image (H, W).
-        sigma: Gaussian spread of the confidence.
     """
     prior_map = torch.zeros((img_size, img_size), device=device)
     if not star_catalog:
@@ -75,7 +70,6 @@ def generate_custom_inference_prior(star_catalog, img_size, sigma=1.0, device='c
     prior_flat = prior_map.view(-1)
     prior_flat.scatter_reduce_(0, flat_indices, valid_patches, reduce="amax", include_self=True)
     
-    # Return as a numpy array since your InferenceEngine converts it to a tensor internally
     return prior_map.view(img_size, img_size).cpu().numpy()
 
 class InferenceEngine:
@@ -86,19 +80,22 @@ class InferenceEngine:
         self.img_size = config["data_params"]["image_size"]
         self.stretch_scale = config["data_params"].get("GLOBAL_STRETCH_SCALE", GLOBAL_STRETCH_SCALE)
         self.transform = AstroSpaceTransform(stretch_scale=self.stretch_scale)
+        # Get cell_size from config, fallback to default
+        self.cell_size = config.get("curriculum", {}).get("stage0", {}).get("cell_size", DEFAULT_CELL_SIZE)
 
-    def _get_centered_psf(self, psf_data):
-        """Robustly extracts and centers a PSF for 1x reconstruction."""
+    def _get_centered_psf(self):
+        """Generates a diagnostic centered Gaussian PSF for reconstruction."""
         S = SHAPE_SIZE
-        # Default diagnostic Gaussian core (Refined from radial analysis sigma=0.94)
-        y, x = np.ogrid[:S, :S]
+        # Default diagnostic Gaussian core (sigma ~ 0.94 pixels)
+        y, x = np.meshgrid(np.arange(S), np.arange(S))
         center = (S - 1) / 2.0
         base_psf = np.exp(-((x - center)**2 + (y - center)**2) / (2 * 0.94**2))
         return base_psf / (base_psf.sum() + 1e-9)
 
-    def predict(self, image_tensor, threshold=0.1, psf_basis=None, mean_psf=None, prior_map=None):
+    def predict(self, image_tensor, threshold=0.1, prior_map=None):
         """Runs inference on a single 2D image tensor [H, W]."""
         self.model.eval()
+        
         with torch.no_grad():
             # 1. Pre-processing: Median Subtraction and Arcsinh Stretch
             chunk_median = image_tensor.median().item()
@@ -138,12 +135,10 @@ class InferenceEngine:
             prediction = prediction_dict["stars"].squeeze(0).float().cpu().numpy()
             bg_map = prediction_dict["background"].squeeze(0).float().cpu().numpy()
             
-        predicted_stars, predicted_shapes = [], []
+        predicted_stars = []
         grid_h, grid_w, K, _ = prediction.shape
         cell_size = self.img_size // grid_h
         
-        base_psf = self._get_centered_psf(mean_psf)
-
         for y in range(grid_h):
             for x in range(grid_w):
                 for k in range(K):
@@ -154,11 +149,10 @@ class InferenceEngine:
                         sigmas = np.exp(0.5 * log_vars)
                         
                         predicted_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, float(physical_flux), p, sigmas))
-                        predicted_shapes.append(base_psf)
                             
-        return predicted_stars, predicted_shapes, bg_map
+        return predicted_stars, bg_map
 
-    def visualize(self, hero_data, global_true, global_pred, threshold=0.43, output_path="inference_comparison.png", mean_psf=None, num_chunks=1):
+    def visualize(self, hero_data, global_true, global_pred, threshold=0.43, output_path="inference_comparison.png", num_chunks=1):
         """
         Visualizes inference results with the full 12-axis diagnostic suite. 
         """
@@ -173,7 +167,6 @@ class InferenceEngine:
         bg_map = hero_data["bg_map"]
         gt_bg_map = hero_data["gt_bg_map"]
         chunk_median = hero_data.get("chunk_median", 0.0)
-        jitter_params = hero_data.get("jitter_params")
         prior_map = hero_data.get("prior_map")
 
         # Match for Hero Plot
@@ -187,7 +180,7 @@ class InferenceEngine:
         g_matches, g_unmatched_true, g_unmatched_pred = match_stars(g_match_true, [(s[0], s[1], s[2]) for s in g_pred_filtered], distance_threshold=1.0)
         g_matched_true_indices = [m[0] for m in g_matches]
         
-        base_psf = self._get_centered_psf(mean_psf)
+        base_psf = self._get_centered_psf()
         flipped_psf = base_psf[::-1, ::-1]
 
         # Draw Hero Reconstruction
@@ -212,15 +205,6 @@ class InferenceEngine:
         h_rec_stars_linear = fftconvolve(draw_stars_on_grid(h_match_pred_filtered, H, W, True), flipped_psf, mode='same')
         h_missed_stars = [hero_true[i] for i in range(len(hero_true)) if i not in h_matched_true_indices and hero_true[i][0] >= 0.1]
         h_rec_missed_linear = fftconvolve(draw_stars_on_grid(h_missed_stars, H, W, False), flipped_psf, mode='same')
-
-        if jitter_params is not None and jitter_params[0] > 0:
-            s_j, q_j, t_j = jitter_params; S_j = SHAPE_SIZE; kj = (S_j - 1) / 2.0
-            gy, gx = np.meshgrid(np.arange(S_j) - kj, np.arange(S_j) - kj, indexing='ij')
-            cos, sin = np.cos(t_j), np.sin(t_j); gxp, gyp = gx * cos + gy * sin, -gx * sin + gy * cos
-            j_kernel = np.exp(-(gxp**2 / (2 * s_j**2) + gyp**2 / (2 * (s_j * q_j)**2))); j_kernel /= (j_kernel.sum() + 1e-9)
-            h_rec_stars_linear = fftconvolve(h_rec_stars_linear, j_kernel, mode='same')
-            h_rec_missed_linear = fftconvolve(h_rec_missed_linear, j_kernel, mode='same')
-
 
         # Convert backgrounds (properly un-stretching them)
         full_bg_stretched = upsample_background(bg_map.squeeze(), (H, W))
@@ -280,7 +264,7 @@ class InferenceEngine:
         ax3 = fig.add_subplot(gs[0:2, 2], sharex=ax1, sharey=ax1); r_lim = np.percentile(np.abs(h_residual_linear), 99)
         im3 = ax3.imshow(h_residual_linear, cmap='bwr', origin='lower', vmin=-r_lim, vmax=r_lim); ax3.set_title("Linear Residual"); add_colorbar(im3, ax3)
 
-        # 🚀 Prior Map
+        # Prior Map
         if prior_map is not None:
             ax_prior = fig.add_subplot(gs[2, 2], sharex=ax1, sharey=ax1)
             im_prior = ax_prior.imshow(prior_map, cmap='magma', origin='lower', vmin=0, vmax=1)
@@ -376,4 +360,5 @@ class InferenceEngine:
             ax8.set_xlabel("True Mag"); ax8.set_ylabel("Pred Mag")
 
         plt.suptitle(f"Global Validation Summary ({num_chunks:,} Chunks) | Predicted: {len(g_pred_filtered):,}", fontsize=24)
-        plt.savefig(output_path); print(f"Global diagnostic saved to {output_path}")
+        plt.savefig(output_path); plt.close()
+        print(f"Global diagnostic saved to {output_path}")

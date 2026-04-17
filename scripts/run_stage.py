@@ -4,6 +4,7 @@ import numpy as np
 import os
 import sys
 import shutil
+import matplotlib.pyplot as plt
 from castor.cloud.config_utils import load_config
 from castor.models.dense_grid import DenseGridModel
 from castor.engine.trainer import Trainer
@@ -322,7 +323,7 @@ def run_infer(stage_idx, config, device, checkpoint=None):
         val_h5 = os.path.join(stage_cfg["data_dir"], "stage0_val.h5")
         dataset = HDF5MosaicDataset(val_h5)
         
-        # NEW: Respect CLI --num_chunks argument if provided
+        # Respect CLI --num_chunks argument if provided
         num_chunks_to_infer = config.get("num_chunks_override", min(20, len(dataset)))
         print(f"🔭 Running Global Inference over {num_chunks_to_infer} chunks (Standard + Oracle)...")
         
@@ -405,6 +406,7 @@ def run_infer(stage_idx, config, device, checkpoint=None):
             pred_stars_flat, _, bg_map_flat = engine.predict(img_noisy, threshold=0.0, psf_basis=master_psf_basis, mean_psf=master_mean_psf)
             
             # 2. Oracle Prediction (Perfect Prior - All Stars)
+            # Use ground truth p value (s[0]) for amplitude and sigma=1.5 to match training
             perfect_catalog = [(s[1], s[2], s[0]) for s in true_stars_chunk]
             oracle_prior_map = generate_custom_inference_prior(perfect_catalog, img_size=image_tensor.shape[-1], sigma=1.5, device=device)
             pred_stars_oracle, _, bg_map_oracle = engine.predict(img_noisy, threshold=0.0, psf_basis=master_psf_basis, mean_psf=master_mean_psf, prior_map=oracle_prior_map)
@@ -434,21 +436,13 @@ def run_infer(stage_idx, config, device, checkpoint=None):
 
             # Capture Hero Data (first chunk)
             if idx == 0:
-                jitter_params = None
-                try:
-                    if "meta" in sample:
-                        meta = sample["meta"]
-                        jitter_params = (meta[3], meta[4], meta[5])
-                except: pass
-                
                 hero_data_flat = {
                     "image_stretched": img_stretched,
                     "true_stars": true_stars_chunk,
                     "pred_stars": pred_stars_flat,
                     "bg_map": bg_map_flat,
                     "gt_bg_map": gt_bg_map,
-                    "chunk_median": noisy_median,
-                    "jitter_params": jitter_params
+                    "chunk_median": noisy_median
                 }
                 hero_data_oracle = hero_data_flat.copy()
                 hero_data_oracle["pred_stars"] = pred_stars_oracle
@@ -465,13 +459,20 @@ def run_infer(stage_idx, config, device, checkpoint=None):
                 hero_data_oracle_p100["bg_map"] = bg_map_oracle_p100
                 hero_data_oracle_p100["prior_map"] = oracle_prior_map_p100
 
+                # Standalone Prior Images
+                plt.imsave("hero_prior_oracle.png", oracle_prior_map, cmap='magma', origin='lower')
+                plt.imsave("hero_prior_oracle_p43.png", oracle_prior_map_p43, cmap='magma', origin='lower')
+                plt.imsave("hero_prior_oracle_p100.png", oracle_prior_map_p100, cmap='magma', origin='lower')
+
                 print(f"📸 Captured Hero Sample with {len(true_stars_chunk)} stars.")
 
         # Final Global Visualizations
         engine.visualize(hero_data_flat, global_true, global_pred_flat, threshold=0.43, output_path="inference_comparison_flat.png", mean_psf=master_mean_psf, num_chunks=num_chunks_to_infer)
-        engine.visualize(hero_data_oracle, global_true, global_pred_oracle, threshold=0.43, output_path="inference_comparison_oracle.png", mean_psf=master_mean_psf, num_chunks=num_chunks_to_infer)
-        engine.visualize(hero_data_oracle_p43, global_true, global_pred_oracle_p43, threshold=0.43, output_path="inference_comparison_oracle_p43.png", mean_psf=master_mean_psf, num_chunks=num_chunks_to_infer)
-        engine.visualize(hero_data_oracle_p100, global_true, global_pred_oracle_p100, threshold=0.43, output_path="inference_comparison_oracle_p100.png", mean_psf=master_mean_psf, num_chunks=num_chunks_to_infer)
+        
+        # 🚀 NEW: Use p=0.9 threshold for informed prior visualizations
+        engine.visualize(hero_data_oracle, global_true, global_pred_oracle, threshold=0.9, output_path="inference_comparison_oracle.png", mean_psf=master_mean_psf, num_chunks=num_chunks_to_infer)
+        engine.visualize(hero_data_oracle_p43, global_true, global_pred_oracle_p43, threshold=0.9, output_path="inference_comparison_oracle_p43.png", mean_psf=master_mean_psf, num_chunks=num_chunks_to_infer)
+        engine.visualize(hero_data_oracle_p100, global_true, global_pred_oracle_p100, threshold=0.9, output_path="inference_comparison_oracle_p100.png", mean_psf=master_mean_psf, num_chunks=num_chunks_to_infer)
     else:
         print(f"⚠️ Specialized inference for stage {stage_idx} not yet implemented.")
 

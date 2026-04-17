@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torchvision.models as models
 import numpy as np
 import os
-from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE, N_PCA_COMPONENTS
+from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE
 
 class CoordConv(nn.Module):
     """Adds normalized (x, y) coordinate channels to the input."""
@@ -33,91 +33,30 @@ class FPNBlock(nn.Module):
         return self.smooth(self.lateral(high_res) + self.up(low_res))
 
 class DiffractionAwareFilter(nn.Module):
-    def __init__(self, kernel_size=21, sigma=3.0, psf_library_path="master_psf_library.pt"):
+    """
+    Simple Mexican Hat (Laplacian of Gaussian) filter for diffraction-aware preprocessing.
+    """
+    def __init__(self, kernel_size=21, sigma=3.0):
         super(DiffractionAwareFilter, self).__init__()
 
         # 1 in channel (raw flux), 1 out channel (filter response)
         self.conv = nn.Conv2d(1, 1, kernel_size=kernel_size, padding=kernel_size//2, bias=False)
 
-        # Priority 1: Master PSF Library (The survey-average blurred PSF)
-        # Priority 2: Analytical Mexican Hat (Fallback)
-        
-        kernel = None
-        
-        # Try Priority 1: Library Mean
-        if os.path.exists(psf_library_path):
-            try:
-                # Set weights_only=False to allow loading NumPy objects in the master library
-                master_data = torch.load(psf_library_path, map_location='cpu', weights_only=False)
-                
-                # Robust extraction of mean_psf
-                if isinstance(master_data, dict):
-                    m_psf = torch.from_numpy(master_data['mean_psf']).float()
-                elif torch.is_tensor(master_data):
-                    # Squeeze batch and channel dims -> e.g., [516, 516]
-                    master_data = master_data.squeeze()
-                    
-                    if master_data.dim() == 2:
-                        m_psf = master_data.float()
-                    elif master_data.dim() == 1:
-                        # Old flattened format
-                        s = int(master_data.shape[0]**0.5)
-                        m_psf = master_data.view(s, s).float()
-                    else:
-                        # Fallback for old [N_PCA+1, H*W] format
-                        m_psf = master_data[-1].float()
-                        if m_psf.dim() == 1:
-                            s = int(m_psf.shape[0]**0.5)
-                            m_psf = m_psf.view(s, s)
-                elif isinstance(master_data, (list, tuple)):
-                    # Assume tuple (eigen, weights, mean)
-                    m_psf = torch.from_numpy(master_data[2]).float()
-                else:
-                    print(f"⚠️ Unknown master library format: {type(master_data)}")
-                    m_psf = None
-                
-                if m_psf is not None:
-                    # NEW: Bin down to 1x if oversampled
-                    from castor.constants import SHAPE_SIZE
-                    S_full = m_psf.shape[0]
-                    if S_full > SHAPE_SIZE:
-                        O = S_full // SHAPE_SIZE
-                        m_psf = m_psf.reshape(SHAPE_SIZE, O, SHAPE_SIZE, O).mean(dim=(1, 3))
-                        m_psf = m_psf / (m_psf.sum() + 1e-9)
-
-                    kernel = self._fit_to_kernel_size(m_psf, kernel_size)
-                    print(f"🛰️ DiffractionAwareFilter: Initialized with Master Library Mean ({psf_library_path})")
-            except Exception as e:
-                print(f"⚠️ Failed to load master library for prior: {e}")
-
-
-        # Priority 3: Analytical Fallback
-        if kernel is None:
-            kernel = self._generate_analytical_prior(kernel_size, sigma)
-            print("🛰️ DiffractionAwareFilter: Initialized with Analytical Mexican Hat")
+        # Generate Analytical Mexican Hat Prior
+        kernel = self._generate_mexican_hat(kernel_size, sigma)
+        print("🛰️ DiffractionAwareFilter: Initialized with Analytical Mexican Hat")
 
         # Zero-mean and normalize (Acts as a high-pass/edge-like detector)
         kernel = kernel - kernel.mean()
-        kernel = kernel / torch.max(torch.abs(kernel))
+        kernel = kernel / (torch.max(torch.abs(kernel)) + 1e-9)
 
         initial_weight = kernel.view(1, 1, kernel_size, kernel_size).float()
         self.conv.weight.data = initial_weight.clone()
         self.register_buffer("init_weight", initial_weight)
         self.conv.weight.requires_grad = True
 
-    def _fit_to_kernel_size(self, psf, kernel_size):
-        """ Crops or pads a PSF to match the target kernel size. """
-        curr_s = psf.shape[0]
-        if curr_s > kernel_size:
-            start = (curr_s - kernel_size) // 2
-            return psf[start:start+kernel_size, start:start+kernel_size]
-        elif curr_s < kernel_size:
-            pad = (kernel_size - curr_s) // 2
-            return F.pad(psf, [pad, pad, pad, pad])
-        return psf
-
-    def _generate_analytical_prior(self, kernel_size, sigma):
-        # 1. Generate the 2D Mexican Hat (Laplacian of Gaussian) kernel
+    def _generate_mexican_hat(self, kernel_size, sigma):
+        # Generate the 2D Mexican Hat (Laplacian of Gaussian) kernel
         device = self.conv.weight.device
         grid = torch.arange(-kernel_size // 2 + 1., kernel_size // 2 + 1., device=device, dtype=torch.float32)
         y, x = torch.meshgrid(grid, grid, indexing='ij')
@@ -126,20 +65,8 @@ class DiffractionAwareFilter(nn.Module):
         # LoG Formula
         pi = torch.tensor(np.pi, device=device, dtype=torch.float32)
         kernel = -(1.0 / (pi * sigma**4)) * (1.0 - r2 / (2 * sigma**2)) * torch.exp(-r2 / (2 * sigma**2))
-
-        # 2. Add Spikes to the prior (3 lines at 0, 60, 120 degrees)
-        angles = [0.0, np.pi/3.0, 2.0*np.pi/3.0]
-        for angle in angles:
-            angle_t = torch.tensor(angle, device=device, dtype=torch.float32)
-            # Distance from each pixel to the infinite line at this angle
-            dist_to_line = torch.abs(x * torch.sin(angle_t) - y * torch.cos(angle_t))
-            # Add a thin exponential spike
-            kernel += torch.exp(-dist_to_line / 0.5) * 0.05
-
-        # Normalize the kernel so it doesn't blow up the activations
-        kernel = kernel - kernel.mean()
-        kernel = kernel / torch.max(torch.abs(kernel))
         return kernel
+
     def get_regularization_loss(self):
         """
         Calculates the L2 distance from the initial LoG kernel.

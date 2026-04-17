@@ -20,5 +20,6 @@ mamba activate ./castor_env
 echo "Upgrading pip and installing requirements..."
 pip install --upgrade pip
 pip install --extra-index-url https://download.pytorch.org/whl/cu124 -e .
+pip install webbpsf stpsf
 
 echo "✅ Environment 'castor_env' is ready to use!"

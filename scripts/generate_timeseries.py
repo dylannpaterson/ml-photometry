@@ -10,11 +10,10 @@ from tqdm import tqdm
 from castor.cloud.config_utils import load_config
 from castor.data.stage0_gaussian import (
     sample_bulge_magnitudes, 
-    generate_field_realistic_psf_library, 
-    _compute_eigen_psfs,
+    generate_stpsf_roman_psf,
     calculate_safe_magnitude_cutoff
 )
-from castor.constants import GLOBAL_STRETCH_SCALE, SHAPE_SIZE, N_PCA_COMPONENTS
+from castor.constants import GLOBAL_STRETCH_SCALE, SHAPE_SIZE
 from scipy.signal import fftconvolve
 from scipy.ndimage import map_coordinates
 from roman_datamodels import datamodels
@@ -146,17 +145,8 @@ def main():
     original_wcs_gs = ris_wcs.get_wcs(template.meta)
     sca_center_x, sca_center_y = (mosaic_size - 1) / 2.0, (mosaic_size - 1) / 2.0
 
-    if os.path.exists(args.psf_library):
-        master_data = torch.load(args.psf_library, map_location='cpu', weights_only=False)
-        if 'kb_array' in master_data:
-            master_psf_library = master_data['kb_array']
-        else:
-            master_psf_library = master_data['mean_psf'][np.newaxis, ...]
-    else:
-        master_psf_library = generate_field_realistic_psf_library(num_psfs=100, grid_size=SHAPE_SIZE, oversample=O)
-    
-    repr_idx = np.random.randint(0, len(master_psf_library))
-    repr_psf_4x = master_psf_library[repr_idx] 
+    print(f"🛰️  Generating realistic Roman PSF on-the-fly...")
+    repr_psf_4x = generate_stpsf_roman_psf(grid_size=SHAPE_SIZE, oversample=O)
     psf_1x = repr_psf_4x.reshape(SHAPE_SIZE, O, SHAPE_SIZE, O).mean(axis=(1, 3))
     psf_1x /= (np.sum(psf_1x) + 1e-9)
 

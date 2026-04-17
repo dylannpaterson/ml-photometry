@@ -3,7 +3,7 @@ import numpy as np
 import os
 from scipy.spatial import cKDTree
 from castor.data.transforms import AstroSpaceTransform
-from castor.constants import MAX_CAPACITY_PER_CELL, GLOBAL_STRETCH_SCALE, N_PCA_COMPONENTS
+from castor.constants import MAX_CAPACITY_PER_CELL, GLOBAL_STRETCH_SCALE
 
 def match_stars(true_stars, pred_stars, distance_threshold=1.0, flux_threshold_dex=0.5):
     """

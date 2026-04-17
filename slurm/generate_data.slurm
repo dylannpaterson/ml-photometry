@@ -24,6 +24,13 @@ mamba activate /home/malpas.1/project_amber/castor_model/castor_env
 # Ensure the root project dir is in PYTHONPATH
 export PYTHONPATH=$PYTHONPATH:.
 
+# Set STPSF_PATH for realistic Roman PSF generation
+# If not already set, we'll use a standard location in project space
+if [ -z "$STPSF_PATH" ]; then
+    export STPSF_PATH="/home/malpas.1/project_amber/stpsf-data"
+    echo "🛰️  Setting STPSF_PATH to $STPSF_PATH"
+fi
+
 # 2. Extract configuration values dynamically
 FINAL_DIR=$(python3 -c "import yaml; c=yaml.safe_load(open('config/config.yaml')); print(c['curriculum']['$TARGET_STAGE']['data_dir'])")
 STAGE_IDX=$(echo $TARGET_STAGE | sed 's/stage//')
@@ -39,42 +46,20 @@ fi
 
 TRAIN_MOS_DIR="$FINAL_DIR/mosaics_train"
 VAL_MOS_DIR="$FINAL_DIR/mosaics_val"
-MASTER_PSF_LIB="$FINAL_DIR/master_psf_library.pt"
 
 echo "📂 Target Directory: $FINAL_DIR"
 echo "🧩 Generating $NUM_MOSAICS train and $NUM_VAL_MOSAICS val mosaics..."
 
-# 3. Master PSF Library Generation (Do once for the whole dataset)
 mkdir -p "$FINAL_DIR"
-NEEDS_REGEN=false
-if [ ! -f "$MASTER_PSF_LIB" ]; then
-    NEEDS_REGEN=true
-else
-    # Check if existing library matches SHAPE_SIZE
-    CURR_SHAPE=$(python3 -c "from castor.constants import SHAPE_SIZE; print(SHAPE_SIZE)")
-    LIB_SHAPE=$(python3 -c "import torch; d=torch.load('$MASTER_PSF_LIB', map_location='cpu', weights_only=False); print(d.get('shape_size', 127))")
-    if [ "$CURR_SHAPE" != "$LIB_SHAPE" ]; then
-        echo "⚠️ PSF Library shape mismatch ($LIB_SHAPE vs $CURR_SHAPE). Forcing REGEN..."
-        NEEDS_REGEN=true
-    fi
-fi
 
-if [ "$NEEDS_REGEN" = true ]; then
-    echo "📡 Pre-generating Master PSF Library..."
-    srun python -u scripts/pregenerate_psf_library.py --num_psfs 100 --output "$MASTER_PSF_LIB"
-else
-    echo "📂 Using existing Master PSF Library at $MASTER_PSF_LIB"
-fi
-
-# 4. Data Generation
+# 3. Data Generation
 echo "1️⃣ Generating raw TRAINING mosaics..."
 mkdir -p "$TRAIN_MOS_DIR"
 srun python -u scripts/generate_mosaics.py \
     --config config/config.yaml \
     --stage $STAGE_IDX \
     --num $NUM_MOSAICS \
-    --output_dir "$TRAIN_MOS_DIR" \
-    --psf_library "$MASTER_PSF_LIB"
+    --output_dir "$TRAIN_MOS_DIR"
 
 echo "2️⃣ Generating raw VALIDATION mosaics..."
 mkdir -p "$VAL_MOS_DIR"
@@ -82,8 +67,7 @@ srun python -u scripts/generate_mosaics.py \
     --config config/config.yaml \
     --stage $STAGE_IDX \
     --num $NUM_VAL_MOSAICS \
-    --output_dir "$VAL_MOS_DIR" \
-    --psf_library "$MASTER_PSF_LIB"
+    --output_dir "$VAL_MOS_DIR"
 
 echo "3️⃣ Converting to HDF5 (Separate Splits)..."
 srun python -u scripts/convert_to_hdf5.py \
