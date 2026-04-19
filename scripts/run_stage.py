@@ -219,44 +219,17 @@ def run_train(stage_idx, config, device):
     if stage_idx == 0:
         train_h5 = os.path.join(stage_cfg["data_dir"], "stage0_train.h5")
         val_h5 = os.path.join(stage_cfg["data_dir"], "stage0_val.h5")
-        train_mos_dir = os.path.join(stage_cfg["data_dir"], "mosaics_train")
-        val_mos_dir = os.path.join(stage_cfg["data_dir"], "mosaics_val")
         
         # 1. Check if we actually NEED to generate anything
         needs_gen = force_gen or not os.path.exists(train_h5) or not os.path.exists(val_h5)
         
         if needs_gen:
-            # Only generate raw mosaics if they don't already exist
-            if force_gen or not os.path.exists(train_mos_dir) or not os.listdir(train_mos_dir):
-                print("🛠️ Generating Mosaics for Stage 0...")
-                cfg_path = config.get("config_path", "config/config.yaml")
-                mos_cfg = stage_cfg.get("mosaic_params", {"num_mosaics": 5, "val_mosaics": 2})
-                num_mos = mos_cfg.get("num_mosaics", 5)
-                num_val_mos = mos_cfg.get("val_mosaics", 2)
-                
-                os.makedirs(train_mos_dir, exist_ok=True)
-                os.makedirs(val_mos_dir, exist_ok=True)
-                
-                # Check for existing library to ensure consistency
-                lib_arg = "--psf_library master_psf_library.pt" if os.path.exists("master_psf_library.pt") else ""
-                
-                os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/generate_mosaics.py --num {num_mos} --stage {stage_idx} --config {cfg_path} --output_dir {train_mos_dir} {lib_arg}")
-                os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/generate_mosaics.py --num {num_val_mos} --stage {stage_idx} --config {cfg_path} --output_dir {val_mos_dir} {lib_arg}")
+            print("🛠️ Generating Stage 0 Data (Parallel HDF5)...")
+            from castor.data.stage0_gaussian import run_stage0_parallel_generation
             
-            print(f"🛠️ HDF5 dataset conversion triggered (force_gen={force_gen})...")
-            # Clear old ones if force_gen is true to avoid h5py append/overlap confusion
-            if force_gen:
-                if os.path.exists(train_h5): os.remove(train_h5)
-                if os.path.exists(val_h5): os.remove(val_h5)
-            
-            # The conversion script now handles incremental cleanup of raw files
-            ret = os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/convert_to_hdf5.py --train_dir {train_mos_dir} --val_dir {val_mos_dir} --output_dir {stage_cfg['data_dir']} --train_samples {data_cfg['num_train_samples']} --val_samples {data_cfg['num_val_samples']}")
-            
-            # Final cleanup
-            if ret == 0:
-                print(f"🧹 Final cleanup of raw mosaic directories...")
-                shutil.rmtree(train_mos_dir, ignore_errors=True)
-                shutil.rmtree(val_mos_dir, ignore_errors=True)
+            # Generate Train and Val splits using the new parallel logic
+            run_stage0_parallel_generation(config, split='train')
+            run_stage0_parallel_generation(config, split='val')
 
         from castor.data.stage0_gaussian import HDF5MosaicDataset
         print(f"🛠️ Using HDF5 Dataset: {train_h5}")

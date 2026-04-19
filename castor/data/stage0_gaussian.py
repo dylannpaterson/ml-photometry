@@ -5,6 +5,10 @@ import os
 import h5py
 from scipy.signal import fftconvolve
 from scipy.ndimage import map_coordinates
+from tqdm import tqdm
+import multiprocessing as mp
+from functools import partial
+
 from castor.data.transforms import AstroSpaceTransform
 from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, GLOBAL_STRETCH_SCALE, SHAPE_SIZE
 
@@ -407,6 +411,126 @@ def generate_mosaic_data(mosaic_size, params):
 
     return full_image, truth_bg_map, structured_cat, meta, psf_1x
 
+def generate_single_sample_stage0(idx, params):
+    """
+    Worker function to generate a single 256x256 Stage 0 sample.
+    Essentially a self-contained version of generate_mosaic_data but for a 256x256 chunk.
+    """
+    img_size = params['image_size']
+    exp_time, zp, sky_mag = np.random.uniform(30.0, 90.0), 26.5, 22.0
+    
+    # 1. PSF
+    O = 4
+    psf_4x = _generate_fallback_psf(SHAPE_SIZE, oversample=O) # Use fallback for speed in pre-training
+    psf_1x = psf_4x.reshape(SHAPE_SIZE, O, SHAPE_SIZE, O).mean(axis=(1, 3))
+    psf_1x /= (psf_1x.sum() + 1e-9)
+    
+    # 2. Stars
+    n_stars = int(10 ** np.random.uniform(np.log10(params['min_stars_chunk']), np.log10(params['max_stars_chunk'])))
+    mags = sample_bulge_magnitudes(n_stars, np.random.uniform(14.5, 16.5), np.random.uniform(0.2, 0.5), np.random.uniform(5.0, 15.0), gamma=np.random.uniform(0.25, 0.35))
+    fluxes = exp_time * (10 ** (-0.4 * (mags - zp)))
+    px, py = np.random.uniform(0, img_size, n_stars), np.random.uniform(0, img_size, n_stars)
+    
+    # 3. Dust & Sky
+    sky_level = (10 ** (-0.4 * (sky_mag - zp))) * (0.11**2) * exp_time
+    raw_dust = generate_dust_cirrus(img_size, 1.0)
+    gamma_clump = np.random.uniform(1.0, 5.0)
+    clumpy_dust = raw_dust ** gamma_clump
+    max_ext = np.random.uniform(0.2, 5.0)
+    transmission = 10 ** (-0.4 * clumpy_dust * max_ext)
+    
+    star_transmissions = map_coordinates(transmission, [py, px], order=1, mode='nearest')
+    apparent_fluxes = fluxes * star_transmissions
+    apparent_mags = mags - 2.5 * np.log10(star_transmissions + 1e-9)
+    
+    frac_bg = 0.60
+    sky_map = (sky_level * (1.0 - frac_bg)) + (sky_level * frac_bg * transmission) + (clumpy_dust * np.random.uniform(20, 100))
+    
+    # 4. Rendering
+    mag_limit = calculate_safe_magnitude_cutoff(exp_time, zp, sky_mag, snr_cutoff=1.0)
+    v_mask = apparent_mags < mag_limit
+    
+    fg_grid = np.zeros((img_size, img_size), dtype=np.float32)
+    bg_grid = np.zeros((img_size, img_size), dtype=np.float32)
+    
+    x0, y0 = np.floor(px).astype(int), np.floor(py).astype(int)
+    dx, dy = px - x0, py - y0
+    w00, w10, w01, w11 = (1 - dx) * (1 - dy), dx * (1 - dy), (1 - dx) * dy, dx * dy
+    
+    def paint(grid, x, y, w, f):
+        flat_indices = y * img_size + x
+        grid.flat += np.bincount(flat_indices, weights=f * w, minlength=grid.size)
+
+    paint(fg_grid, x0[v_mask], y0[v_mask], w00[v_mask], apparent_fluxes[v_mask])
+    paint(fg_grid, x0[v_mask]+1, y0[v_mask], w10[v_mask], apparent_fluxes[v_mask])
+    paint(fg_grid, x0[v_mask], y0[v_mask]+1, w01[v_mask], apparent_fluxes[v_mask])
+    paint(fg_grid, x0[v_mask]+1, y0[v_mask]+1, w11[v_mask], apparent_fluxes[v_mask])
+
+    paint(bg_grid, x0[~v_mask], y0[~v_mask], w00[~v_mask], apparent_fluxes[~v_mask])
+    paint(bg_grid, x0[~v_mask]+1, y0[~v_mask], w10[~v_mask], apparent_fluxes[~v_mask])
+    paint(bg_grid, x0[~v_mask], y0[~v_mask]+1, w01[~v_mask], apparent_fluxes[~v_mask])
+    paint(bg_grid, x0[~v_mask]+1, y0[~v_mask]+1, w11[~v_mask], apparent_fluxes[~v_mask])
+    
+    img = fftconvolve(fg_grid, psf_1x, mode='same')
+    bg_img = fftconvolve(bg_grid, psf_1x, mode='same') + sky_map
+    full_img = img + bg_img
+    
+    # 5. Target Grid
+    cell_size, K = DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL
+    grid_size = img_size // cell_size
+    
+    half = SHAPE_SIZE // 2
+    N_eff = 1.0 / (np.sum(psf_1x**2) + 1e-9)
+    star_peak_val = psf_1x[half, half]
+    
+    local_sky = map_coordinates(sky_map, [py[v_mask], px[v_mask]], order=1, mode='nearest')
+    confusion = np.maximum(0.0, full_img[np.clip(y0[v_mask], 0, img_size-1), np.clip(x0[v_mask], 0, img_size-1)] - (apparent_fluxes[v_mask] * star_peak_val))
+    snrs = apparent_fluxes[v_mask] / np.sqrt(apparent_fluxes[v_mask] + N_eff * (local_sky + confusion + 25.0))
+    
+    sort_idx = np.argsort(apparent_fluxes[v_mask])[::-1]
+    target_grid = fast_paint_grid(px[v_mask], py[v_mask], apparent_fluxes[v_mask], snrs, sort_idx, 5.0, grid_size, cell_size, K)
+    
+    transform = AstroSpaceTransform(stretch_scale=GLOBAL_STRETCH_SCALE)
+    chunk_median = np.median(full_img)
+    bg_downsampled = bg_img.reshape(grid_size, cell_size, grid_size, cell_size).mean(axis=(1, 3))
+    target_grid_full = np.concatenate([target_grid.reshape(grid_size, grid_size, -1), transform.target_bg_to_network(bg_downsampled - chunk_median)[:, :, None]], axis=-1)
+    
+    meta = np.array([exp_time, zp, sky_mag, 0.0, 0.0, 0.0], dtype=np.float32)
+    return full_img.astype(np.float32), target_grid_full.astype(np.float32), chunk_median.astype(np.float32), meta
+
+def run_stage0_parallel_generation(config, split='train'):
+    s0_cfg = config['curriculum']['stage0']
+    d_cfg = config['data_params']
+    num_samples = d_cfg['num_train_samples'] if split == 'train' else d_cfg['num_val_samples']
+    output_path = os.path.join(s0_cfg['data_dir'], f"stage0_{split}.h5")
+    os.makedirs(s0_cfg['data_dir'], exist_ok=True)
+    
+    # Scaling density to 256x256 chunk
+    # min_stars was for 1024x1024
+    area_scale = (256.0 / 1024.0)**2
+    params = {
+        'image_size': 256,
+        'min_stars_chunk': d_cfg['min_stars'] * area_scale,
+        'max_stars_chunk': d_cfg['max_stars'] * area_scale
+    }
+    
+    num_workers = mp.cpu_count()
+    print(f"🔥 Stage 0 [{split}]: Parallelizing with {num_workers} workers...")
+    
+    with h5py.File(output_path, 'w') as f:
+        dset_img = f.create_dataset("images", (num_samples, 1, 256, 256), dtype='f4', chunks=(1, 1, 256, 256), compression="lzf")
+        dset_tgt = f.create_dataset("targets", (num_samples, 64, 64, MAX_CAPACITY_PER_CELL*5 + 1), dtype='f4', chunks=(1, 64, 64, MAX_CAPACITY_PER_CELL*5 + 1), compression="lzf")
+        dset_med = f.create_dataset("chunk_medians", (total_samples if 'total_samples' in locals() else num_samples,), dtype='f4')
+        dset_meta = f.create_dataset("metas", (num_samples, 6), dtype='f4')
+        
+        worker_func = partial(generate_single_sample_stage0, params=params)
+        with mp.Pool(num_workers) as pool:
+            for i, (img, tgt, med, meta) in enumerate(tqdm(pool.imap(worker_func, range(num_samples)), total=num_samples)):
+                dset_img[i, 0] = img
+                dset_tgt[i] = tgt
+                dset_med[i] = med
+                dset_meta[i] = meta
+
 class HDF5MosaicDataset(Dataset):
     """
     PyTorch Dataset for reading simulated mosaics from an HDF5 file.
@@ -439,7 +563,7 @@ class HDF5MosaicDataset(Dataset):
         ----------
         h5_path : str
             Path to the HDF5 file.
-        image_size : int, optional
+            image_size : int, optional
             Size of the square images, by default 256.
         """
         self.h5_path, self.file, self.img_size = h5_path, None, image_size
@@ -482,3 +606,10 @@ class HDF5MosaicDataset(Dataset):
         meta = self.file['metas'][idx] if 'metas' in self.file else np.zeros(6, dtype=np.float32)
         # Return a single mean PSF or None if we don't need it per-sample here
         return {"image": img, "target": target, "chunk_median": median, "meta": meta}
+
+if __name__ == "__main__":
+    import yaml
+    with open("config/config.yaml", 'r') as f:
+        config = yaml.safe_load(f)
+    run_stage0_parallel_generation(config, split='train')
+    run_stage0_parallel_generation(config, split='val')
