@@ -240,28 +240,77 @@ def main():
         dt = t - times[0]
         curr_drift = drift_vec_px * dt
         
-        # Calculate epoch boresight using GalSim (1-indexed)
+        # 1. Calculate the exact astrometric DELTA caused by the drift
+        # Find base center at 0 drift
+        center_ra, center_dec = original_wcs_gs.xyToradec(
+            sca_center_x + 1.0, 
+            sca_center_y + 1.0, 
+            units=galsim.degrees
+        )
+        # Find drifted center (epoch boresight)
         epoch_ra, epoch_dec = original_wcs_gs.xyToradec(
             sca_center_x + curr_drift[0] + 1.0, 
             sca_center_y + curr_drift[1] + 1.0, 
             units=galsim.degrees
         )
         
-        model = template.copy()
-        ris_wcs.fill_in_parameters(
-            model.meta, 
-            SkyCoord(epoch_ra, epoch_dec, unit='deg', frame='icrs'), 
-            boresight=False, 
-            pa_aper=pa_aper
-        )
+        delta_ra = epoch_ra - center_ra
+        delta_dec = epoch_dec - center_dec
         
-        # 2. Rebuild the GWCS object tree to reflect the new wcsinfo
+        # 2. Safely apply ONLY the delta to the existing reference pointing
+        # This prevents the "Double Offset" bug where observatory boresight was 
+        # being overwritten by the SCA boresight.
+        model = template.copy()
+        model.meta.wcsinfo.ra_ref += delta_ra
+        model.meta.wcsinfo.dec_ref += delta_dec
+        
+        # 3. Rebuild the GWCS object tree to reflect the shifted metadata
         # This guarantees 100% Roman Data Model compliance for the output .asdf
         model = AssignWcsStep.call(model)
         
-        # 3. Extract the fresh WCS object and calculate new pixel positions
+        # 4. Extract the fresh WCS object and calculate new pixel positions
         gwcs_obj = model.meta.wcs 
-        px_epoch, py_epoch = gwcs_obj.world_to_pixel_values(star_ra, star_dec)
+
+        # --- ASTROMETRICALLY RIGOROUS FIX ---
+        # Prevent the GWCS Broyden solver from diverging by only evaluating 
+        # coordinates that are in the rough vicinity of the SCA.
+        
+        # Use a simple linear shift ONLY to create a safe evaluation mask
+        px_est = px_init - curr_drift[0]
+        py_est = py_init - curr_drift[1]
+        
+        # Keep stars within a 200-pixel buffer of the detector
+        safe_mask = (px_est > -200) & (px_est < mosaic_size + 200) & \
+                    (py_est > -200) & (py_est < mosaic_size + 200)
+                    
+        px_epoch = np.full(n_total_stars, np.nan)
+        py_epoch = np.full(n_total_stars, np.nan)
+        
+        # Apply the TRUE Roman datamodel WCS inversion on the safe subset
+        if np.any(safe_mask):
+            sub_px, sub_py = gwcs_obj.world_to_pixel_values(star_ra[safe_mask], star_dec[safe_mask])
+            px_epoch[safe_mask] = sub_px
+            py_epoch[safe_mask] = sub_py
+
+        # Guarantee precision for your specific microlensing targets.
+        # If the vectorized batch somehow still hiccups on a border star,
+        # solving a single point forces a clean, isolated Jacobian calculation.
+        for ev in events:
+            idx = ev['idx']
+            if np.isnan(px_epoch[idx]) or np.isnan(py_epoch[idx]):
+                px_epoch[idx], py_epoch[idx] = gwcs_obj.world_to_pixel_values(ev['ra'], ev['dec'])
+            
+            # --- NEW: FAIL-FAST VALIDATION ---
+            # If the isolated solver STILL returns NaN for a target event, halt immediately.
+            if np.isnan(px_epoch[idx]) or np.isnan(py_epoch[idx]):
+                raise RuntimeError(
+                    f"🛑 CRITICAL WCS FAILURE: Solver returned NaN for Event {ev['idx']} "
+                    f"at Epoch {i} (t={t:.2f}).\n"
+                    f"Target RA/Dec: {ev['ra']:.6f}, {ev['dec']:.6f}\n"
+                    f"Current SCA Boresight: {epoch_ra:.6f}, {epoch_dec:.6f}\n"
+                    f"Aborting generation to prevent corrupted data."
+                )
+        # ------------------------------------
 
         # Start from base fluxes every epoch
         current_fluxes = fluxes_base.copy()
