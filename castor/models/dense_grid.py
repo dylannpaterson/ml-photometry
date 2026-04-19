@@ -94,7 +94,7 @@ class DenseGridModel(nn.Module):
         # 2. Backbone: Full ResNet-34
         resnet = models.resnet34(weights=None)
         self.initial = nn.Sequential(
-            # 3 Channels: Raw Image, Physics Filter, Confidence Prior
+            # 3 Channels: Raw Image, Physics Filter response, Confidence Prior
             nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
             resnet.bn1,
             resnet.relu,

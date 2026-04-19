@@ -31,46 +31,49 @@ def upsample_background(bg_map, target_size):
 
 def generate_custom_inference_prior(star_catalog, img_size, sigma=1.0, device='cpu'):
     """
-    Generates a 2D prior map for inference testing.
+    Generates a 1-channel bilinear splat confidence prior map for inference testing.
+    Channel 0: P (bilinear sum = P)
     """
+    # 1 channel: P
     prior_map = torch.zeros((img_size, img_size), device=device)
     if not star_catalog:
         return prior_map.cpu().numpy()
         
     # Convert to tensors
     catalog = torch.tensor(star_catalog, device=device)
+    # catalog expected to be list of (cx, cy, p)
     cx, cy, p = catalog[:, 0], catalog[:, 1], catalog[:, 2]
     
-    # Bounding box limits
-    r = int(5 * sigma)
-    patch_size = 2 * r + 1
+    # Map to pixels
+    # Ensure anchors are in [0, img_size-2] for 2x2 splat
+    cx = torch.clamp(cx, 0, img_size - 1.001)
+    cy = torch.clamp(cy, 0, img_size - 1.001)
     
-    local_coords = torch.arange(-r, r + 1, device=device)
-    local_y, local_x = torch.meshgrid(local_coords, local_coords, indexing='ij')
+    x0 = torch.floor(cx).long()
+    y0 = torch.floor(cy).long()
+    dx = cx - x0.float()
+    dy = cy - y0.float()
     
-    cx_int, cy_int = cx.round().long(), cy.round().long()
+    # Bilinear weights scaled by P
+    w00 = (1 - dx) * (1 - dy) * p
+    w10 = dx * (1 - dy) * p
+    w01 = (1 - dx) * dy * p
+    w11 = dx * dy * p
     
-    patch_y = cy_int.view(-1, 1, 1) + local_y.view(1, patch_size, patch_size)
-    patch_x = cx_int.view(-1, 1, 1) + local_x.view(1, patch_size, patch_size)
-    
-    dist_sq = (patch_x.float() - cx.view(-1, 1, 1))**2 + \
-              (patch_y.float() - cy.view(-1, 1, 1))**2
-              
-    patches = p.view(-1, 1, 1) * torch.exp(-dist_sq / (2 * sigma**2))
-    
-    # Mask out-of-bounds pixels
-    valid_mask = (patch_x >= 0) & (patch_x < img_size) & (patch_y >= 0) & (patch_y < img_size)
-    
-    valid_y = patch_y[valid_mask]
-    valid_x = patch_x[valid_mask]
-    valid_patches = patches[valid_mask]
-    
-    # Fast Scatter Reduction
-    flat_indices = valid_y * img_size + valid_x
+    # Scatter add into the flat array
     prior_flat = prior_map.view(-1)
-    prior_flat.scatter_reduce_(0, flat_indices, valid_patches, reduce="amax", include_self=True)
     
-    return prior_map.view(img_size, img_size).cpu().numpy()
+    idx00 = y0 * img_size + x0
+    idx10 = idx00 + 1
+    idx01 = idx00 + img_size
+    idx11 = idx01 + 1
+    
+    prior_flat.scatter_add_(0, idx00, w00)
+    prior_flat.scatter_add_(0, idx10, w10)
+    prior_flat.scatter_add_(0, idx01, w01)
+    prior_flat.scatter_add_(0, idx11, w11)
+    
+    return prior_map.cpu().numpy()
 
 class InferenceEngine:
     def __init__(self, model, device, config):
@@ -267,7 +270,12 @@ class InferenceEngine:
         # Prior Map
         if prior_map is not None:
             ax_prior = fig.add_subplot(gs[2, 2], sharex=ax1, sharey=ax1)
-            im_prior = ax_prior.imshow(prior_map, cmap='magma', origin='lower', vmin=0, vmax=1)
+            # Display P channel (channel 0) if 3D, else just show it
+            if prior_map.ndim == 3:
+                display_prior = prior_map[0]
+            else:
+                display_prior = prior_map
+            im_prior = ax_prior.imshow(display_prior, cmap='magma', origin='lower', vmin=0, vmax=1)
             ax_prior.set_title("Inference Prior Map"); add_colorbar(im_prior, ax_prior)
 
         # Backgrounds
@@ -351,13 +359,22 @@ class InferenceEngine:
         
         # Photometry scatter
         if g_matches:
-            ax8 = fig.add_subplot(gs[3, 0]); ax8.scatter(g_matched_true_mags, g_matched_pred_mags, alpha=0.3, s=2)
+            ax8 = fig.add_subplot(gs[3, 0])
+            # Use p-values for color mapping
+            matched_p_values = np.array([g_pred_filtered[m[1]][3] for m in g_matches])
+            sc_photo = ax8.scatter(g_matched_true_mags, g_matched_pred_mags, 
+                                  c=matched_p_values, cmap='viridis', 
+                                  alpha=0.6, s=10, vmin=0, vmax=1)
+            
             all_mags = np.concatenate([g_matched_true_mags, g_matched_pred_mags])
             if len(all_mags) > 0:
                 m_min, m_max = np.min(all_mags), np.max(all_mags)
                 ax8.plot([m_min, m_max], [m_min, m_max], 'k--', alpha=0.5, zorder=0)
-            ax8.set_title("Global Photometry"); ax8.invert_xaxis(); ax8.invert_yaxis()
+            
+            ax8.set_title("Global Photometry (Color: p-value)")
+            ax8.invert_xaxis(); ax8.invert_yaxis()
             ax8.set_xlabel("True Mag"); ax8.set_ylabel("Pred Mag")
+            add_colorbar(sc_photo, ax8)
 
         plt.suptitle(f"Global Validation Summary ({num_chunks:,} Chunks) | Predicted: {len(g_pred_filtered):,}", fontsize=24)
         plt.savefig(output_path); plt.close()

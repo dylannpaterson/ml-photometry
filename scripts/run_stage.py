@@ -339,48 +339,11 @@ def run_infer(stage_idx, config, device, checkpoint=None):
         hero_data_oracle_p43 = None
         hero_data_oracle_p100 = None
         
-        # Robust PSF Extraction logic (shared for all chunks)
-        master_mean_psf = None
-        master_psf_basis = None
-
         for idx in range(num_chunks_to_infer):
             sample = dataset[idx]
             image_tensor = sample["image"]
             target = sample["target"]
             
-            # --- One-time PSF extraction ---
-            if master_mean_psf is None:
-                psf_lib_data = psf_lib_ckpt if psf_lib_ckpt is not None else sample["psf_library"]
-                if isinstance(psf_lib_data, dict):
-                    master_mean_psf = psf_lib_data.get('mean_psf')
-                    master_psf_basis = psf_lib_data.get('eigen_psfs')
-                elif isinstance(psf_lib_data, (list, tuple)):
-                    master_psf_basis = psf_lib_data[0]
-                    master_mean_psf = psf_lib_data[2] if len(psf_lib_data) > 2 else psf_lib_data[-1]
-                else:
-                    data = psf_lib_data if isinstance(psf_lib_data, np.ndarray) else psf_lib_data.cpu().numpy()
-                    data = np.squeeze(data)
-                    if data.ndim == 2: master_mean_psf = data
-                    elif data.ndim == 1: master_mean_psf = data.reshape(int(data.shape[0]**0.5), -1)
-                    else:
-                        master_psf_basis = data[:-1]
-                        master_mean_psf = data[-1]
-                        if master_mean_psf.ndim == 1:
-                            s = int(master_mean_psf.shape[0]**0.5)
-                            master_mean_psf = master_mean_psf.reshape(s, s)
-                            master_psf_basis = master_psf_basis.reshape(-1, s, s)
-
-                if torch.is_tensor(master_mean_psf): master_mean_psf = master_mean_psf.detach().cpu().numpy()
-                S_full = master_mean_psf.shape[0]
-                if S_full > SHAPE_SIZE:
-                    O = S_full // SHAPE_SIZE
-                    master_mean_psf = master_mean_psf.reshape(SHAPE_SIZE, O, SHAPE_SIZE, O).mean(axis=(1, 3))
-                    if master_psf_basis is not None:
-                        master_psf_basis = master_psf_basis.reshape(-1, S_full, S_full)
-                        master_psf_basis = master_psf_basis.reshape(-1, SHAPE_SIZE, O, SHAPE_SIZE, O).mean(axis=(2, 4))
-                master_mean_psf /= (np.sum(master_mean_psf) + 1e-9)
-                if master_psf_basis is not None: master_psf_basis = master_psf_basis.reshape(-1, SHAPE_SIZE * SHAPE_SIZE)
-
             # --- Physical Prep ---
             stretch_scale = data_cfg.get("GLOBAL_STRETCH_SCALE", 10.0)
             img_pos = torch.clamp(image_tensor, min=0.0)
@@ -403,23 +366,23 @@ def run_infer(stage_idx, config, device, checkpoint=None):
                             true_stars_chunk.append((slot[0], (x * cell_size) + slot[1], (y * cell_size) + slot[2], float(slot[3])))
 
             # 1. Standard Prediction (Flat Prior)
-            pred_stars_flat, _, bg_map_flat = engine.predict(img_noisy, threshold=0.0, psf_basis=master_psf_basis, mean_psf=master_mean_psf)
+            pred_stars_flat, bg_map_flat = engine.predict(img_noisy, threshold=0.0)
             
             # 2. Oracle Prediction (Perfect Prior - All Stars)
-            # Use ground truth p value (s[0]) for amplitude and sigma=1.5 to match training
+            # Use ground truth p value (s[0]) for amplitude and sigma=1.0 to match training
             perfect_catalog = [(s[1], s[2], s[0]) for s in true_stars_chunk]
-            oracle_prior_map = generate_custom_inference_prior(perfect_catalog, img_size=image_tensor.shape[-1], sigma=1.5, device=device)
-            pred_stars_oracle, _, bg_map_oracle = engine.predict(img_noisy, threshold=0.0, psf_basis=master_psf_basis, mean_psf=master_mean_psf, prior_map=oracle_prior_map)
+            oracle_prior_map = generate_custom_inference_prior(perfect_catalog, img_size=image_tensor.shape[-1], sigma=1.0, device=device)
+            pred_stars_oracle, bg_map_oracle = engine.predict(img_noisy, threshold=0.0, prior_map=oracle_prior_map)
 
             # 3. Oracle Prediction (p >= 0.43)
             perfect_catalog_p43 = [(s[1], s[2], s[0]) for s in true_stars_chunk if s[0] >= 0.43]
-            oracle_prior_map_p43 = generate_custom_inference_prior(perfect_catalog_p43, img_size=image_tensor.shape[-1], sigma=1.5, device=device)
-            pred_stars_oracle_p43, _, bg_map_oracle_p43 = engine.predict(img_noisy, threshold=0.0, psf_basis=master_psf_basis, mean_psf=master_mean_psf, prior_map=oracle_prior_map_p43)
+            oracle_prior_map_p43 = generate_custom_inference_prior(perfect_catalog_p43, img_size=image_tensor.shape[-1], sigma=1.0, device=device)
+            pred_stars_oracle_p43, bg_map_oracle_p43 = engine.predict(img_noisy, threshold=0.0, prior_map=oracle_prior_map_p43)
 
             # 4. Oracle Prediction (p >= 1.0)
             perfect_catalog_p100 = [(s[1], s[2], s[0]) for s in true_stars_chunk if s[0] >= 1.0]
-            oracle_prior_map_p100 = generate_custom_inference_prior(perfect_catalog_p100, img_size=image_tensor.shape[-1], sigma=1.5, device=device)
-            pred_stars_oracle_p100, _, bg_map_oracle_p100 = engine.predict(img_noisy, threshold=0.0, psf_basis=master_psf_basis, mean_psf=master_mean_psf, prior_map=oracle_prior_map_p100)
+            oracle_prior_map_p100 = generate_custom_inference_prior(perfect_catalog_p100, img_size=image_tensor.shape[-1], sigma=1.0, device=device)
+            pred_stars_oracle_p100, bg_map_oracle_p100 = engine.predict(img_noisy, threshold=0.0, prior_map=oracle_prior_map_p100)
 
             # Aggregate with Global Offset to prevent overlap during global matching
             offset = idx * 10000.0
@@ -467,12 +430,12 @@ def run_infer(stage_idx, config, device, checkpoint=None):
                 print(f"📸 Captured Hero Sample with {len(true_stars_chunk)} stars.")
 
         # Final Global Visualizations
-        engine.visualize(hero_data_flat, global_true, global_pred_flat, threshold=0.43, output_path="inference_comparison_flat.png", mean_psf=master_mean_psf, num_chunks=num_chunks_to_infer)
+        engine.visualize(hero_data_flat, global_true, global_pred_flat, threshold=0.43, output_path="inference_comparison_flat.png", num_chunks=num_chunks_to_infer)
         
         # 🚀 NEW: Use p=0.9 threshold for informed prior visualizations
-        engine.visualize(hero_data_oracle, global_true, global_pred_oracle, threshold=0.9, output_path="inference_comparison_oracle.png", mean_psf=master_mean_psf, num_chunks=num_chunks_to_infer)
-        engine.visualize(hero_data_oracle_p43, global_true, global_pred_oracle_p43, threshold=0.9, output_path="inference_comparison_oracle_p43.png", mean_psf=master_mean_psf, num_chunks=num_chunks_to_infer)
-        engine.visualize(hero_data_oracle_p100, global_true, global_pred_oracle_p100, threshold=0.9, output_path="inference_comparison_oracle_p100.png", mean_psf=master_mean_psf, num_chunks=num_chunks_to_infer)
+        engine.visualize(hero_data_oracle, global_true, global_pred_oracle, threshold=0.9, output_path="inference_comparison_oracle.png", num_chunks=num_chunks_to_infer)
+        engine.visualize(hero_data_oracle_p43, global_true, global_pred_oracle_p43, threshold=0.9, output_path="inference_comparison_oracle_p43.png", num_chunks=num_chunks_to_infer)
+        engine.visualize(hero_data_oracle_p100, global_true, global_pred_oracle_p100, threshold=0.9, output_path="inference_comparison_oracle_p100.png", num_chunks=num_chunks_to_infer)
     else:
         print(f"⚠️ Specialized inference for stage {stage_idx} not yet implemented.")
 

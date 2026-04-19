@@ -28,6 +28,7 @@ import astropy.units as u
 import asdf
 import copy
 import gc
+from romancal.assign_wcs import AssignWcsStep
 
 def paczynski_magnification(t, t0, tE, u0):
     """ Standard Paczynski microlensing magnification formula. """
@@ -179,21 +180,43 @@ def main():
     x_sca_ref = np.random.uniform(-padding_px, mosaic_size + padding_px, n_total_stars)
     y_sca_ref = np.random.uniform(-padding_px, mosaic_size + padding_px, n_total_stars)
     
-    if master_transmission is not None:
-        star_transmissions = map_coordinates(master_transmission, [y_sca_ref + padding_px, x_sca_ref + padding_px], order=1, mode='nearest')
-        fluxes_base *= star_transmissions
-        print(f"🌫️ Applied dust extinction to {n_total_stars} stars.")
-
+    # NOTE: fluxes_base here is the ABSOLUTE base flux (no dust yet)
+    
     # Convert initial reference pixels to RA/Dec using GalSim (1-indexed for simulation)
     star_ra, star_dec = original_wcs_gs.xyToradec(x_sca_ref + 1.0, y_sca_ref + 1.0, units=galsim.degrees)
     
-    candidates = np.where((mags <= 25.0) & (x_sca_ref > 200) & (x_sca_ref < mosaic_size - 200))[0]
+    # --- 🛡️ ROBUST CANDIDATE SELECTION ---
+    # We must ensure the selected stars are on the detector according to the TEMPLATE WCS
+    # This prevents NaN issues where AssignWcsStep might return null for stars slightly out of bounds.
+    from romancal.assign_wcs import AssignWcsStep
+    template_model = template.copy()
+    template_model = AssignWcsStep.call(template_model)
+    template_gwcs = template_model.meta.wcs
+    
+    px_init, py_init = template_gwcs.world_to_pixel_values(star_ra, star_dec)
+    
+    # Select events with sufficient baseline
+    # We select stars well within the detector (500px buffer) to survive drift
+    candidates = np.where(
+        (mags <= 25.0) & 
+        (~np.isnan(px_init)) & (~np.isnan(py_init)) &
+        (px_init > 500) & (px_init < mosaic_size - 500) &
+        (py_init > 500) & (py_init < mosaic_size - 500)
+    )[0]
     event_indices = np.random.choice(candidates, min(len(candidates), args.num_events), replace=False)
     
     events = []
+    times_range = times.max() - times.min()
     for idx in event_indices:
-        tE = float(np.random.uniform(args.tE_min, args.tE_max))
-        t0 = float(np.random.uniform(times.min() + 2*tE, times.max() - 2*tE))
+        tE = float(np.random.uniform(args.tE_min, min(args.tE_max, times_range / 4.0)))
+        # Ensure t0 is far enough from edges for baseline
+        t0_min = times.min() + 1.5 * tE
+        t0_max = times.max() - 1.5 * tE
+        if t0_max <= t0_min:
+            t0 = float(np.random.uniform(times.min(), times.max()))
+        else:
+            t0 = float(np.random.uniform(t0_min, t0_max))
+            
         events.append({
             'idx': int(idx), 't0': t0, 'tE': tE, 'u0': float(np.random.uniform(0.01, 0.5)),
             'mag_base': float(mags[idx]), 'flux_base': float(fluxes_base[idx]),
@@ -214,10 +237,7 @@ def main():
             units=galsim.degrees
         )
         
-        # --- FIX 1: Copy template without breaking ASDF schema ---
         model = template.copy()
-        
-        # Overwrite pointing parameters directly (Do NOT set model.meta.wcs = None)
         ris_wcs.fill_in_parameters(
             model.meta, 
             SkyCoord(epoch_ra, epoch_dec, unit='deg', frame='icrs'), 
@@ -225,33 +245,20 @@ def main():
             pa_aper=pa_aper
         )
         
-        # --- FIX 2: Grab the native GWCS object ---
-        # Note: model.meta.wcs is the standard high-level gWCS object
-        gwcs_obj = model.meta.wcs 
+        # 2. Rebuild the GWCS object tree to reflect the new wcsinfo
+        # This guarantees 100% Roman Data Model compliance for the output .asdf
+        model = AssignWcsStep.call(model)
         
-        # --- FIX 3: Fast, 0-indexed vectorized projection ---
-        # GWCS world_to_pixel_values uses raw arrays natively and returns 0-indexed coords
+        # 3. Extract the fresh WCS object and calculate new pixel positions
+        gwcs_obj = model.meta.wcs 
         px_epoch, py_epoch = gwcs_obj.world_to_pixel_values(star_ra, star_dec)
 
+        # Start from base fluxes every epoch
         current_fluxes = fluxes_base.copy()
-        current_event_data = []
-        
-        for ev in events:
-            A = paczynski_magnification(t, ev['t0'], ev['tE'], ev['u0'])
-            current_fluxes[ev['idx']] *= A
-            
-            current_event_data.append({
-                'target_x_sca': float(px_epoch[ev['idx']]), 
-                'target_y_sca': float(py_epoch[ev['idx']]),
-                'magnification': float(A), 'true_mag': float(ev['mag_base']),
-                't0': float(ev['t0'] - times[0]), 'tE': float(ev['tE']), 'u0': float(ev['u0']),
-                'ra': float(ev['ra']), 'dec': float(ev['dec'])
-            })
-            
-        epoch_img = render_tiled(px_epoch, py_epoch, current_fluxes, mosaic_size, psf_1x, tile_size=1024)
         
         # --- 🌫️ EPOCH-SPECIFIC DUST SAMPLING ---
         if master_transmission is not None:
+            # 1. Generate full-resolution transmission map for the image
             y_indices, x_indices = np.meshgrid(np.arange(mosaic_size), np.arange(mosaic_size), indexing='ij')
             ref_x = x_indices + (padding_px + curr_drift[0])
             ref_y = y_indices + (padding_px + curr_drift[1])
@@ -259,14 +266,43 @@ def main():
             epoch_transmission = map_coordinates(master_transmission, [ref_y, ref_x], order=1, mode='nearest')
             epoch_scattering = map_coordinates(master_scattering, [ref_y, ref_x], order=1, mode='nearest')
             
+            # 2. Sample transmission at ALL star positions for this epoch
+            # Stars drift across the dust map
+            star_transmissions = map_coordinates(master_transmission, [y_sca_ref + padding_px + curr_drift[1], x_sca_ref + padding_px + curr_drift[0]], order=1, mode='nearest')
+            current_fluxes *= star_transmissions
+            
             frac_bg = 0.60
             sky_foreground = sky_level * (1.0 - frac_bg)
             sky_background_attenuated = (sky_level * frac_bg) * epoch_transmission
             epoch_sky_map = sky_foreground + sky_background_attenuated + epoch_scattering
-            epoch_img *= epoch_transmission
         else:
             epoch_sky_map = sky_level
+            star_transmissions = np.ones_like(px_epoch)
 
+        current_event_data = []
+        for ev in events:
+            A = paczynski_magnification(t, ev['t0'], ev['tE'], ev['u0'])
+            
+            # Attenuated flux BEFORE microlensing
+            ev_attenuation = star_transmissions[ev['idx']]
+            attenuated_base_flux = ev['flux_base'] * ev_attenuation
+            
+            # Apply microlensing to the already attenuated star
+            current_fluxes[ev['idx']] *= A 
+            
+            current_event_data.append({
+                'target_x_sca': float(px_epoch[ev['idx']]), 
+                'target_y_sca': float(py_epoch[ev['idx']]),
+                'magnification': float(A), 
+                'dust_attenuation': float(ev_attenuation),
+                'apparent_flux': float(attenuated_base_flux * A),
+                'true_mag': float(ev['mag_base']),
+                't0': float(ev['t0'] - times[0]), 'tE': float(ev['tE']), 'u0': float(ev['u0']),
+                'ra': float(ev['ra']), 'dec': float(ev['dec'])
+            })
+            
+        epoch_img = render_tiled(px_epoch, py_epoch, current_fluxes, mosaic_size, psf_1x, tile_size=1024)
+        
         noisy = np.random.poisson(np.maximum(0, epoch_img + epoch_sky_map)).astype(np.float32)
         noisy += np.random.normal(0, read_noise, noisy.shape)
         
@@ -288,18 +324,23 @@ def main():
         output_path = os.path.join(args.outdir, f"epoch_{i:04d}.asdf")
         model.save(output_path)
 
-        # Identify top 1000 brightest stars for verification (primarily in first epoch)
+        # Identify top 1000 brightest stars currently on the detector for verification
         bright_stars = []
-        if i == 0:
-            b_idx = np.argsort(fluxes_base)[-1000:][::-1]
-            for idx in b_idx:
+        b_idx = np.argsort(current_fluxes)[-1000:][::-1]
+        for idx in b_idx:
+            x, y = px_epoch[idx], py_epoch[idx]
+            # Only record if it's on the detector
+            if 0 <= x < mosaic_size and 0 <= y < mosaic_size:
                 bright_stars.append({
                     'ra': float(star_ra[idx]),
                     'dec': float(star_dec[idx]),
-                    'x': float(px_epoch[idx]),
-                    'y': float(py_epoch[idx]),
-                    'flux': float(fluxes_base[idx])
+                    'x': float(x),
+                    'y': float(y),
+                    'flux': float(current_fluxes[idx])
                 })
+            if len(bright_stars) >= 100: # 100 is plenty for verification
+                break
+
 
         gt = {
             'events': current_event_data, 

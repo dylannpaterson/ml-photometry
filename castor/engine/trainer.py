@@ -23,11 +23,11 @@ def find_latest_checkpoint(checkpoint_dir="checkpoints", prefix="stage0"):
                     latest_epoch, latest_file = epoch, os.path.join(checkpoint_dir, f)
     return latest_file, latest_epoch
 
-def render_confidence_prior(targets, img_size, cell_size, K, sigma=1.0):
+def render_confidence_prior(targets, img_size, cell_size, K, jitter=0.4):
     """
-    Renders a confidence prior map from target grid on-the-fly.
-    Fully vectorized to avoid CPU-to-GPU kernel launch bottlenecks.
-    targets shape: [Batch, GridH, GridW, K*7 + 1]
+    Renders a bilinear splat confidence prior map from target grid on-the-fly.
+    Channel 0: P (bilinear sum = P)
+    Fully vectorized. Handles overlapping splats via scatter_add_.
     """
     B, GH, GW, _ = targets.shape
     device = targets.device
@@ -44,13 +44,12 @@ def render_confidence_prior(targets, img_size, cell_size, K, sigma=1.0):
     dx_flat = dx_targets.reshape(B, -1)
     dy_flat = dy_targets.reshape(B, -1)
     
-    # 2. Create Global Coordinate Grid (Fast Generation)
+    # 2. Create Global Coordinate Grid
     grid_y, grid_x = torch.meshgrid(
         torch.arange(GH, device=device), 
         torch.arange(GW, device=device), 
         indexing='ij'
     )
-    # Expand to match K capacities and flatten
     grid_y = grid_y.unsqueeze(-1).expand(-1, -1, K).reshape(-1)
     grid_x = grid_x.unsqueeze(-1).expand(-1, -1, K).reshape(-1)
     
@@ -58,76 +57,68 @@ def render_confidence_prior(targets, img_size, cell_size, K, sigma=1.0):
     center_x = grid_x.unsqueeze(0) * cell_size + dx_flat
     center_y = grid_y.unsqueeze(0) * cell_size + dy_flat
     
-    # Filter active stars to avoid computing blank cells
-    mask = p_flat > 0.1
+    # Filter active stars (p > dropout threshold)
+    mask = p_flat > 0.05
     batch_idx, star_idx = torch.where(mask)
     
-    active_cx = center_x[batch_idx, star_idx]
-    active_cy = center_y[batch_idx, star_idx]
-    active_p  = p_flat[batch_idx, star_idx]
+    all_cx = center_x[batch_idx, star_idx]
+    all_cy = center_y[batch_idx, star_idx]
+    all_p  = p_flat[batch_idx, star_idx]
     
     # --- INJECT POISON (False Positives) ---
-    # Vectorized random generation for the whole batch
     num_poison = 5
     poison_batch_idx = torch.arange(B, device=device).view(-1, 1).expand(-1, num_poison).reshape(-1)
-    poison_cx = torch.rand((B * num_poison,), device=device) * img_size
-    poison_cy = torch.rand((B * num_poison,), device=device) * img_size
+    poison_cx = torch.rand((B * num_poison,), device=device) * (img_size - 1)
+    poison_cy = torch.rand((B * num_poison,), device=device) * (img_size - 1)
     poison_p = torch.empty((B * num_poison,), device=device).uniform_(0.5, 0.95)
     
-    # Combine true targets and poison
+    # Combine
     all_batch_idx = torch.cat([batch_idx, poison_batch_idx])
-    all_cx = torch.cat([active_cx, poison_cx])
-    all_cy = torch.cat([active_cy, poison_cy])
-    all_p = torch.cat([active_p, poison_p])
+    all_cx = torch.cat([all_cx, poison_cx])
+    all_cy = torch.cat([all_cy, poison_cy])
+    all_p = torch.cat([all_p, poison_p])
     
-    # Initialize the batch prior map
-    prior_map = torch.zeros((B, 1, img_size, img_size), device=device)
+    # --- 3. BILINEAR SPLATTING ---
+    # Apply Jitter (with 10% dropout to teach the network perfect alignment)
+    if jitter > 0:
+        jitter_mask = torch.rand_like(all_cx) < 0.9
+        all_cx = all_cx + torch.randn_like(all_cx) * jitter * jitter_mask
+        all_cy = all_cy + torch.randn_like(all_cy) * jitter * jitter_mask
+
+    # Anchors and sub-pixel remainders
+    # We must ensure anchors are in [0, img_size-2] for 2x2 splat
+    all_cx = torch.clamp(all_cx, 0, img_size - 1.001)
+    all_cy = torch.clamp(all_cy, 0, img_size - 1.001)
     
-    if len(all_cx) > 0:
-        # 3. Parallelized Bounding Box Construction
-        r = int(5 * sigma)
-        patch_size = 2 * r + 1
-        
-        local_coords = torch.arange(-r, r + 1, device=device)
-        local_y, local_x = torch.meshgrid(local_coords, local_coords, indexing='ij')
-        
-        # Snap center to integer to anchor the patch window (prevents grid snapping errors)
-        cx_int = all_cx.round().long()
-        cy_int = all_cy.round().long()
-        
-        # Grid coordinates for all patches [N, patch_size, patch_size]
-        patch_y = cy_int.view(-1, 1, 1) + local_y.view(1, patch_size, patch_size)
-        patch_x = cx_int.view(-1, 1, 1) + local_x.view(1, patch_size, patch_size)
-        
-        # 4. Exact Sub-Pixel Distance Computation 
-        # Calculate true distance from the floating-point center to maintain precision
-        dist_sq = (patch_x.float() - all_cx.view(-1, 1, 1))**2 + \
-                  (patch_y.float() - all_cy.view(-1, 1, 1))**2
-                  
-        patches = all_p.view(-1, 1, 1) * torch.exp(-dist_sq / (2 * sigma**2))
-        
-        # Mask out-of-bounds pixels naturally
-        valid_mask = (patch_x >= 0) & (patch_x < img_size) & (patch_y >= 0) & (patch_y < img_size)
-        
-        # Extract only the valid pixels mapping to the image
-        valid_b = all_batch_idx.view(-1, 1, 1).expand(-1, patch_size, patch_size)[valid_mask]
-        valid_y = patch_y[valid_mask]
-        valid_x = patch_x[valid_mask]
-        valid_patches = patches[valid_mask]
-        
-        # 5. Fast Scatter Reduction
-        # Flattened 1D target indices for the entire batch mapping
-        flat_indices = valid_b * (img_size * img_size) + valid_y * img_size + valid_x
-        prior_flat = prior_map.view(-1)
-        
-        # Scatter the patches in parallel. `amax` takes the max value where patches overlap.
-        # Note: scatter_reduce_ is natively supported in PyTorch >= 1.12
-        prior_flat.scatter_reduce_(0, flat_indices, valid_patches, reduce="amax", include_self=True)
-        
-        # Reshape back to BxCxHxW
-        prior_map = prior_flat.view(B, 1, img_size, img_size)
-        
-    return prior_map
+    x0 = torch.floor(all_cx).long()
+    y0 = torch.floor(all_cy).long()
+    dx = all_cx - x0.float()
+    dy = all_cy - y0.float()
+    
+    # Bilinear weights scaled by P
+    w00 = (1 - dx) * (1 - dy) * all_p
+    w10 = dx * (1 - dy) * all_p
+    w01 = (1 - dx) * dy * all_p
+    w11 = dx * dy * all_p
+    
+    # Flattened indices for 4 corners
+    img_stride = img_size
+    batch_stride = img_size * img_size
+    
+    idx00 = all_batch_idx * batch_stride + y0 * img_stride + x0
+    idx10 = idx00 + 1
+    idx01 = idx00 + img_stride
+    idx11 = idx01 + 1
+    
+    prior_flat = torch.zeros(B * batch_stride, device=device)
+    
+    # Scatter add handles overlapping stars naturally
+    prior_flat.scatter_add_(0, idx00, w00)
+    prior_flat.scatter_add_(0, idx10, w10)
+    prior_flat.scatter_add_(0, idx01, w01)
+    prior_flat.scatter_add_(0, idx11, w11)
+    
+    return prior_flat.view(B, 1, img_size, img_size)
 
 class Trainer:
     def __init__(self, model, train_loader, val_loader, config, device, epochs=100, lr=0.0001, checkpoint_prefix="stage0"):
@@ -135,25 +126,12 @@ class Trainer:
         self.config, self.device, self.checkpoint_prefix = config, device, checkpoint_prefix
         self.epochs, self.lr = epochs, lr
         
-        # 1. AdamW Optimizer
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=1e-4)
-        
-        # 2. OneCycleLR Scheduler
-        self.scheduler = optim.lr_scheduler.OneCycleLR(
-            self.optimizer,
-            max_lr=self.lr * 3.0,
-            steps_per_epoch=len(self.train_loader),
-            epochs=self.epochs,
-            pct_start=0.1, # 10% warmup
-            div_factor=25.0,
-            final_div_factor=10000.0
-        )
-        
-        self.start_epoch = 0
-        
-        # FIX: Only use GradScaler on CUDA. CPU GradScaler is generally unnecessary and adds overhead.
         self.use_cuda = self.device.type == 'cuda'
         self.scaler = torch.amp.GradScaler('cuda') if self.use_cuda else None
+        self.start_epoch = 0
+
+        # 1. AdamW Optimizer
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=1e-4)
         
         # NEW: Memory-Aware Dynamic Batch Scaling
         self.target_batch_size = config.get("training_params", {}).get("BATCH_SIZE", 32)
@@ -177,6 +155,20 @@ class Trainer:
             self.accumulation_steps = max(1, self.target_batch_size // self.micro_batch_size)
             
             print(f"📟 GPU Memory Detected: {vram_gb:.1f}GB | Scaling Micro-batch: {self.micro_batch_size} | Accumulation: {self.accumulation_steps}")
+
+        # 2. OneCycleLR Scheduler
+        # FIX: Calculate actual steps the scheduler will see per epoch due to accumulation
+        actual_steps_per_epoch = (len(self.train_loader) + self.accumulation_steps - 1) // self.accumulation_steps
+        
+        self.scheduler = optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=self.lr * 2.0,
+            steps_per_epoch=actual_steps_per_epoch,
+            epochs=self.epochs,
+            pct_start=0.1, # 10% warmup
+            div_factor=25.0,
+            final_div_factor=10000.0
+        )
 
         # FIX: Extract loss parameters from root of config instead of data_params
         self.loss_params = config.get("loss_params", {}).copy()
@@ -250,9 +242,9 @@ class Trainer:
                     partial_targets = targets.clone()
                     st_view = partial_targets[..., :-1].view(B, GH, GW, K, num_params)
                     st_view[~prior_mask] = 0.0
-                    st_view[..., 1:3] += torch.randn_like(st_view[..., 1:3]) * 0.4
                     
-                    prior_map = render_confidence_prior(partial_targets, img_size, cell_size, K)
+                    # Render bilinear splat prior map (1 channel)
+                    prior_map = render_confidence_prior(partial_targets, img_size, cell_size, K, jitter=0.4)
 
                 # 15% chance to drop the entire prior map
                 if torch.rand(1).item() < 0.15:
@@ -380,6 +372,7 @@ class Trainer:
                     batch_medians = images_noisy.view(images_noisy.shape[0], -1).median(dim=1)[0].view(-1, 1, 1, 1)
                 images_final = torch.asinh((images_noisy - batch_medians) / self.loss_params["stretch_scale"])
                 
+                # Use 1-channel zero prior
                 prior_zeros = torch.zeros_like(images_final)
 
                 if self.use_cuda:
