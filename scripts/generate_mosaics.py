@@ -1,3 +1,10 @@
+"""
+Mosaic generation script for the Castor pipeline.
+
+This script acts as a wrapper for generating simulated astronomical mosaics 
+using parameters defined in the curriculum configuration.
+"""
+
 import argparse
 import os
 import torch
@@ -8,6 +15,9 @@ from castor.cloud.config_utils import load_config
 from castor.constants import SHAPE_SIZE
 
 def main():
+    """
+    Main entry point for mosaic generation.
+    """
     parser = argparse.ArgumentParser(description="Thin wrapper for Mosaic Generation")
     parser.add_argument("--config", default="config/config.yaml")
     parser.add_argument("--stage", type=int, default=0)

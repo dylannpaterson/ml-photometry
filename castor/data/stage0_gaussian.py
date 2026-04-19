@@ -17,8 +17,22 @@ if 'STPSF_PATH' not in os.environ:
 
 def generate_stpsf_roman_psf(grid_size=129, oversample=4):
     """
-    Generates a realistic Roman PSF on the fly using the stpsf (Space Telescope PSF) tool.
-    Randomizes the detector (SCA) and position for variety.
+    Generates a realistic Roman PSF on the fly using the stpsf tool.
+
+    Randomizes the detector (SCA) and position for variety. Falls back to 
+    an analytical model if stpsf is not available.
+
+    Parameters
+    ----------
+    grid_size : int, optional
+        The number of detector pixels for the PSF FOV, by default 129.
+    oversample : int, optional
+        The oversampling factor for the PSF calculation, by default 4.
+
+    Returns
+    -------
+    numpy.ndarray
+        The generated PSF data, normalized to sum to 1.
     """
     try:
         import stpsf
@@ -58,7 +72,21 @@ def generate_stpsf_roman_psf(grid_size=129, oversample=4):
     return psf_data / (psf_data.sum() + 1e-9)
 
 def _generate_fallback_psf(grid_size, oversample):
-    """Simplified Roman-like PSF with core and diffraction spikes."""
+    """
+    Simplified Roman-like PSF with core and diffraction spikes.
+
+    Parameters
+    ----------
+    grid_size : int
+        The size of the grid in detector pixels.
+    oversample : int
+        The oversampling factor.
+
+    Returns
+    -------
+    numpy.ndarray
+        The generated fallback PSF data.
+    """
     S = grid_size * oversample
     center = (S - 1) / 2.0
     y, x = np.meshgrid(np.arange(S) - center, np.arange(S) - center, indexing='ij')
@@ -79,7 +107,35 @@ def _generate_fallback_psf(grid_size, oversample):
     return psf / (psf.sum() + 1e-9)
 
 def fast_paint_grid(lx, ly, fluxes, snrs, sort_idx, min_snr, grid_size, cell_size, K):
-    """Highly optimized target grid painter."""
+    """
+    Highly optimized target grid painter.
+
+    Parameters
+    ----------
+    lx : numpy.ndarray
+        Local x coordinates within cells.
+    ly : numpy.ndarray
+        Local y coordinates within cells.
+    fluxes : numpy.ndarray
+        Star fluxes.
+    snrs : numpy.ndarray
+        Signal-to-noise ratios.
+    sort_idx : numpy.ndarray
+        Indices for sorting stars.
+    min_snr : float
+        Minimum SNR threshold (currently not used directly in logic but passed).
+    grid_size : int
+        Size of the target grid.
+    cell_size : int
+        Size of each grid cell.
+    K : int
+        Maximum number of stars per cell.
+
+    Returns
+    -------
+    numpy.ndarray
+        The painted grid of shape [grid_size, grid_size, K, 5].
+    """
     grid_stars = np.zeros((grid_size, grid_size, K, 5), dtype=np.float32)
     counts = np.zeros((grid_size, grid_size), dtype=np.int32)
 
@@ -111,8 +167,33 @@ def fast_paint_grid(lx, ly, fluxes, snrs, sort_idx, min_snr, grid_size, cell_siz
                 counts[cy, cx] += 1
 
     return grid_stars
+
 def sample_bulge_magnitudes(n_total, rc_mag, rc_sigma, rc_enhancement=3.0, m_min=12.0, m_max=32.0, gamma=0.3):
-    """Samples from a power-law luminosity function with Red Clump enhancement."""
+    """
+    Samples from a power-law luminosity function with Red Clump enhancement.
+
+    Parameters
+    ----------
+    n_total : int
+        Total number of stars to sample.
+    rc_mag : float
+        Magnitude of the Red Clump.
+    rc_sigma : float
+        Sigma for the Red Clump Gaussian enhancement.
+    rc_enhancement : float, optional
+        Enhancement factor for Red Clump stars, by default 3.0.
+    m_min : float, optional
+        Minimum magnitude, by default 12.0.
+    m_max : float, optional
+        Maximum magnitude, by default 32.0.
+    gamma : float, optional
+        Power-law index, by default 0.3.
+
+    Returns
+    -------
+    numpy.ndarray
+        The sampled magnitudes.
+    """
     u = np.random.uniform(0, 1, n_total)
     a = 10**(gamma * m_min)
     b = 10**(gamma * m_max)
@@ -132,6 +213,29 @@ def sample_bulge_magnitudes(n_total, rc_mag, rc_sigma, rc_enhancement=3.0, m_min
     return m_all
 
 def calculate_safe_magnitude_cutoff(exp_time, zp, sky_mag, read_noise=5.0, sigma=1.5, snr_cutoff=1.0):
+    """
+    Calculate the magnitude cutoff for a given SNR.
+
+    Parameters
+    ----------
+    exp_time : float
+        Exposure time in seconds.
+    zp : float
+        Zero point magnitude.
+    sky_mag : float
+        Sky brightness in mag/arcsec^2.
+    read_noise : float, optional
+        Read noise in electrons, by default 5.0.
+    sigma : float, optional
+        Gaussian sigma for PSF, by default 1.5.
+    snr_cutoff : float, optional
+        SNR threshold for the cutoff, by default 1.0.
+
+    Returns
+    -------
+    float
+        The calculated magnitude cutoff.
+    """
     pixel_scale = 0.11
     sky_level = (10 ** (-0.4 * (sky_mag - zp))) * (pixel_scale**2) * exp_time
     n_pix = 12.0 
@@ -141,7 +245,23 @@ def calculate_safe_magnitude_cutoff(exp_time, zp, sky_mag, read_noise=5.0, sigma
     return zp - 2.5 * np.log10(min_flux / exp_time)
 
 def generate_dust_cirrus(img_size, amplitude, exponent=None):
-    """Generates fractal dust noise with randomized power spectrum P(k) ~ k^-beta."""
+    """
+    Generates fractal dust noise with randomized power spectrum P(k) ~ k^-beta.
+
+    Parameters
+    ----------
+    img_size : int
+        The size of the square image.
+    amplitude : float
+        The maximum amplitude of the dust map.
+    exponent : float, optional
+        The power-law exponent (beta). If None, randomized between 2.5 and 4.0.
+
+    Returns
+    -------
+    numpy.ndarray
+        The generated dust map.
+    """
     fx = np.fft.fftfreq(img_size)
     fy = np.fft.fftfreq(img_size)
     kx, ky = np.meshgrid(fx, fy)
@@ -168,8 +288,22 @@ def generate_dust_cirrus(img_size, amplitude, exponent=None):
 
 def generate_mosaic_data(mosaic_size, params):
     """
-    Simplified Stage 0 Engine: Uses a random Roman PSF generated on the fly.
-    Employs bi-linear interpolation for sub-pixel placement.
+    Generates a full mosaic simulation including stars, dust, and sky.
+
+    This function uses a random Roman PSF, power-law luminosity function, 
+    fractal dust extinction, and additive sky noise.
+
+    Parameters
+    ----------
+    mosaic_size : int
+        The size of the output mosaic image.
+    params : dict
+        Parameters for the simulation (e.g., 'image_size', 'min_stars', 'max_stars').
+
+    Returns
+    -------
+    tuple
+        A tuple (full_image, truth_bg_map, structured_cat, meta, psf_1x).
     """
     area_ratio = (mosaic_size / params['image_size'])**2
     exp_time, zp, sky_mag = np.random.uniform(30.0, 90.0), 26.5, 22.0
@@ -274,7 +408,40 @@ def generate_mosaic_data(mosaic_size, params):
     return full_image, truth_bg_map, structured_cat, meta, psf_1x
 
 class HDF5MosaicDataset(Dataset):
+    """
+    PyTorch Dataset for reading simulated mosaics from an HDF5 file.
+
+    Attributes
+    ----------
+    h5_path : str
+        Path to the HDF5 file.
+    file : h5py.File
+        HDF5 file handle.
+    img_size : int
+        Size of the square images.
+    cell_size : int
+        Size of each grid cell.
+    grid_size : int
+        Number of cells along one dimension.
+    K : int
+        Maximum number of stars per cell.
+    transform : AstroSpaceTransform
+        Transform for data augmentation/normalization.
+    length : int
+        Total number of samples in the dataset.
+    """
+
     def __init__(self, h5_path, image_size=256):
+        """
+        Initialize the HDF5MosaicDataset.
+
+        Parameters
+        ----------
+        h5_path : str
+            Path to the HDF5 file.
+        image_size : int, optional
+            Size of the square images, by default 256.
+        """
         self.h5_path, self.file, self.img_size = h5_path, None, image_size
         self.cell_size, self.grid_size, self.K = DEFAULT_CELL_SIZE, image_size // DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL
         self.transform = AstroSpaceTransform(stretch_scale=GLOBAL_STRETCH_SCALE)
@@ -283,9 +450,31 @@ class HDF5MosaicDataset(Dataset):
         with h5py.File(self.h5_path, 'r') as f:
             self.length = len(f['images'])
 
-    def __len__(self): return self.length
+    def __len__(self):
+        """
+        Get the total number of samples.
+
+        Returns
+        -------
+        int
+            Number of samples.
+        """
+        return self.length
 
     def __getitem__(self, idx):
+        """
+        Get a single sample by index.
+
+        Parameters
+        ----------
+        idx : int
+            Sample index.
+
+        Returns
+        -------
+        dict
+            A dictionary containing 'image', 'target', 'chunk_median', and 'meta'.
+        """
         if self.file is None: self.file = h5py.File(self.h5_path, 'r', swmr=True, libver='latest')
         img = torch.from_numpy(self.file['images'][idx]).float()
         target = torch.from_numpy(self.file['targets'][idx]).float()

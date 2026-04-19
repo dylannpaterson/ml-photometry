@@ -5,7 +5,39 @@ from castor.engine.evaluator import match_stars
 from castor.data.transforms import AstroSpaceTransform
 
 class ThresholdAnalyzer:
+    """
+    Analyzes the sensitivity of the model to different probability thresholds.
+
+    This tool helps in selecting the optimal threshold for star detection 
+    by evaluating precision and recall across a range of values.
+
+    Attributes
+    ----------
+    model : torch.nn.Module
+        The neural network model.
+    device : torch.device
+        The device to run inference on.
+    dataset : Dataset
+        The dataset used for analysis.
+    stretch_scale : float
+        The scale used for arcsinh flux stretching.
+    transform : AstroSpaceTransform
+        The transform used for image preprocessing.
+    """
+
     def __init__(self, model, device, dataset):
+        """
+        Initialize the ThresholdAnalyzer.
+
+        Parameters
+        ----------
+        model : torch.nn.Module
+            The trained model.
+        device : torch.device
+            The device to use.
+        dataset : Dataset
+            The dataset to sample chunks from.
+        """
         self.model = model
         self.device = device
         self.dataset = dataset
@@ -13,6 +45,21 @@ class ThresholdAnalyzer:
         self.transform = dataset.transform
 
     def run_analysis(self, num_chunks=20, output_path="threshold_analysis.png"):
+        """
+        Runs the threshold sensitivity analysis.
+
+        Parameters
+        ----------
+        num_chunks : int, optional
+            Number of image chunks to evaluate, by default 20.
+        output_path : str, optional
+            Path to save the resulting plots, by default "threshold_analysis.png".
+
+        Returns
+-------
+        numpy.ndarray
+            A 2D array of results: [threshold, precision, recall, fp_count, fn_count].
+        """
         self.model.eval()
         
         thresholds = np.linspace(0.01, 0.99, 50)
@@ -100,6 +147,7 @@ class ThresholdAnalyzer:
         return results
 
     def _print_p_summary(self, obj_p, bg_p):
+        """Prints a distribution summary of the probability scores."""
         obj_p = np.array(obj_p)
         bg_p = np.array(bg_p)
         
@@ -120,6 +168,7 @@ class ThresholdAnalyzer:
         print("-" * 50)
 
     def _plot_results(self, results, num_chunks, output_path):
+        """Generates diagnostic plots for the threshold analysis."""
         t = results[:, 0]
         prec = results[:, 1]
         rec = results[:, 2]

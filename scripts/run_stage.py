@@ -1,3 +1,10 @@
+"""
+Roman Point Source Curriculum Runner script.
+
+This script manages the execution of different stages in the point source 
+analysis curriculum, supporting training, evaluation, inference, and analysis.
+"""
+
 import argparse
 import torch
 import numpy as np
@@ -15,7 +22,21 @@ from torch.utils.data import DataLoader
 from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE
 
 def get_stage_config(config, stage_idx):
-    """Extracts configuration for a specific curriculum stage."""
+    """
+    Extracts configuration for a specific curriculum stage.
+
+    Parameters
+    ----------
+    config : dict
+        The full configuration dictionary.
+    stage_idx : int
+        The curriculum stage index.
+
+    Returns
+    -------
+    dict
+        The configuration for the specified stage.
+    """
     curriculum = config.get("curriculum", {})
     stage_key = f"stage{stage_idx}"
     if stage_key not in curriculum:
@@ -24,6 +45,26 @@ def get_stage_config(config, stage_idx):
     return curriculum[stage_key]
 
 def load_stage_model(stage_idx, device, config, checkpoint_path=None):
+    """
+    Loads a model for a specific curriculum stage from a checkpoint.
+
+    Parameters
+    ----------
+    stage_idx : int
+        The curriculum stage index.
+    device : torch.device
+        The device to load the model onto.
+    config : dict
+        The full configuration dictionary.
+    checkpoint_path : str, optional
+        Path to a specific checkpoint. If None, it uses the default final 
+        checkpoint for the stage.
+
+    Returns
+    -------
+    tuple
+        A tuple (model, psf_library) if successful, else (None, None).
+    """
     if checkpoint_path is None:
         checkpoint_path = f"checkpoints/stage{stage_idx}_final.pth"
         
@@ -60,7 +101,23 @@ def load_stage_model(stage_idx, device, config, checkpoint_path=None):
     return model, psf_library
 
 def ensure_stage0_data(stage_cfg, data_cfg, config_path):
-    """Checks for HDF5 data and generates a small amount if missing."""
+    """
+    Checks for HDF5 data and generates a small amount if missing.
+
+    Parameters
+    ----------
+    stage_cfg : dict
+        Configuration for the current stage.
+    data_cfg : dict
+        Data-specific configuration.
+    config_path : str
+        Path to the configuration file for sub-script execution.
+
+    Returns
+    -------
+    bool
+        True if data is available or successfully generated, False otherwise.
+    """
     train_mos_dir = os.path.join(stage_cfg["data_dir"], "mosaics_train")
     val_mos_dir = os.path.join(stage_cfg["data_dir"], "mosaics_val")
     val_h5 = os.path.join(stage_cfg["data_dir"], "stage0_val.h5")
@@ -88,7 +145,21 @@ def ensure_stage0_data(stage_cfg, data_cfg, config_path):
     return True
 
 def get_safe_batch_size(target_batch_size, device):
-    """Detects VRAM and scales batch size to avoid OOM, return (micro_batch, accumulation_steps)."""
+    """
+    Detects VRAM and scales batch size to avoid OOM.
+
+    Parameters
+    ----------
+    target_batch_size : int
+        The desired batch size from the configuration.
+    device : torch.device
+        The device being used for training.
+
+    Returns
+    -------
+    tuple
+        A tuple (micro_batch, accumulation_steps).
+    """
     if device.type != 'cuda':
         return target_batch_size, 1
 
@@ -106,7 +177,20 @@ def get_safe_batch_size(target_batch_size, device):
     micro_batch = min(micro_batch, target_batch_size)
     acc_steps = max(1, target_batch_size // micro_batch)
     return micro_batch, acc_steps
+
 def run_train(stage_idx, config, device):
+    """
+    Runs the training process for a specified stage.
+
+    Parameters
+    ----------
+    stage_idx : int
+        The curriculum stage index.
+    config : dict
+        The full configuration dictionary.
+    device : torch.device
+        The device to run training on.
+    """
     print(f"--- 🚀 Curriculum Stage {stage_idx}: Training ---")
     stage_key = f"stage{stage_idx}"
     stage_cfg = config["curriculum"].get(stage_key, {})
@@ -282,6 +366,20 @@ def run_train(stage_idx, config, device):
     print(f"✅ Stage {stage_idx} complete.")
 
 def run_eval(stage_idx, config, device, checkpoint=None):
+    """
+    Runs the evaluation process for a specified stage.
+
+    Parameters
+    ----------
+    stage_idx : int
+        The curriculum stage index.
+    config : dict
+        The full configuration dictionary.
+    device : torch.device
+        The device to run evaluation on.
+    checkpoint : str, optional
+        Path to a specific model checkpoint.
+    """
     print(f"--- 📊 Curriculum Stage {stage_idx}: Evaluation ---")
     model, _ = load_stage_model(stage_idx, device, config, checkpoint)
     if not model: return
@@ -301,6 +399,20 @@ def run_eval(stage_idx, config, device, checkpoint=None):
         print(f"⚠️ Specialized evaluator for stage {stage_idx} not yet implemented.")
 
 def run_infer(stage_idx, config, device, checkpoint=None):
+    """
+    Runs the inference process for a specified stage.
+
+    Parameters
+    ----------
+    stage_idx : int
+        The curriculum stage index.
+    config : dict
+        The full configuration dictionary.
+    device : torch.device
+        The device to run inference on.
+    checkpoint : str, optional
+        Path to a specific model checkpoint.
+    """
     from castor.engine.evaluator import match_stars
     from castor.engine.inference import InferenceEngine, generate_custom_inference_prior
     import random
@@ -440,6 +552,20 @@ def run_infer(stage_idx, config, device, checkpoint=None):
         print(f"⚠️ Specialized inference for stage {stage_idx} not yet implemented.")
 
 def run_analyze(stage_idx, config, device, checkpoint=None):
+    """
+    Runs the threshold analysis process for a specified stage.
+
+    Parameters
+    ----------
+    stage_idx : int
+        The curriculum stage index.
+    config : dict
+        The full configuration dictionary.
+    device : torch.device
+        The device to run analysis on.
+    checkpoint : str, optional
+        Path to a specific model checkpoint.
+    """
     print(f"--- 📈 Curriculum Stage {stage_idx}: Threshold Analysis ---")
     model, _ = load_stage_model(stage_idx, device, config, checkpoint)
     if not model: return
@@ -463,6 +589,9 @@ def run_analyze(stage_idx, config, device, checkpoint=None):
         print(f"⚠️ Specialized analysis for stage {stage_idx} not yet implemented.")
 
 def main():
+    """
+    Main entry point for the Roman Point Source Curriculum Runner.
+    """
     parser = argparse.ArgumentParser(description="Roman Point Source Curriculum Runner")
     parser.add_argument("stage", type=int, help="Curriculum stage index")
     parser.add_argument("action", choices=["train", "eval", "infer", "analyze"], help="Action to perform")

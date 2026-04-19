@@ -7,12 +7,46 @@ import os
 from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE
 
 class CoordConv(nn.Module):
-    """Adds normalized (x, y) coordinate channels to the input."""
+    """
+    Adds normalized (x, y) coordinate channels to the input.
+
+    Attributes
+    ----------
+    conv : nn.Conv2d
+        The convolutional layer applied after concatenating coordinates.
+    """
     def __init__(self, in_channels, out_channels, kernel_size=1, padding=0):
+        """
+        Initialize CoordConv.
+
+        Parameters
+        ----------
+        in_channels : int
+            Number of input channels.
+        out_channels : int
+            Number of output channels.
+        kernel_size : int, optional
+            Size of the convolution kernel, by default 1.
+        padding : int, optional
+            Padding for the convolution, by default 0.
+        """
         super(CoordConv, self).__init__()
         self.conv = nn.Conv2d(in_channels + 2, out_channels, kernel_size=kernel_size, padding=padding)
 
     def forward(self, x):
+        """
+        Forward pass.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor of shape [B, C, H, W].
+
+        Returns
+        -------
+        torch.Tensor
+            Output tensor with coordinate channels concatenated and convolved.
+        """
         batch_size, _, h, w = x.size()
         xx = torch.arange(w).view(1, 1, 1, w).expand(batch_size, 1, h, w).float() / (w - 1)
         yy = torch.arange(h).view(1, 1, h, 1).expand(batch_size, 1, h, w).float() / (h - 1)
@@ -22,21 +56,77 @@ class CoordConv(nn.Module):
         return self.conv(x)
 
 class FPNBlock(nn.Module):
+    """
+    Feature Pyramid Network (FPN) block for merging high and low res features.
+
+    Attributes
+    ----------
+    lateral : nn.Conv2d
+        Lateral convolution for high-resolution features.
+    up : nn.Upsample
+        Upsampling layer for low-resolution features.
+    smooth : nn.Conv2d
+        Smoothing convolution applied to the merged features.
+    """
     def __init__(self, high_res_in, low_res_in, out_channels):
+        """
+        Initialize FPNBlock.
+
+        Parameters
+        ----------
+        high_res_in : int
+            Number of channels in high-resolution input.
+        low_res_in : int
+            Number of channels in low-resolution input.
+        out_channels : int
+            Number of channels in the output.
+        """
         super(FPNBlock, self).__init__()
         self.lateral = nn.Conv2d(high_res_in, out_channels, kernel_size=1)
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         self.smooth = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
 
     def forward(self, high_res, low_res):
+        """
+        Forward pass.
+
+        Parameters
+        ----------
+        high_res : torch.Tensor
+            High-resolution feature map.
+        low_res : torch.Tensor
+            Low-resolution feature map from a deeper layer.
+
+        Returns
+        -------
+        torch.Tensor
+            The merged and smoothed feature map.
+        """
         # low_res comes from deeper in the network, needs upsampling
         return self.smooth(self.lateral(high_res) + self.up(low_res))
 
 class DiffractionAwareFilter(nn.Module):
     """
-    Simple Mexican Hat (Laplacian of Gaussian) filter for diffraction-aware preprocessing.
+    Mexican Hat (Laplacian of Gaussian) filter for diffraction-aware preprocessing.
+
+    Attributes
+    ----------
+    conv : nn.Conv2d
+        The convolutional layer with the LoG kernel.
+    init_weight : torch.Tensor
+        The initial analytical LoG kernel preserved for regularization.
     """
     def __init__(self, kernel_size=21, sigma=3.0):
+        """
+        Initialize DiffractionAwareFilter.
+
+        Parameters
+        ----------
+        kernel_size : int, optional
+            Size of the filter kernel, by default 21.
+        sigma : float, optional
+            Gaussian sigma for the Mexican Hat, by default 3.0.
+        """
         super(DiffractionAwareFilter, self).__init__()
 
         # 1 in channel (raw flux), 1 out channel (filter response)
@@ -56,7 +146,7 @@ class DiffractionAwareFilter(nn.Module):
         self.conv.weight.requires_grad = True
 
     def _generate_mexican_hat(self, kernel_size, sigma):
-        # Generate the 2D Mexican Hat (Laplacian of Gaussian) kernel
+        """Generates the 2D Mexican Hat (Laplacian of Gaussian) kernel."""
         device = self.conv.weight.device
         grid = torch.arange(-kernel_size // 2 + 1., kernel_size // 2 + 1., device=device, dtype=torch.float32)
         y, x = torch.meshgrid(grid, grid, indexing='ij')
@@ -70,17 +160,75 @@ class DiffractionAwareFilter(nn.Module):
     def get_regularization_loss(self):
         """
         Calculates the L2 distance from the initial LoG kernel.
-        This prevents the filter from drifting into a random conv layer.
+
+        This prevents the filter from drifting into a random conv layer 
+        during training.
+
+        Returns
+        -------
+        torch.Tensor
+            The L2 regularization loss value.
         """
         return torch.sum((self.conv.weight - self.init_weight) ** 2)
 
     def forward(self, x):
+        """
+        Forward pass.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Raw input image tensor [B, 1, H, W].
+
+        Returns
+        -------
+        torch.Tensor
+            Concatenated original image and filtered response [B, 2, H, W].
+        """
         # Concatenate the original raw image with the filtered response
         # Output shape: [Batch, 2, H, W]
         return torch.cat([x, self.conv(x)], dim=1)
 
 class DenseGridModel(nn.Module):
+    """
+    The main Castor neural network model using a dense grid output.
+
+    Attributes
+    ----------
+    K : int
+        Maximum number of stars per grid cell.
+    cell_size : float
+        The size of each grid cell in pixels.
+    stretch_scale : float
+        The scale used for arcsinh flux stretching.
+    num_output_channels : int
+        Total number of output channels in the prediction head.
+    diffraction_filter : DiffractionAwareFilter
+        Initial physics-aware filtering layer.
+    initial, layer1, layer2, layer3, layer4 : nn.Module
+        ResNet backbone components.
+    top_layer, fpn3, fpn2, fpn1 : nn.Module
+        FPN neck components.
+    head : nn.Sequential
+        Prediction head with CoordConv.
+    log_task_vars : nn.Parameter
+        Learnable parameters for homoscedastic task uncertainty.
+    """
     def __init__(self, K=MAX_CAPACITY_PER_CELL, shape_size=SHAPE_SIZE, cell_size=DEFAULT_CELL_SIZE, stretch_scale=GLOBAL_STRETCH_SCALE):
+        """
+        Initialize DenseGridModel.
+
+        Parameters
+        ----------
+        K : int, optional
+            Stars per cell, by default MAX_CAPACITY_PER_CELL.
+        shape_size : int, optional
+            Size of input image (not used directly in init), by default SHAPE_SIZE.
+        cell_size : int, optional
+            Size of each cell, by default DEFAULT_CELL_SIZE.
+        stretch_scale : float, optional
+            Flux stretch scale, by default GLOBAL_STRETCH_SCALE.
+        """
         super(DenseGridModel, self).__init__()
         self.K = K
         # Output per slot: [p, dx, dy, asinh_flux, log_var_x, log_var_y, log_var_f] = 7 channels
@@ -124,10 +272,20 @@ class DenseGridModel(nn.Module):
 
     def forward(self, x, prior=None):
         """
-        Args:
-            x: Raw input image (B, 1, H, W)
-            prior: Confidence map (B, 1, H, W), values [0, 1]. 
-                  If None, a zero prior is used.
+        Forward pass.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Raw input image of shape [B, 1, H, W].
+        prior : torch.Tensor, optional
+            Confidence map of shape [B, 1, H, W], values in [0, 1].
+            If None, a zero prior is used.
+
+        Returns
+        -------
+        dict
+            Dictionary containing predicted stars, background, and uncertainty.
         """
         # Bottom-up
         # 1. Pass through trainable physics prior (Outputs 2 channels: Raw, Filtered)
@@ -206,6 +364,24 @@ class DenseGridModel(nn.Module):
 def compute_nll_loss(pred, target, log_var, beta=0.5, weights=None):
     """
     Calculates Beta-NLL with optional per-sample weighting.
+
+    Parameters
+    ----------
+    pred : torch.Tensor
+        Predicted values.
+    target : torch.Tensor
+        Target values.
+    log_var : torch.Tensor
+        Log-variance prediction for aleatoric uncertainty.
+    beta : float, optional
+        Power for variance scaling (Beta-NLL), by default 0.5.
+    weights : torch.Tensor, optional
+        Per-sample weights for the loss, by default None.
+
+    Returns
+    -------
+    torch.Tensor
+        The calculated NLL loss.
     """
     precision = torch.exp(-log_var)
     # 1. Standard Gaussian NLL
@@ -230,8 +406,18 @@ def compute_nll_loss(pred, target, log_var, beta=0.5, weights=None):
 def compute_curvature_loss(bg_pred):
     """
     Calculates the L2 penalty on the spatial curvature of the background.
+
     Uses an interior mask to avoid boundary artifacts from zero-padding.
-    bg_pred shape: (Batch, H, W, 1)
+
+    Parameters
+    ----------
+    bg_pred : torch.Tensor
+        Predicted background map of shape [B, H, W, 1].
+
+    Returns
+    -------
+    torch.Tensor
+        The curvature loss value.
     """
     # 1. Prepare for Conv2D (B, 1, H, W)
     x = bg_pred.permute(0, 3, 1, 2)
@@ -251,12 +437,19 @@ def compute_curvature_loss(bg_pred):
 
 def compute_relative_entropy_loss(bg_pred):
     """
-    Calculates the Relative Entropy of the background map against a 
-    spatially varying "background mesh" prior (SExtractor-style).
+    Calculates the Relative Entropy of the background map against a mesh prior.
     
     Uses a stable residual-space asymmetric penalty: exp(d) - d - 1.
-    This creates an exponential "wall" against moats (where BG < Mesh)
-    while allowing linear growth for real astrophysical hills (where BG > Mesh).
+
+    Parameters
+    ----------
+    bg_pred : torch.Tensor
+        Predicted background map of shape [B, H, W, 1].
+
+    Returns
+    -------
+    torch.Tensor
+        The calculated entropy/moat-wall loss.
     """
     B, H, W, _ = bg_pred.shape
     # 1. Background Mesh (The "Astronomer's Low-Pass")
@@ -289,7 +482,28 @@ def compute_relative_entropy_loss(bg_pred):
 def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=1.0, lambda_pos=1.0, lambda_flux=1.0, lambda_bg=1.0, lambda_curvature=1.0, focal_alpha=0.50, focal_gamma=2.0, stretch_scale=GLOBAL_STRETCH_SCALE, log_task_vars=None):
     """
     Refactored loss using Aleatoric Uncertainty Estimation (NLL).
-    Supports Homoscedastic Task Uncertainty Weighting and Curvature Regularization.
+
+    Parameters
+    ----------
+    preds : dict
+        Predictions from the model.
+    targets : torch.Tensor
+        Ground truth grid.
+    pca_std : torch.Tensor, optional
+        Standard deviation for PCA (unused), by default None.
+    lambda_prob, lambda_pos, lambda_flux, lambda_bg, lambda_curvature : float, optional
+        Legacy weight parameters, by default 1.0.
+    focal_alpha, focal_gamma : float, optional
+        Focal loss parameters, by default 0.50 and 2.0.
+    stretch_scale : float, optional
+        Arcsinh stretch scale, by default GLOBAL_STRETCH_SCALE.
+    log_task_vars : torch.Tensor, optional
+        Task uncertainty weights, by default None.
+
+    Returns
+    -------
+    tuple
+        Tuple of (total_loss, prob_loss, pos_loss, flux_loss, bg_loss, ent_loss).
     """
     star_preds = preds["stars"]
     bg_preds = preds["background"]

@@ -10,6 +10,22 @@ from castor.models.dense_grid import compute_grid_loss, DenseGridModel
 from castor.constants import GLOBAL_STRETCH_SCALE, DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL
 
 def find_latest_checkpoint(checkpoint_dir="checkpoints", prefix="stage0"):
+    """
+    Find the most recent checkpoint file in the specified directory.
+
+    Parameters
+    ----------
+    checkpoint_dir : str, optional
+        Directory where checkpoints are stored, by default "checkpoints".
+    prefix : str, optional
+        Prefix for the checkpoint filename, by default "stage0".
+
+    Returns
+    -------
+    tuple
+        A tuple containing (path_to_latest_checkpoint, latest_epoch_number).
+        Returns (None, 0) if no checkpoints are found.
+    """
     if not os.path.exists(checkpoint_dir): return None, 0
     pattern = re.compile(rf"{prefix}_epoch_(\d+)\.pth")
     latest_epoch = 0
@@ -26,8 +42,33 @@ def find_latest_checkpoint(checkpoint_dir="checkpoints", prefix="stage0"):
 def render_confidence_prior(targets, img_size, cell_size, K, max_jitter=0.4, fwhm=3.5, sys_floor=0.01):
     """
     Renders a bilinear splat confidence prior map from target grid on-the-fly.
-    Channel 0: P (bilinear sum = P)
-    Fully vectorized. Handles overlapping splats via scatter_add_.
+
+    This function generates a confidence map where channel 0 represents the 
+    bilinear sum P. It is fully vectorized and handles overlapping splats 
+    via scatter_add_. It also injects poison (false positives) and applies 
+    dynamic SNR-based jitter.
+
+    Parameters
+    ----------
+    targets : torch.Tensor
+        Target grid tensor of shape [B, GH, GW, C].
+    img_size : int
+        The size of the output image (width and height).
+    cell_size : int
+        The size of each grid cell in pixels.
+    K : int
+        Maximum number of stars per cell.
+    max_jitter : float, optional
+        Maximum allowed jitter in pixels, by default 0.4.
+    fwhm : float, optional
+        Full Width at Half Maximum for SNR-based jitter calculation, by default 3.5.
+    sys_floor : float, optional
+        Systematic floor for jitter calculation, by default 0.01.
+
+    Returns
+    -------
+    torch.Tensor
+        The rendered prior map of shape [B, 1, img_size, img_size].
     """
     B, GH, GW, _ = targets.shape
     device = targets.device
@@ -133,7 +174,52 @@ def render_confidence_prior(targets, img_size, cell_size, K, max_jitter=0.4, fwh
     return prior_flat.view(B, 1, img_size, img_size)
 
 class Trainer:
+    """
+    Orchestrates the training process for the Castor model.
+
+    Attributes
+    ----------
+    model : torch.nn.Module
+        The neural network model to train.
+    train_loader : DataLoader
+        Iterable dataset for training data.
+    val_loader : DataLoader
+        Iterable dataset for validation data.
+    config : dict
+        Configuration parameters for training and model.
+    device : torch.device
+        The device (CPU/GPU) to run training on.
+    epochs : int
+        Total number of training epochs.
+    lr : float
+        Initial learning rate.
+    checkpoint_prefix : str
+        Prefix for saved checkpoint files.
+    """
+
     def __init__(self, model, train_loader, val_loader, config, device, epochs=100, lr=0.0001, checkpoint_prefix="stage0"):
+        """
+        Initialize the Trainer.
+
+        Parameters
+        ----------
+        model : torch.nn.Module
+            The neural network model.
+        train_loader : DataLoader
+            Training data loader.
+        val_loader : DataLoader
+            Validation data loader.
+        config : dict
+            Configuration dictionary.
+        device : torch.device
+            Device to use for training.
+        epochs : int, optional
+            Number of training epochs, by default 100.
+        lr : float, optional
+            Learning rate, by default 0.0001.
+        checkpoint_prefix : str, optional
+            Prefix for checkpoint filenames, by default "stage0".
+        """
         self.model, self.train_loader, self.val_loader = model, train_loader, val_loader
         self.config, self.device, self.checkpoint_prefix = config, device, checkpoint_prefix
         self.epochs, self.lr = epochs, lr
@@ -188,6 +274,15 @@ class Trainer:
         self.lambda_diffraction = self.loss_params.pop("lambda_diffraction_reg", 10.0)
 
     def resume(self, checkpoint_path=None):
+        """
+        Resume training from a checkpoint.
+
+        Parameters
+        ----------
+        checkpoint_path : str, optional
+            Path to the checkpoint file. If None, it finds the latest checkpoint 
+            in the checkpoints directory with the configured prefix.
+        """
         if checkpoint_path is None:
             checkpoint_path, self.start_epoch = find_latest_checkpoint(prefix=self.checkpoint_prefix)
         if checkpoint_path:
@@ -209,6 +304,13 @@ class Trainer:
                 self.model.load_state_dict(ckpt)
 
     def train(self):
+        """
+        Execute the training loop.
+
+        This method iterates through epochs, performing forward and backward 
+        passes, loss calculation, and optimization steps with gradient 
+        accumulation and mixed precision if applicable.
+        """
         print(f"Starting Training [{self.checkpoint_prefix}]: {self.epochs} epochs")
         
         # Get params for prior rendering
@@ -352,6 +454,14 @@ class Trainer:
         torch.save(final_ckpt, os.path.join("checkpoints", f"{self.checkpoint_prefix}_final.pth"))
 
     def _prune_checkpoints(self, keep_last=10):
+        """
+        Delete old checkpoints, keeping only the most recent ones.
+
+        Parameters
+        ----------
+        keep_last : int, optional
+            Number of recent checkpoints to preserve, by default 10.
+        """
         checkpoint_dir = "checkpoints"
         if not os.path.exists(checkpoint_dir): return
         pattern = re.compile(rf"{self.checkpoint_prefix}_epoch_(\d+)\.pth")
@@ -366,6 +476,14 @@ class Trainer:
                 except OSError: pass
 
     def validate(self):
+        """
+        Evaluate the model on the validation set.
+
+        Returns
+        -------
+        float
+            The average validation loss.
+        """
         self.model.eval(); val_loss = 0
         num_batches = len(self.val_loader)
         if num_batches == 0: return 0.0

@@ -1,1 +1,3 @@
-# Roman ML Photometry scripts package
+"""
+Scripting utilities for the Castor pipeline.
+"""

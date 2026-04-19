@@ -12,7 +12,20 @@ from scipy.signal import fftconvolve
 def upsample_background(bg_map, target_size):
     """
     Upsamples a grid-based background map to full image resolution.
+
     Uses bilinear interpolation with correct physical centering (cell centers).
+
+    Parameters
+    ----------
+    bg_map : numpy.ndarray
+        The low-resolution background map.
+    target_size : tuple of int
+        The (height, width) of the target high-resolution image.
+
+    Returns
+    -------
+    numpy.ndarray
+        The upsampled background map.
     """
     from scipy.interpolate import RegularGridInterpolator
     h, w = bg_map.shape
@@ -32,7 +45,22 @@ def upsample_background(bg_map, target_size):
 def generate_custom_inference_prior(star_catalog, img_size, sigma=1.0, device='cpu'):
     """
     Generates a 1-channel bilinear splat confidence prior map for inference testing.
-    Channel 0: P (bilinear sum = P)
+
+    Parameters
+    ----------
+    star_catalog : list of tuple
+        A list of stars, where each star is (cx, cy, p).
+    img_size : int
+        The size of the output square image.
+    sigma : float, optional
+        Gaussian sigma (currently unused in this bilinear implementation), by default 1.0.
+    device : str, optional
+        The device to perform calculations on ('cpu' or 'cuda'), by default 'cpu'.
+
+    Returns
+    -------
+    numpy.ndarray
+        The generated prior map of shape [img_size, img_size].
     """
     # 1 channel: P
     prior_map = torch.zeros((img_size, img_size), device=device)
@@ -76,7 +104,40 @@ def generate_custom_inference_prior(star_catalog, img_size, sigma=1.0, device='c
     return prior_map.cpu().numpy()
 
 class InferenceEngine:
+    """
+    Handles model inference and visualization of results.
+
+    Attributes
+    ----------
+    model : torch.nn.Module
+        The trained neural network model.
+    device : torch.device
+        The device to run inference on.
+    config : dict
+        Configuration dictionary.
+    img_size : int
+        Size of the input images.
+    stretch_scale : float
+        Scale for arcsinh stretching.
+    transform : AstroSpaceTransform
+        Transform for image processing.
+    cell_size : int
+        Size of the grid cells.
+    """
+
     def __init__(self, model, device, config):
+        """
+        Initialize the InferenceEngine.
+
+        Parameters
+        ----------
+        model : torch.nn.Module
+            The trained model.
+        device : torch.device
+            The device to use.
+        config : dict
+            The configuration dictionary.
+        """
         self.model = model
         self.device = device
         self.config = config
@@ -87,7 +148,14 @@ class InferenceEngine:
         self.cell_size = config.get("curriculum", {}).get("stage0", {}).get("cell_size", DEFAULT_CELL_SIZE)
 
     def _get_centered_psf(self):
-        """Generates a diagnostic centered Gaussian PSF for reconstruction."""
+        """
+        Generates a diagnostic centered Gaussian PSF for reconstruction.
+
+        Returns
+        -------
+        numpy.ndarray
+            A centered Gaussian PSF of size SHAPE_SIZE.
+        """
         S = SHAPE_SIZE
         # Default diagnostic Gaussian core (sigma ~ 0.94 pixels)
         y, x = np.meshgrid(np.arange(S), np.arange(S))
@@ -96,7 +164,24 @@ class InferenceEngine:
         return base_psf / (base_psf.sum() + 1e-9)
 
     def predict(self, image_tensor, threshold=0.1, prior_map=None):
-        """Runs inference on a single 2D image tensor [H, W]."""
+        """
+        Runs inference on a single 2D image tensor.
+
+        Parameters
+        ----------
+        image_tensor : torch.Tensor
+            Input image tensor of shape [H, W].
+        threshold : float, optional
+            Probability threshold for detecting stars, by default 0.1.
+        prior_map : numpy.ndarray or torch.Tensor, optional
+            Optional prior map to guide inference, by default None.
+
+        Returns
+        -------
+        tuple
+            A tuple (predicted_stars, bg_map). `predicted_stars` is a list 
+            of ((x, y), flux, p, sigmas).
+        """
         self.model.eval()
         
         with torch.no_grad():
@@ -157,7 +242,22 @@ class InferenceEngine:
 
     def visualize(self, hero_data, global_true, global_pred, threshold=0.43, output_path="inference_comparison.png", num_chunks=1):
         """
-        Visualizes inference results with the full 12-axis diagnostic suite. 
+        Visualizes inference results with the full 12-axis diagnostic suite.
+
+        Parameters
+        ----------
+        hero_data : dict
+            Data for the "hero" sample used in visual comparisons.
+        global_true : list
+            List of all true stars across all evaluated chunks.
+        global_pred : list
+            List of all predicted stars across all evaluated chunks.
+        threshold : float, optional
+            Detection threshold, by default 0.43.
+        output_path : str, optional
+            Path to save the diagnostic plot, by default "inference_comparison.png".
+        num_chunks : int, optional
+            Number of chunks evaluated, by default 1.
         """
         from castor.engine.evaluator import match_stars
         from mpl_toolkits.axes_grid1 import make_axes_locatable

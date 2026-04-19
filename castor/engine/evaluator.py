@@ -11,6 +11,23 @@ def match_stars(true_stars, pred_stars, distance_threshold=1.0, flux_threshold_d
     
     The cost function balances positional error and magnitude difference:
     Cost = (dist / dist_thresh)**2 + (abs(log_flux_diff) / flux_thresh_dex)**2
+
+    Parameters
+    ----------
+    true_stars : list of tuple
+        Ground truth stars as (x, y, flux, ...).
+    pred_stars : list of tuple
+        Predicted stars as (x, y, flux, ...).
+    distance_threshold : float, optional
+        Maximum allowed distance for a match in pixels, by default 1.0.
+    flux_threshold_dex : float, optional
+        Normalization factor for flux difference in dex (log10), by default 0.5.
+
+    Returns
+    -------
+    tuple
+        A tuple (matches, unmatched_true_indices, unmatched_pred_indices). 
+        `matches` is a list of (true_idx, pred_idx, cost).
     """
     if not pred_stars:
         return [], list(range(len(true_stars))), []
@@ -71,7 +88,42 @@ def match_stars(true_stars, pred_stars, distance_threshold=1.0, flux_threshold_d
     return matches, unmatched_true, unmatched_pred
 
 class Evaluator:
+    """
+    Handles model evaluation and metric reporting.
+
+    Attributes
+    ----------
+    model : torch.nn.Module
+        The neural network model.
+    device : torch.device
+        The device to run evaluation on.
+    config : dict
+        Configuration dictionary.
+    stage_idx : int
+        The training stage index.
+    K : int
+        Maximum number of stars per cell.
+    stretch_scale : float
+        The scale used for arcsinh flux stretching.
+    transform : AstroSpaceTransform
+        The transform used for image preprocessing.
+    """
+
     def __init__(self, model, device, config, stage_idx=0):
+        """
+        Initialize the Evaluator.
+
+        Parameters
+        ----------
+        model : torch.nn.Module
+            The trained model.
+        device : torch.device
+            The device to use.
+        config : dict
+            The configuration dictionary.
+        stage_idx : int, optional
+            The stage index, by default 0.
+        """
         self.model = model
         self.device = device
         self.config = config
@@ -81,6 +133,16 @@ class Evaluator:
         self.transform = AstroSpaceTransform(stretch_scale=self.stretch_scale)
 
     def run_evaluation(self, num_chunks=100, threshold=0.5):
+        """
+        Runs the evaluation suite on a set number of chunks.
+
+        Parameters
+        ----------
+        num_chunks : int, optional
+            Number of chunks to evaluate, by default 100.
+        threshold : float, optional
+            Detection threshold, by default 0.5.
+        """
         print(f"Evaluating model on {num_chunks} chunks...")
         self.model.eval()
         
@@ -194,6 +256,7 @@ class Evaluator:
         print("=============================================\n")
 
     def _print_metric(self, name, value, target, reverse=False):
+        """Prints a single metric with a pass/fail indicator."""
         status = "✅"
         if reverse:
             if value > target: status = "❌"

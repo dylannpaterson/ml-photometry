@@ -2,6 +2,26 @@ import yaml
 import os
 
 def load_config(config_path="config/config.yaml"):
+    """
+    Loads and validates the pipeline configuration from a YAML file.
+
+    Parameters
+    ----------
+    config_path : str, optional
+        Path to the configuration YAML file, by default "config/config.yaml".
+
+    Returns
+    -------
+    dict
+        The loaded and validated configuration dictionary.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the configuration file does not exist.
+    ValueError
+        If the configuration file is empty or missing required sections/fields.
+    """
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Config file not found: {config_path}")
     

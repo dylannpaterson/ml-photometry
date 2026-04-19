@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""
+Microlensing animation script for the Castor pipeline.
+
+This script generates an animation of microlensing events from an ASDF 
+image stack, including aperture photometry and magnification curves.
+"""
+
 import os
 import glob
 import json
@@ -16,11 +23,32 @@ from astropy.stats import sigma_clipped_stats
 from photutils.aperture import CircularAperture, CircularAnnulus, aperture_photometry
 
 def paczynski_magnification(t, t0, tE, u0):
-    """ Theoretical magnification formula. """
+    """
+    Calculates the theoretical magnification using the Paczynski formula.
+
+    Parameters
+    ----------
+    t : float or numpy.ndarray
+        The time(s) at which to calculate magnification.
+    t0 : float
+        The time of peak magnification.
+    tE : float
+        The Einstein crossing time.
+    u0 : float
+        The minimum impact parameter.
+
+    Returns
+    -------
+    float or numpy.ndarray
+        The calculated magnification value(s).
+    """
     u = np.sqrt(u0**2 + ((t - t0) / tE)**2)
     return (u**2 + 2) / (u * np.sqrt(u**2 + 4) + 1e-9)
 
 def main():
+    """
+    Main entry point for generating microlensing animations.
+    """
     parser = argparse.ArgumentParser(description="Animate microlensing events from ASDF stack.")
     parser.add_argument("--indir", default="data/microlensing_mag23_strict", help="Directory containing ASDF and JSON files")
     parser.add_argument("--out", default="microlensing_animation.mp4", help="Output animation file")

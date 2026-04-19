@@ -7,12 +7,28 @@ import time
 from castor.constants import SHAPE_SIZE
 
 def is_gpu_available():
+    """
+    Checks if a GPU is available for JAX.
+
+    Returns
+    -------
+    bool
+        True if a GPU is detected, False otherwise.
+    """
     try:
         return any(d.platform == 'gpu' for d in jax.devices())
     except:
         return False
 
 def _get_jax_renderer_core():
+    """
+    Returns the core JAX-based rendering function.
+
+    Returns
+    -------
+    callable
+        A function that performs the core rendering logic using JAX.
+    """
     def render_core(x, y, fluxes, repr_psf_4x, mosaic_size, v_mask):
         O = 4 
         S = SHAPE_SIZE
@@ -64,6 +80,14 @@ def _get_jax_renderer_core():
     return render_core
 
 def _get_fused_generator_renderer():
+    """
+    Returns a JIT-compiled fused generator and renderer.
+
+    Returns
+    -------
+    callable
+        A JIT-compiled function that generates star positions and renders them.
+    """
     render_core = _get_jax_renderer_core()
     def fused_op(key, fluxes, mags, single_psf, mosaic_size, mag_limit):
         n_stars = fluxes.shape[0]
@@ -80,6 +104,28 @@ _FUSED_OP = None
 _JAX_KEY = jax.random.PRNGKey(int(time.time())) if 'time' in globals() else jax.random.PRNGKey(42)
 
 def render_generate_and_filter_gpu(fluxes, mags, single_psf, mosaic_size, mag_limit=27.0):
+    """
+    Accelerated GPU renderer for large mosaic simulations using JAX.
+
+    Parameters
+    ----------
+    fluxes : numpy.ndarray
+        Array of star fluxes.
+    mags : numpy.ndarray
+        Array of star magnitudes.
+    single_psf : numpy.ndarray
+        High-resolution PSF kernel.
+    mosaic_size : int
+        Size of the output mosaic image.
+    mag_limit : float, optional
+        Magnitude threshold for separating foreground and background, by default 27.0.
+
+    Returns
+    -------
+    tuple
+        A tuple (full_image, bg_image, x, y, fluxes_filtered, mags_filtered) 
+        containing the rendered images and filtered star catalogs.
+    """
     global _FUSED_OP, _JAX_KEY
     if _FUSED_OP is None:
         _FUSED_OP = _get_fused_generator_renderer()

@@ -1,155 +1,214 @@
-import torch
-import torch.nn as nn
-import numpy as np
+"""
+HDF5 dataset conversion script for the Castor pipeline.
+
+This script converts simulated mosaics saved as .npy files into a unified 
+HDF5 database for efficient training and validation.
+"""
+
 import os
-import argparse
-import subprocess
-from castor.cloud.config_utils import load_config
-from castor.models.dense_grid import DenseGridModel
-from castor.constants import GLOBAL_STRETCH_SCALE, DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE
+import h5py
+import numpy as np
+import torch
+from tqdm import tqdm
+import gc
+import shutil
+from castor.data.stage0_gaussian import fast_paint_grid
+from castor.data.transforms import AstroSpaceTransform
+from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE
 
-class HandoverWrapper(nn.Module):
+def discover_mosaics(mosaic_dir):
     """
-    Bakes Preprocessing into the ONNX Graph for Pollux.
-    Accepts raw linear images [Batch, 1, H, W] and an optional Confidence Prior [Batch, 1, H, W].
-    Outputs standard catalogs.
-    """
-    def __init__(self, base_model, stretch_scale=GLOBAL_STRETCH_SCALE):
-        super(HandoverWrapper, self).__init__()
-        self.base_model = base_model
-        self.register_buffer("stretch_scale", torch.tensor(stretch_scale))
+    Discovers and metadata-loads mosaics in a directory.
 
-    def forward(self, x, prior=None):
-        # 1. Input Validation (Ensure Batch, Channel, H, W)
-        if x.dim() == 3:
-            x = x.unsqueeze(1)
+    Parameters
+    ----------
+    mosaic_dir : str
+        Path to the directory containing .npy mosaic files.
+
+    Returns
+    -------
+    list
+        A list of dictionaries, each containing metadata for a discovered mosaic.
+    """
+    mosaics = []
+    if not os.path.exists(mosaic_dir):
+        print(f"⚠️ Warning: Mosaic directory {mosaic_dir} not found.")
+        return mosaics
+
+    for f in sorted(os.listdir(mosaic_dir)):
+        if f.endswith("_img.npy"):
+            base = f.replace("_img.npy", "")
+            meta_path = os.path.join(mosaic_dir, f"{base}_meta.npy")
+            cat_path = os.path.join(mosaic_dir, f"{base}_cat.npy")
+            bg_path = os.path.join(mosaic_dir, f"{base}_bg.npy")
             
-        # 2. Per-image Median Subtraction (Baking preprocessing into graph)
-        # Flatten H,W to compute median per image in batch
-        B, C, H, W = x.shape
-        x_flat = x.view(B, -1)
-        
-        # ONNX-compatible median (Sort and take middle)
-        B, C, H, W = x.shape
-        x_flat = x.view(B, -1)
-        num_pixels = H * W
-        
-        # We use sort instead of median() as it has better ONNX support in some environments
-        sorted_x, _ = torch.sort(x_flat, dim=1)
-        medians = sorted_x[:, num_pixels // 2]
-        medians = medians.view(B, 1, 1, 1)
-        
-        # 3. Arcsinh Stretch
-        x_stretched = torch.arcsinh((x - medians) / self.stretch_scale)
-        
-        # 4. Handle Prior
-        if prior is None:
-            prior = torch.zeros_like(x)
-        
-        # 5. Base Model Inference
-        preds = self.base_model(x_stretched, prior=prior)
-        
-        # 6. Return structured tuple for ONNX compatibility
-        # stars: [Batch, Hg, Wg, K, 7] -> (p, dx, dy, flux, log_var_x, log_var_y, log_var_m)
-        # background: [Batch, Hg, Wg, 1]
-        return preds["stars"], preds["background"]
+            if not os.path.exists(meta_path) or not os.path.exists(cat_path):
+                continue
 
-def get_git_hash():
-    try:
-        return subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD']).decode('ascii').strip()
-    except:
-        return "unknown"
+            meta = np.load(meta_path)
+            mosaics.append({
+                'img': os.path.join(mosaic_dir, f),
+                'bg': bg_path if os.path.exists(bg_path) else None,
+                'cat': cat_path,
+                'exp_time': meta[0], 'zp': meta[1], 'sky_mag': meta[2]
+            })
+    return mosaics
 
-def main():
-    parser = argparse.ArgumentParser(description="Export Castor Model to ONNX for Pollux Handover")
-    parser.add_argument("--stage", type=int, default=0, help="Stage index")
-    parser.add_argument("--config", default="config/config.yaml", help="Path to config file")
-    parser.add_argument("--checkpoint", default=None, help="Path to specific model checkpoint")
-    parser.add_argument("--output_dir", default="artifacts", help="Where to save the ONNX and Parity files")
-    
-    args = parser.parse_args()
-    config = load_config(args.config)
-    
-    device = torch.device("cpu") # Export on CPU for maximum compatibility
-    
-    # 1. Load Model
-    data_cfg = config["data_params"]
-    stage_key = f"stage{args.stage}"
-    stage_cfg = config["curriculum"].get(stage_key, {})
-    
-    K = data_cfg.get("max_capacity_per_cell", MAX_CAPACITY_PER_CELL)
-    S = data_cfg.get("shape_size", SHAPE_SIZE)
-    cell_size = stage_cfg.get("cell_size", DEFAULT_CELL_SIZE)
-    img_size = data_cfg.get("image_size", 256)
-    
-    base_model = DenseGridModel(K=K, shape_size=S, cell_size=cell_size).to(device)
-    
-    checkpoint_path = args.checkpoint
-    if checkpoint_path is None:
-        checkpoint_path = f"checkpoints/stage{args.stage}_final.pth"
-    
-    if not os.path.exists(checkpoint_path):
-        # Try latest epoch if final doesn't exist
-        from castor.engine.trainer import find_latest_checkpoint
-        latest, _ = find_latest_checkpoint(prefix=f"stage{args.stage}")
-        if latest:
-            checkpoint_path = latest
-        else:
-            print(f"❌ Error: No checkpoint found for stage {args.stage}")
-            return
+def create_hdf5_datasets_combined(train_mosaic_dir, val_mosaic_dir, train_path, val_path, train_samples=50000, val_samples=2000, img_size=256):
+    """
+    Creates and populates HDF5 datasets from raw mosaic files.
 
-    print(f"📂 Loading weights from {checkpoint_path}...")
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
-        base_model.load_state_dict(ckpt['model_state_dict'])
-    else:
-        base_model.load_state_dict(ckpt)
+    Parameters
+    ----------
+    train_mosaic_dir : str
+        Directory containing training mosaics.
+    val_mosaic_dir : str
+        Directory containing validation mosaics.
+    train_path : str
+        Output path for the training HDF5 file.
+    val_path : str
+        Output path for the validation HDF5 file.
+    train_samples : int, optional
+        Total number of samples to generate for training, by default 50000.
+    val_samples : int, optional
+        Total number of samples to generate for validation, by default 2000.
+    img_size : int, optional
+        Size of the square image chunks, by default 256.
+
+    Returns
+    -------
+    bool
+        True if the conversion was successful.
+    """
+    cell_size = DEFAULT_CELL_SIZE
+    grid_size = img_size // cell_size
+    K = MAX_CAPACITY_PER_CELL
+    transform = AstroSpaceTransform(stretch_scale=GLOBAL_STRETCH_SCALE)
     
-    base_model.eval()
+    # Target per slot: [p, dx, dy, flux, snr] = 5 channels
+    target_shape = (grid_size, grid_size, K * 5 + 1)
     
-    # 2. Wrap with Preprocessing
-    model = HandoverWrapper(base_model, stretch_scale=GLOBAL_STRETCH_SCALE)
-    model.eval()
-    
-    # 3. Prepare Artifact Versioning
-    git_hash = get_git_hash()
-    os.makedirs(args.output_dir, exist_ok=True)
-    onnx_filename = f"stage{args.stage}_{git_hash}.onnx"
-    onnx_path = os.path.join(args.output_dir, onnx_filename)
-    
-    # 4. Generate Golden Master Parity Data
-    print("💎 Generating Golden Master Parity Test data...")
-    dummy_input = torch.randn(1, 1, img_size, img_size) * 50.0 + 100.0 # Random ADU-like data
-    dummy_prior = torch.zeros(1, 1, img_size, img_size) # Default empty prior
-    with torch.no_grad():
-        pytorch_stars, pytorch_bg = model(dummy_input, prior=dummy_prior)
-    
-    np.save(os.path.join(args.output_dir, f"test_input_{git_hash}.npy"), dummy_input.numpy())
-    np.save(os.path.join(args.output_dir, f"test_prior_{git_hash}.npy"), dummy_prior.numpy())
-    np.save(os.path.join(args.output_dir, f"test_output_stars_{git_hash}.npy"), pytorch_stars.numpy())
-    np.save(os.path.join(args.output_dir, f"test_output_bg_{git_hash}.npy"), pytorch_bg.numpy())
-    
-    # 5. Export to ONNX
-    print(f"🚀 Exporting ONNX model to {onnx_path}...")
-    torch.onnx.export(
-        model,
-        (dummy_input, dummy_prior),
-        onnx_path,
-        export_params=True,
-        opset_version=12, # Supports arcsinh and median
-        do_constant_folding=True,
-        input_names=['input_adu', 'prior_map'],
-        output_names=['stars', 'background'],
-        dynamic_axes={
-            'input_adu': {0: 'batch_size'},
-            'prior_map': {0: 'batch_size'},
-            'stars': {0: 'batch_size'},
-            'background': {0: 'batch_size'}
-        }
-    )
-    
-    print(f"✅ Handover artifact ready: {onnx_path}")
-    print(f"📦 Contents: ONNX Model + Parity Tensors (Input, Stars, Background)")
+    # Discover mosaics for each split
+    train_mosaics = discover_mosaics(train_mosaic_dir)
+    val_mosaics = discover_mosaics(val_mosaic_dir)
+
+    if not train_mosaics:
+        print(f"❌ Error: No training mosaics found in {train_mosaic_dir}")
+        return False
+    if not val_mosaics:
+        print(f"❌ Error: No validation mosaics found in {val_mosaic_dir}")
+        return False
+
+    print(f"Found {len(train_mosaics)} train and {len(val_mosaics)} val mosaics. Creating HDF5 databases...")
+    os.makedirs(os.path.dirname(train_path), exist_ok=True)
+
+    with h5py.File(train_path, 'w') as h5_train, h5py.File(val_path, 'w') as h5_val:
+        # 1. Setup Train Datasets
+        tr_imgs = h5_train.create_dataset("images", (train_samples, 1, img_size, img_size), dtype='float32', chunks=(1, 1, img_size, img_size), compression="lzf")
+        tr_tgts = h5_train.create_dataset("targets", (train_samples, *target_shape), dtype='float32', chunks=(1, *target_shape), compression="lzf")
+        tr_meds = h5_train.create_dataset("chunk_medians", (train_samples,), dtype='float32')
+        tr_meta = h5_train.create_dataset("metas", (train_samples, 6), dtype='float32')
+        
+        # 2. Setup Val Datasets
+        val_imgs = h5_val.create_dataset("images", (val_samples, 1, img_size, img_size), dtype='float32', chunks=(1, 1, img_size, img_size), compression="lzf")
+        val_tgts = h5_val.create_dataset("targets", (val_samples, *target_shape), dtype='float32', chunks=(1, *target_shape), compression="lzf")
+        val_meds = h5_val.create_dataset("chunk_medians", (val_samples,), dtype='float32')
+        val_meta = h5_val.create_dataset("metas", (val_samples, 6), dtype='float32')
+
+        # --- PROCESS EACH SPLIT INDEPENDENTLY ---
+        for split_name, mosaics, split_samples, ds_imgs, ds_tgts, ds_meds, ds_meta, is_val in [
+            ("Train", train_mosaics, train_samples, tr_imgs, tr_tgts, tr_meds, tr_meta, False),
+            ("Val", val_mosaics, val_samples, val_imgs, val_tgts, val_meds, val_meta, True)
+        ]:
+            print(f"\n🚀 Processing {split_name} Split ({len(mosaics)} mosaics)...")
+            samples_per_mos = split_samples // len(mosaics)
+            global_idx = 0
+            
+            for m_idx, mosaic in enumerate(mosaics):
+                this_mos_samples = samples_per_mos if m_idx < len(mosaics)-1 else (split_samples - global_idx)
+                print(f"  [{m_idx+1}/{len(mosaics)}] {os.path.basename(mosaic['img'])} -> {this_mos_samples} samples")
+                
+                img_data = np.load(mosaic['img'])
+                bg_data = np.load(mosaic['bg']) if mosaic['bg'] else None
+                cat_data = np.load(mosaic['cat'])
+                
+                # IMPORTANT: Ensure catalog is sorted by Y for searchsorted
+                if not np.all(np.diff(cat_data['y']) >= 0):
+                    cat_data = np.sort(cat_data, order='y')
+                
+                meta_path = mosaic['img'].replace("_img.npy", "_meta.npy")
+                meta_data = np.load(meta_path) if os.path.exists(meta_path) else np.zeros(6, dtype=np.float32)
+
+                pixel_scale = 0.11
+                sky_level = (10 ** (-0.4 * (mosaic['sky_mag'] - mosaic['zp']))) * (pixel_scale**2) * mosaic['exp_time']
+                my, mx = img_data.shape
+                snrs = cat_data['snr']
+                
+                for _ in range(this_mos_samples):
+                    py = np.random.randint(0, my - img_size)
+                    px = np.random.randint(0, mx - img_size)
+                    
+                    star_signal = img_data[py:py+img_size, px:px+img_size]
+                    chunk_median = np.median(star_signal)
+                    signal_tensor = np.expand_dims(np.clip(star_signal, 0, None), axis=0).astype(np.float32)
+                    
+                    y_start = np.searchsorted(cat_data['y'], py)
+                    y_end = np.searchsorted(cat_data['y'], py + img_size)
+                    band_cat = cat_data[y_start:y_end]
+                    mask_x = (band_cat['x'] >= px) & (band_cat['x'] < px + img_size)
+                    
+                    target_buffer = np.zeros(target_shape, dtype=np.float32)
+                    if mask_x.any():
+                        local_cat = band_cat[mask_x]
+                        lx, ly = local_cat['x'] - px, local_cat['y'] - py
+                        local_snrs = local_cat['snr']
+                        sort_idx = np.argsort(local_cat['flux'])[::-1]
+                        
+                        grid_stars = fast_paint_grid(lx, ly, local_cat['flux'], local_snrs, sort_idx, 5.0, grid_size, cell_size, K)
+                        target_buffer[:, :, :-1] = grid_stars.reshape(grid_size, grid_size, -1)
+
+                    if bg_data is not None:
+                        bg_chunk = bg_data[py:py+img_size, px:px+img_size]
+                        bg_map = bg_chunk.reshape(grid_size, cell_size, grid_size, cell_size).mean(axis=(1, 3))
+                        target_buffer[:, :, -1] = transform.target_bg_to_network(bg_map - chunk_median)
+                    else:
+                        target_buffer[:, :, -1] = transform.target_bg_to_network(sky_level - chunk_median)
+                    
+                    ds_imgs[global_idx] = signal_tensor
+                    ds_tgts[global_idx] = target_buffer
+                    ds_meds[global_idx] = chunk_median
+                    ds_meta[global_idx] = meta_data
+                    global_idx += 1
+
+                # --- CLEANUP THIS MOSAIC ---
+                for f_path in [mosaic['img'], mosaic['bg'], mosaic['cat']]:
+                    if f_path and os.path.exists(f_path): os.remove(f_path)
+                meta_f = mosaic['img'].replace("_img.npy", "_meta.npy")
+                if os.path.exists(meta_f): os.remove(meta_f)
+                
+                del img_data, cat_data
+                if bg_data is not None: del bg_data
+                gc.collect()
+
+    print(f"✅ Combined HDF5 datasets complete!")
+    return True
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description="Convert .npy mosaics to HDF5 database (Separate Pass)")
+    parser.add_argument("--train_dir", required=True, help="Directory containing training mosaics")
+    parser.add_argument("--val_dir", required=True, help="Directory containing validation mosaics")
+    parser.add_argument("--output_dir", required=True, help="Where to save HDF5 files")
+    parser.add_argument("--train_samples", type=int, default=50000, help="Number of training samples")
+    parser.add_argument("--val_samples", type=int, default=5000, help="Number of validation samples")
+    args = parser.parse_args()
+
+    train_h5 = os.path.join(args.output_dir, "stage0_train.h5")
+    val_h5 = os.path.join(args.output_dir, "stage0_val.h5")
+    
+    create_hdf5_datasets_combined(
+        args.train_dir, args.val_dir, 
+        train_h5, val_h5, 
+        train_samples=args.train_samples, 
+        val_samples=args.val_samples
+    )
