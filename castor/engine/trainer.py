@@ -334,7 +334,16 @@ class Trainer:
                 # --- LIVE NOISE INJECTION ---
                 images_positive = torch.clamp(images, min=0.0) 
                 images_noisy = torch.poisson(images_positive)
-                images_noisy += torch.randn_like(images_noisy) * 5.0
+                
+                # Defensive check: Stage 1 has 17 elements (read_noise is at index 12). Stage 0 has 6.
+                if isinstance(batch, dict) and "meta" in batch and batch["meta"].shape[1] >= 17:
+                    # Stage 1: Inject exact dynamic read noise for this domain
+                    batch_read_noise = batch["meta"][:, 12].to(self.device, non_blocking=True).float().view(-1, 1, 1, 1)
+                else:
+                    # Stage 0: Fallback to static config default
+                    batch_read_noise = 5.0
+                
+                images_noisy += torch.randn_like(images_noisy) * batch_read_noise
                 
                 if isinstance(batch, dict) and "chunk_median" in batch:
                     batch_medians = batch["chunk_median"].to(self.device, non_blocking=True).float().view(-1, 1, 1, 1)
@@ -358,8 +367,14 @@ class Trainer:
                     st_view[~prior_mask] = 0.0
                     
                     # Render bilinear splat prior map (1 channel)
-                    sigma_fixed = self.config.get("data_params", {}).get("physics_params", {}).get("sigma_fixed", 1.5)
-                    calculated_fwhm = sigma_fixed * 2.355
+                    # Stage 1: Use dynamic FWHM from metadata [index 3]
+                    if isinstance(batch, dict) and "meta" in batch and batch["meta"].shape[1] >= 17:
+                        calculated_fwhm = batch["meta"][:, 3].to(self.device, non_blocking=True).float().view(-1, 1, 1, 1)
+                    else:
+                        # Stage 0: Fallback to static config default
+                        sigma_fixed = self.config.get("data_params", {}).get("physics_params", {}).get("sigma_fixed", 1.5)
+                        calculated_fwhm = sigma_fixed * 2.355
+
                     prior_map = render_confidence_prior(
                         partial_targets, img_size, cell_size, K, 
                         max_jitter=0.4, fwhm=calculated_fwhm, sys_floor=0.01
@@ -499,7 +514,16 @@ class Trainer:
                 
                 images_positive = torch.clamp(images, min=0.0) 
                 images_noisy = torch.poisson(images_positive)
-                images_noisy += torch.randn_like(images_noisy) * 5.0
+                
+                # Defensive check: Stage 1 has 17 elements (read_noise is at index 12). Stage 0 has 6.
+                if isinstance(batch, dict) and "meta" in batch and batch["meta"].shape[1] >= 17:
+                    # Stage 1: Inject exact dynamic read noise for this domain
+                    batch_read_noise = batch["meta"][:, 12].to(self.device, non_blocking=True).float().view(-1, 1, 1, 1)
+                else:
+                    # Stage 0: Fallback to static config default
+                    batch_read_noise = 5.0
+                
+                images_noisy += torch.randn_like(images_noisy) * batch_read_noise
                 
                 if isinstance(batch, dict) and "chunk_median" in batch:
                     batch_medians = batch["chunk_median"].to(self.device, non_blocking=True).float().view(-1, 1, 1, 1)
