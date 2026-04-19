@@ -515,17 +515,20 @@ def run_stage0_parallel_generation(config, split='train'):
     }
     
     num_workers = mp.cpu_count()
-    print(f"🔥 Stage 0 [{split}]: Parallelizing with {num_workers} workers...")
+    # 1. Leave 1 core free for HDF5 I/O
+    pool_workers = max(1, num_workers - 1)
+    print(f"🔥 Stage 0 [{split}]: Parallelizing with {pool_workers} workers (1 core reserved for I/O)...")
     
     with h5py.File(output_path, 'w') as f:
         dset_img = f.create_dataset("images", (num_samples, 1, 256, 256), dtype='f4', chunks=(1, 1, 256, 256), compression="lzf")
         dset_tgt = f.create_dataset("targets", (num_samples, 64, 64, MAX_CAPACITY_PER_CELL*5 + 1), dtype='f4', chunks=(1, 64, 64, MAX_CAPACITY_PER_CELL*5 + 1), compression="lzf")
-        dset_med = f.create_dataset("chunk_medians", (total_samples if 'total_samples' in locals() else num_samples,), dtype='f4')
+        dset_med = f.create_dataset("chunk_medians", (num_samples,), dtype='f4')
         dset_meta = f.create_dataset("metas", (num_samples, 6), dtype='f4')
         
         worker_func = partial(generate_single_sample_stage0, params=params)
-        with mp.Pool(num_workers) as pool:
-            for i, (img, tgt, med, meta) in enumerate(tqdm(pool.imap(worker_func, range(num_samples)), total=num_samples)):
+        with mp.Pool(pool_workers) as pool:
+            # 2. Use imap_unordered for zero-latency writing
+            for i, (img, tgt, med, meta) in enumerate(tqdm(pool.imap_unordered(worker_func, range(num_samples)), total=num_samples)):
                 dset_img[i, 0] = img
                 dset_tgt[i] = tgt
                 dset_med[i] = med
