@@ -270,6 +270,13 @@ class Trainer:
 
         # FIX: Extract loss parameters from root of config instead of data_params
         self.loss_params = config.get("loss_params", {}).copy()
+        
+        # --- STAGE-SPECIFIC LOSS OVERRIDES ---
+        stage_cfg = config.get("curriculum", {}).get(self.checkpoint_prefix, {})
+        if "loss_params" in stage_cfg:
+            print(f"🎯 Applying stage-specific loss overrides for {self.checkpoint_prefix}")
+            self.loss_params.update(stage_cfg["loss_params"])
+            
         self.loss_params["stretch_scale"] = config.get("data_params", {}).get("GLOBAL_STRETCH_SCALE", GLOBAL_STRETCH_SCALE)
         self.lambda_diffraction = self.loss_params.pop("lambda_diffraction_reg", 10.0)
 
