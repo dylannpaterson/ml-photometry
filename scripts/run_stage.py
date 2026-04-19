@@ -263,31 +263,29 @@ def run_train(stage_idx, config, device):
         train_dataset = HDF5MosaicDataset(train_h5)
         val_dataset = HDF5MosaicDataset(val_h5)
     elif stage_idx == 1:
-        # NEW: Stage 1 Multi-Telescope Foundation Dataset (Macro-Sparse)
-        from castor.data.stage1_dataset import Stage1MacroSparseDataset
-        mosaic_dir = "data/stage1_mosaics"
+        # Stage 1 Multi-Telescope Foundation (Direct GalSim HDF5)
+        train_h5 = os.path.join(stage_cfg["data_dir"], "stage1_data.h5")
         
-        if force_gen or not os.path.exists(mosaic_dir) or not os.listdir(mosaic_dir):
-            print("🛠️ Generating Stage 1 High-Fidelity Mosaics...")
-            os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/generate_stage1_mosaics.py")
+        # Check if we need to generate data
+        if force_gen or not os.path.exists(train_h5):
+            print("🛠️ Generating Stage 1 High-Fidelity GalSim Data (Parallel)...")
+            cfg_path = config.get("config_path", "config/config.yaml")
+            
+            # Use the direct GalSim generator we implemented
+            # It generates a single unified HDF5 file
+            ret = os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 castor/data/stage1_galsim.py --config {cfg_path}")
+            
+            if ret != 0 or not os.path.exists(train_h5):
+                print("❌ Error: Stage 1 data generation failed.")
+                return
 
-        print("🛠️ Using Stage 1 Macro-Sparse Pipeline (Cached Physics, Live Noise)...")
-        train_dataset = Stage1MacroSparseDataset(
-            mosaic_dir,
-            num_samples=data_cfg["num_train_samples"],
-            image_size=data_cfg["image_size"],
-            cell_size=cell_size,
-            K=K,
-            global_stretch_scale=stretch_scale
-        )
-        val_dataset = Stage1MacroSparseDataset(
-            mosaic_dir,
-            num_samples=data_cfg["num_val_samples"],
-            image_size=data_cfg["image_size"],
-            cell_size=cell_size,
-            K=K,
-            global_stretch_scale=stretch_scale
-        )
+        from castor.data.stage0_gaussian import HDF5MosaicDataset
+        print(f"🛠️ Using Stage 1 HDF5 Dataset: {train_h5}")
+        # Stage 1 uses the exact same HDF5 structure as Stage 0, just with more meta columns
+        train_dataset = HDF5MosaicDataset(train_h5)
+        # For Stage 1, we often use the same file for val or a split if implemented. 
+        # For now, we'll use the same dataset object as the generator handles total samples.
+        val_dataset = train_dataset 
     else:
         print(f"❌ Error: Stage {stage_idx} data loading via PregeneratedDataset is obsolete.")
         print(f"   Please implement HDF5MosaicDataset support for Stage {stage_idx}.")
