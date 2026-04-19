@@ -1,7 +1,3 @@
 """
-Neural network model architectures for the Castor pipeline.
-"""
-.
-"""
-e analysis.
+Castor: A deep learning pipeline for Roman Space Telescope point source analysis.
 """
