@@ -12,9 +12,11 @@ To develop a machine learning pipeline capable of performing fast, direct point-
 
 ### Output (The Spatial Grid)
 *   **Format:** 3D Tensor (Flattened Channels)
-*   **Dimensions:** $64 \times 64 \times (K \times 7 + 1)$ (where $K=3$ star slots per cell).
+*   **Dimensions:** 
+    *   **Target (HDF5):** $64 \times 64 \times (K \times 5 + 1)$
+    *   **Prediction (Model):** $64 \times 64 \times (K \times 7 + 1)$
 *   **Structure:** The output is a $64 \times 64$ spatial grid (stride 4 relative to input). Each cell predicts star parameters for $K$ slots plus one shared local background value. **Canonical Slot Sorting:** Stars within each cell are sorted by flux (brightest to faintest) before being assigned to the $K$ slots. This provides a stable and consistent learning target.
-*   **Slot Values (7 per slot):**
+*   **Slot Values (Model Output - 7 per slot):**
     1.  **p:** **SNR-Based Objectness ($0.0 \to 1.0$)**. Represents the physical detectability of the source.
         *   **Logarithmic Soft Labels:** Instead of binary 1/0 targets, the objectness target is mapped smoothly based on physical SNR using a Base-10 Logarithmic scale:
             *   $\text{SNR} \ge 5.0 \implies p = 1.0$
@@ -42,10 +44,18 @@ Before entering the backbone, the raw input image passes through a **Diffraction
 
 ### Stage 1: The Backbone
 *   **Backbone:** Full ResNet-34 (all 4 stages).
-*   **Input:** $256 \times 256 \times 2$ (Original Stretched Image + Physics Prior Response).
+*   **Input:** $256 \times 256 \times 3$ (Original Stretched Image + Physics Prior Response + **Confidence Prior Map**).
 *   **Multi-scale Features:** Extracts features at $1/4, 1/8, 1/16, 1/32$ resolutions.
 
-### Stage 2: The FPN Neck
+### Stage 2: Dynamic Confidence Prior Jitter
+The **Confidence Prior Map** is a single-channel image that encodes the "current best guess" of star locations. To prevent the model from becoming an overfitted "lookup table," the prior is jittered during training using a physically motivated strategy:
+*   **CRLB-Based Uncertainty:** Instead of uniform noise, the spatial jitter applied to the prior is derived from the **Cramér-Rao Lower Bound (CRLB)** for astrometric precision:
+    $$\sigma_{astrometric} = \frac{\text{FWHM}}{2.355 \cdot \text{SNR}}$$
+*   **Noise Floor:** A systematic noise floor (e.g., $0.01$ pixels) is added in quadrature: $\sigma_{total} = \sqrt{\sigma_{astrometric}^2 + \sigma_{sys}^2}$.
+*   **Enforced High Uncertainty:** For injected "poison" stars (false positives), a low SNR (1.0 to 3.0) is assigned to force the model to learn that high-variance priors are unreliable.
+*   **Objective:** This teaches the FPN to treat the prior as a *guide* rather than a ground-truth, forcing it to look at the underlying pixel data for final sub-pixel refinement.
+
+### Stage 3: The FPN Neck
 A **Feature Pyramid Network (FPN)** merges deep semantic context from the lower resolutions back into the high-resolution prediction grid.
 *   **Top-down path:** Upsamples deep features and merges them with lateral high-res connections.
 *   **Final Feature Map:** $64 \times 64 \times 128$ tensor (Stride 4 relative to input).

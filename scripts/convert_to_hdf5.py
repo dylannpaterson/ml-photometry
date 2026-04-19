@@ -41,8 +41,8 @@ def create_hdf5_datasets_combined(train_mosaic_dir, val_mosaic_dir, train_path, 
     K = MAX_CAPACITY_PER_CELL
     transform = AstroSpaceTransform(stretch_scale=GLOBAL_STRETCH_SCALE)
     
-    # Target per slot: [p, dx, dy, flux] = 4 channels
-    target_shape = (grid_size, grid_size, K * 4 + 1)
+    # Target per slot: [p, dx, dy, flux, snr] = 5 channels
+    target_shape = (grid_size, grid_size, K * 5 + 1)
     
     # Discover mosaics for each split
     train_mosaics = discover_mosaics(train_mosaic_dir)

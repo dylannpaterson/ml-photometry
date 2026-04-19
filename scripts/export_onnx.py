@@ -11,14 +11,15 @@ from castor.constants import GLOBAL_STRETCH_SCALE, DEFAULT_CELL_SIZE, MAX_CAPACI
 class HandoverWrapper(nn.Module):
     """
     Bakes Preprocessing into the ONNX Graph for Pollux.
-    Accepts raw linear images [Batch, 1, H, W] and outputs standard catalogs.
+    Accepts raw linear images [Batch, 1, H, W] and an optional Confidence Prior [Batch, 1, H, W].
+    Outputs standard catalogs.
     """
     def __init__(self, base_model, stretch_scale=GLOBAL_STRETCH_SCALE):
         super(HandoverWrapper, self).__init__()
         self.base_model = base_model
         self.register_buffer("stretch_scale", torch.tensor(stretch_scale))
 
-    def forward(self, x):
+    def forward(self, x, prior=None):
         # 1. Input Validation (Ensure Batch, Channel, H, W)
         if x.dim() == 3:
             x = x.unsqueeze(1)
@@ -41,10 +42,14 @@ class HandoverWrapper(nn.Module):
         # 3. Arcsinh Stretch
         x_stretched = torch.arcsinh((x - medians) / self.stretch_scale)
         
-        # 4. Base Model Inference
-        preds = self.base_model(x_stretched)
+        # 4. Handle Prior
+        if prior is None:
+            prior = torch.zeros_like(x)
         
-        # 5. Return structured tuple for ONNX compatibility
+        # 5. Base Model Inference
+        preds = self.base_model(x_stretched, prior=prior)
+        
+        # 6. Return structured tuple for ONNX compatibility
         # stars: [Batch, Hg, Wg, K, 7] -> (p, dx, dy, flux, log_var_x, log_var_y, log_var_m)
         # background: [Batch, Hg, Wg, 1]
         return preds["stars"], preds["background"]
@@ -115,10 +120,12 @@ def main():
     # 4. Generate Golden Master Parity Data
     print("💎 Generating Golden Master Parity Test data...")
     dummy_input = torch.randn(1, 1, img_size, img_size) * 50.0 + 100.0 # Random ADU-like data
+    dummy_prior = torch.zeros(1, 1, img_size, img_size) # Default empty prior
     with torch.no_grad():
-        pytorch_stars, pytorch_bg = model(dummy_input)
+        pytorch_stars, pytorch_bg = model(dummy_input, prior=dummy_prior)
     
     np.save(os.path.join(args.output_dir, f"test_input_{git_hash}.npy"), dummy_input.numpy())
+    np.save(os.path.join(args.output_dir, f"test_prior_{git_hash}.npy"), dummy_prior.numpy())
     np.save(os.path.join(args.output_dir, f"test_output_stars_{git_hash}.npy"), pytorch_stars.numpy())
     np.save(os.path.join(args.output_dir, f"test_output_bg_{git_hash}.npy"), pytorch_bg.numpy())
     
@@ -126,15 +133,16 @@ def main():
     print(f"🚀 Exporting ONNX model to {onnx_path}...")
     torch.onnx.export(
         model,
-        dummy_input,
+        (dummy_input, dummy_prior),
         onnx_path,
         export_params=True,
         opset_version=12, # Supports arcsinh and median
         do_constant_folding=True,
-        input_names=['input_adu'],
+        input_names=['input_adu', 'prior_map'],
         output_names=['stars', 'background'],
         dynamic_axes={
             'input_adu': {0: 'batch_size'},
+            'prior_map': {0: 'batch_size'},
             'stars': {0: 'batch_size'},
             'background': {0: 'batch_size'}
         }

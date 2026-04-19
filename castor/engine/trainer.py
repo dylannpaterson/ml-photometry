@@ -23,7 +23,7 @@ def find_latest_checkpoint(checkpoint_dir="checkpoints", prefix="stage0"):
                     latest_epoch, latest_file = epoch, os.path.join(checkpoint_dir, f)
     return latest_file, latest_epoch
 
-def render_confidence_prior(targets, img_size, cell_size, K, jitter=0.4):
+def render_confidence_prior(targets, img_size, cell_size, K, max_jitter=0.4, fwhm=3.5, sys_floor=0.01):
     """
     Renders a bilinear splat confidence prior map from target grid on-the-fly.
     Channel 0: P (bilinear sum = P)
@@ -38,11 +38,13 @@ def render_confidence_prior(targets, img_size, cell_size, K, jitter=0.4):
     p_targets = star_targets[..., 0]
     dx_targets = star_targets[..., 1]
     dy_targets = star_targets[..., 2]
+    snr_targets = star_targets[..., 4]
     
     # Flatten across spatial and K dimensions: [B, GH*GW*K]
     p_flat = p_targets.reshape(B, -1)
     dx_flat = dx_targets.reshape(B, -1)
     dy_flat = dy_targets.reshape(B, -1)
+    snr_flat = snr_targets.reshape(B, -1)
     
     # 2. Create Global Coordinate Grid
     grid_y, grid_x = torch.meshgrid(
@@ -64,6 +66,7 @@ def render_confidence_prior(targets, img_size, cell_size, K, jitter=0.4):
     all_cx = center_x[batch_idx, star_idx]
     all_cy = center_y[batch_idx, star_idx]
     all_p  = p_flat[batch_idx, star_idx]
+    all_snr = snr_flat[batch_idx, star_idx]
     
     # --- INJECT POISON (False Positives) ---
     num_poison = 5
@@ -71,19 +74,28 @@ def render_confidence_prior(targets, img_size, cell_size, K, jitter=0.4):
     poison_cx = torch.rand((B * num_poison,), device=device) * (img_size - 1)
     poison_cy = torch.rand((B * num_poison,), device=device) * (img_size - 1)
     poison_p = torch.empty((B * num_poison,), device=device).uniform_(0.5, 0.95)
+    # Poison stars have low SNR for high uncertainty
+    poison_snr = torch.empty((B * num_poison,), device=device).uniform_(1.0, 3.0)
     
     # Combine
     all_batch_idx = torch.cat([batch_idx, poison_batch_idx])
     all_cx = torch.cat([all_cx, poison_cx])
     all_cy = torch.cat([all_cy, poison_cy])
     all_p = torch.cat([all_p, poison_p])
+    all_snr = torch.cat([all_snr, poison_snr])
     
-    # --- 3. BILINEAR SPLATTING ---
-    # Apply Jitter (with 10% dropout to teach the network perfect alignment)
-    if jitter > 0:
-        jitter_mask = torch.rand_like(all_cx) < 0.9
-        all_cx = all_cx + torch.randn_like(all_cx) * jitter * jitter_mask
-        all_cy = all_cy + torch.randn_like(all_cy) * jitter * jitter_mask
+    # --- DYNAMIC SNR-BASED JITTER (Cramér-Rao Lower Bound) ---
+    snr_safe = torch.clamp(all_snr, min=1.0)
+    theoretical_sigma = fwhm / (2.355 * snr_safe)
+    dynamic_jitter = torch.sqrt(theoretical_sigma**2 + sys_floor**2)
+    dynamic_jitter = torch.clamp(dynamic_jitter, max=max_jitter)
+
+    # Apply random scatter based on dynamic jitter (with 10% dropout to teach the network perfect alignment)
+    jitter_mask = torch.rand_like(all_cx) < 0.9
+    jitter_x = (torch.rand_like(all_cx) * 2 - 1) * dynamic_jitter * jitter_mask
+    jitter_y = (torch.rand_like(all_cy) * 2 - 1) * dynamic_jitter * jitter_mask
+    all_cx = all_cx + jitter_x
+    all_cy = all_cy + jitter_y
 
     # Anchors and sub-pixel remainders
     # We must ensure anchors are in [0, img_size-2] for 2x2 splat
@@ -244,7 +256,12 @@ class Trainer:
                     st_view[~prior_mask] = 0.0
                     
                     # Render bilinear splat prior map (1 channel)
-                    prior_map = render_confidence_prior(partial_targets, img_size, cell_size, K, jitter=0.4)
+                    sigma_fixed = self.config.get("data_params", {}).get("physics_params", {}).get("sigma_fixed", 1.5)
+                    calculated_fwhm = sigma_fixed * 2.355
+                    prior_map = render_confidence_prior(
+                        partial_targets, img_size, cell_size, K, 
+                        max_jitter=0.4, fwhm=calculated_fwhm, sys_floor=0.01
+                    )
 
                 # 15% chance to drop the entire prior map
                 if torch.rand(1).item() < 0.15:

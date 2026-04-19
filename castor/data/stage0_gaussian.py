@@ -80,13 +80,13 @@ def _generate_fallback_psf(grid_size, oversample):
 
 def fast_paint_grid(lx, ly, fluxes, snrs, sort_idx, min_snr, grid_size, cell_size, K):
     """Highly optimized target grid painter."""
-    grid_stars = np.zeros((grid_size, grid_size, K, 4), dtype=np.float32)
+    grid_stars = np.zeros((grid_size, grid_size, K, 5), dtype=np.float32)
     counts = np.zeros((grid_size, grid_size), dtype=np.int32)
-    
+
     for idx in range(len(sort_idx)):
         i = sort_idx[idx]
         snr = snrs[i]
-        
+
         if snr <= 1.0:
             target_p = 0.0
         elif snr >= 5.0:
@@ -96,10 +96,10 @@ def fast_paint_grid(lx, ly, fluxes, snrs, sort_idx, min_snr, grid_size, cell_siz
 
         if target_p <= 0.0:
             continue
-            
+
         cx = int(lx[i] // cell_size)
         cy = int(ly[i] // cell_size)
-        
+
         if 0 <= cx < grid_size and 0 <= cy < grid_size:
             slot = counts[cy, cx]
             if slot < K:
@@ -107,10 +107,10 @@ def fast_paint_grid(lx, ly, fluxes, snrs, sort_idx, min_snr, grid_size, cell_siz
                 grid_stars[cy, cx, slot, 1] = lx[i] % cell_size
                 grid_stars[cy, cx, slot, 2] = ly[i] % cell_size
                 grid_stars[cy, cx, slot, 3] = fluxes[i]
+                grid_stars[cy, cx, slot, 4] = snr
                 counts[cy, cx] += 1
-                
-    return grid_stars
 
+    return grid_stars
 def sample_bulge_magnitudes(n_total, rc_mag, rc_sigma, rc_enhancement=3.0, m_min=12.0, m_max=32.0, gamma=0.3):
     """Samples from a power-law luminosity function with Red Clump enhancement."""
     u = np.random.uniform(0, 1, n_total)
@@ -140,8 +140,8 @@ def calculate_safe_magnitude_cutoff(exp_time, zp, sky_mag, read_noise=5.0, sigma
     min_flux = (-b + np.sqrt(b**2 - 4*a*c)) / (2*a)
     return zp - 2.5 * np.log10(min_flux / exp_time)
 
-def generate_dust_cirrus(img_size, amplitude):
-    """Generates fractal dust noise with P(k) ~ k^-3 power spectrum."""
+def generate_dust_cirrus(img_size, amplitude, exponent=None):
+    """Generates fractal dust noise with randomized power spectrum P(k) ~ k^-beta."""
     fx = np.fft.fftfreq(img_size)
     fy = np.fft.fftfreq(img_size)
     kx, ky = np.meshgrid(fx, fy)
@@ -151,7 +151,14 @@ def generate_dust_cirrus(img_size, amplitude):
     noise_fft = (np.random.normal(size=(img_size, img_size)) + 
                  1j * np.random.normal(size=(img_size, img_size)))
     
-    noise_fft *= k**(-1.5)
+    # Beta typically ranges from 2.5 to 3.5 for ISM cirrus. 
+    # We randomize this to give the network different textures to learn.
+    if exponent is None:
+        beta = np.random.uniform(2.5, 4.0)
+    else:
+        beta = exponent
+        
+    noise_fft *= k**(-beta / 2.0)
     noise_fft[0, 0] = 0.0 
     
     dust_map = np.real(np.fft.ifft2(noise_fft))
@@ -187,8 +194,14 @@ def generate_mosaic_data(mosaic_size, params):
     if np.random.rand() < 0.7:
         print("🌫️ Adding realistic Interstellar Cirrus (Dust) to mosaic...")
         raw_dust = generate_dust_cirrus(mosaic_size, 1.0)
+        
+        # 🚀 NEW: Random clumping factor to create sharper cloud edges and more 'clear' regions
+        # Gamma > 1 creates 'wispy' structures, Gamma = 1 is standard Gaussian
+        gamma = np.random.uniform(1.0, 5.0)
+        clumpy_dust = raw_dust ** gamma
+        
         max_extinction = np.random.uniform(0.2, 5.0)
-        transmission_map = 10 ** (-0.4 * raw_dust * max_extinction)
+        transmission_map = 10 ** (-0.4 * clumpy_dust * max_extinction)
         
         star_transmissions = map_coordinates(transmission_map, [py, px], order=1, mode='nearest')
         apparent_fluxes = fluxes * star_transmissions
@@ -198,7 +211,7 @@ def generate_mosaic_data(mosaic_size, params):
         sky_foreground = sky_level * (1.0 - frac_bg)
         sky_background_attenuated = (sky_level * frac_bg) * transmission_map
         total_sky_map = sky_foreground + sky_background_attenuated
-        additive_dust_emission = raw_dust * np.random.uniform(20, 100)
+        additive_dust_emission = clumpy_dust * np.random.uniform(20, 100)
     else:
         transmission_map = np.ones((mosaic_size, mosaic_size), dtype=np.float32)
         apparent_fluxes = fluxes.copy()

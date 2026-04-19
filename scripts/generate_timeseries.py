@@ -163,10 +163,20 @@ def main():
         from castor.data.stage0_gaussian import generate_dust_cirrus
         print("🌫️ Generating Master Interstellar Cirrus (Dust) Map...")
         dust_map_size = mosaic_size + padding_px * 2
-        raw_dust_map = generate_dust_cirrus(dust_map_size, 1.0)
+        
+        # 🚀 NEW: Randomize the power spectrum beta
+        beta = np.random.uniform(2.5, 4.0)
+        raw_dust_map = generate_dust_cirrus(dust_map_size, 1.0, exponent=beta)
+        
+        # 🚀 NEW: Randomize clumping (gamma) to create sharpened clouds
+        gamma = np.random.uniform(1.0, 5.0)
+        clumpy_dust_map = raw_dust_map ** gamma
+        
         max_extinction = np.random.uniform(1.0, 4.0)
-        master_transmission = 10 ** (-0.4 * raw_dust_map * max_extinction)
-        master_scattering = raw_dust_map * np.random.uniform(10, 50)
+        master_transmission = 10 ** (-0.4 * clumpy_dust_map * max_extinction)
+        
+        # Increased scattering amplitude for better visibility against sky background
+        master_scattering = clumpy_dust_map * np.random.uniform(50, 200)
     else:
         master_transmission = None
         master_scattering = None
