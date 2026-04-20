@@ -82,6 +82,27 @@ def generate_single_chunk(idx, config):
     K = d_cfg['max_capacity_per_cell']
 
     random_pixel_scale = np.random.uniform(bounds['pixel_scale_min'], bounds['pixel_scale_max'])
+    
+    # --- DYNAMIC DENSITY SCALING (Capacity Management) ---
+    # target occupancy: average stars per cell brighter than 26
+    # Aim for 0.5 to 2.5 stars per cell (model max is 3)
+    target_occupancy = np.random.uniform(0.5, 2.5)
+    
+    cell_area_sq_deg = (cell_size * random_pixel_scale / 3600.0)**2
+    # target_density_26 is stars per square degree
+    target_density_26 = target_occupancy / cell_area_sq_deg
+    
+    # Clip to physical bounds from config if provided, but prioritize occupancy safety
+    d26_min = d_cfg.get('density_26_min', 500_000)
+    d26_max = d_cfg.get('density_26_max', 50_000_000)
+    target_density_26 = np.clip(target_density_26, d26_min, d26_max)
+
+    buffer = 10
+    chunk_fov_arcsec = (image_size + 2 * buffer) * random_pixel_scale
+    chunk_area_sq_deg = (chunk_fov_arcsec / 3600.0)**2
+    expected_n_26 = target_density_26 * chunk_area_sq_deg
+    
+    # LF params
     lf = d_cfg['lf_params']
     gamma = np.random.uniform(lf['gamma_min'], lf['gamma_max'])
     rc_loc = np.random.uniform(lf['rc_loc_min'], lf['rc_loc_max'])
@@ -89,12 +110,7 @@ def generate_single_chunk(idx, config):
     rc_enhancement = np.random.uniform(lf['rc_enh_min'], lf['rc_enh_max'])
     m_min, m_max = lf['m_min'], lf['m_max']
 
-    target_density_26 = np.random.uniform(d_cfg['density_26_min'], d_cfg['density_26_max'])
-    buffer = 10
-    chunk_fov_arcsec = (image_size + 2 * buffer) * random_pixel_scale
-    chunk_area_sq_deg = (chunk_fov_arcsec / 3600.0)**2
-    expected_n_26 = target_density_26 * chunk_area_sq_deg
-    
+    # Analytic LF Fraction calculation for n_base draw
     f_base_26 = (10**(gamma * 26.0) - 10**(gamma * m_min)) / (10**(gamma * m_max) - 10**(gamma * m_min))
     f_base_rc_bin = (10**(gamma * (rc_loc + 0.5)) - 10**(gamma * (rc_loc - 0.5))) / (10**(gamma * m_max) - 10**(gamma * m_min))
     f_rc_26 = 0.5 * (1.0 + erf((26.0 - rc_loc) / (rc_scale * np.sqrt(2.0))))
@@ -109,8 +125,10 @@ def generate_single_chunk(idx, config):
     max_extinction = np.random.uniform(0.0, 5.0)
     
     random_psf, psf_params = generate_random_galsim_psf(bounds)
+    
+    # --- SPEED FIX: Lighter Interpolation ---
     cached_psf_image = random_psf.drawImage(scale=random_pixel_scale / 4.0, method='auto')
-    fast_psf = galsim.InterpolatedImage(cached_psf_image, x_interpolant='lanczos15')
+    fast_psf = galsim.InterpolatedImage(cached_psf_image, x_interpolant='lanczos3')
     
     mag_limit = calculate_dynamic_magnitude_cutoff(exp_time, zp, sky_mag, random_pixel_scale, read_noise=read_noise, sigma=psf_params['fwhm'] / 2.355)
     
@@ -126,6 +144,7 @@ def generate_single_chunk(idx, config):
     
     if max_extinction > 0.0:
         raw_dust = generate_dust_cirrus(image_size, 1.0)
+        # raw_dust is normalized [0,1] inside generate_dust_cirrus
         transmission_map = 10 ** (-0.4 * raw_dust * max_extinction)
         star_transmissions = map_coordinates(transmission_map, [np.clip(py, 0, image_size-1), np.clip(px, 0, image_size-1)], order=1, mode='nearest')
         apparent_fluxes = fluxes * star_transmissions
@@ -194,8 +213,12 @@ def run_stage1_generation(config_path="config/config.yaml", num_samples=None, nu
     os.makedirs(s1_cfg['data_dir'], exist_ok=True)
     
     output_path = os.path.join(s1_cfg['data_dir'], "stage1_data.h5")
-    if num_workers is None: num_workers = mp.cpu_count()
-    print(f"🔥 Parallelizing generation with {num_workers} workers...")
+    if num_workers is None: 
+        num_workers = mp.cpu_count()
+    
+    # 1. Leave 1 core entirely free for HDF5 I/O and serialization overhead
+    pool_workers = max(1, num_workers - 1)
+    print(f"🔥 Parallelizing generation with {pool_workers} workers (1 core reserved for I/O)...")
 
     with h5py.File(output_path, 'w') as f:
         dset_img = f.create_dataset("images", (total_samples, d_cfg['image_size'], d_cfg['image_size']), dtype='f4')
@@ -204,8 +227,9 @@ def run_stage1_generation(config_path="config/config.yaml", num_samples=None, nu
         dset_meta = f.create_dataset("metas", (total_samples, 17), dtype='f4')
         
         worker_func = partial(generate_single_chunk, config=config)
-        with mp.Pool(num_workers) as pool:
-            for i, (img, tgt, med, meta) in enumerate(tqdm(pool.imap(worker_func, range(total_samples)), total=total_samples)):
+        with mp.Pool(pool_workers) as pool:
+            # 2. Use imap_unordered to prevent memory buffering
+            for i, (img, tgt, med, meta) in enumerate(tqdm(pool.imap_unordered(worker_func, range(total_samples)), total=total_samples)):
                 dset_img[i], dset_tgt[i], dset_med[i], dset_meta[i] = img, tgt, med, meta
 
 if __name__ == "__main__":

@@ -34,7 +34,7 @@ curriculum:
       lambda_diffraction_reg: 0.0
     optical_randomization:
       pixel_scale_min: 0.05  
-      pixel_scale_max: 1.0   
+      pixel_scale_max: 0.4   
       fwhm_min: 0.8  
       fwhm_max: 5.0  
       max_shear: 0.15 
@@ -71,8 +71,10 @@ data_params:
   max_stars: 300000
   
   # New density-based scaling (stars/sq deg brighter than 26th mag)
+  # These bounds will be dynamically adjusted by the generator to target
+  # a safe cell occupancy (avg 0.5 - 2.5 stars per cell)
   density_26_min: 500_000
-  density_26_max: 20_000_000
+  density_26_max: 50_000_000
 
   
   image_size: 256
