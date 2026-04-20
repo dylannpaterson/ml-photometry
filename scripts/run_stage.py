@@ -18,7 +18,7 @@ from castor.engine.trainer import Trainer
 from castor.engine.evaluator import Evaluator
 # Removed top-level InferenceEngine import
 from castor.engine.analyzer import ThresholdAnalyzer
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, SubsetRandomSampler
 from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, SHAPE_SIZE, GLOBAL_STRETCH_SCALE
 
 def get_stage_config(config, stage_idx):
@@ -277,16 +277,26 @@ def run_train(stage_idx, config, device):
     use_optimizations = num_workers > 0
     prefetch_factor = (4 if stage_idx == 0 else 2) if use_optimizations else None
     
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=micro_batch, 
-        shuffle=True, 
-        num_workers=num_workers,
-        pin_memory=use_optimizations,
-        persistent_workers=use_optimizations,
-        prefetch_factor=prefetch_factor,
-        drop_last=True
-    )
+    # --- EPOCH SUBSETTING (Stage 0 Only) ---
+    if stage_idx == 0:
+        # For Stage 0, we'll wrap the DataLoader to re-subset every epoch
+        # This is handled inside Trainer.train by re-initializing the iterator
+        # but we need to pass a sampler that shuffles every epoch.
+        # However, SubsetRandomSampler only shuffles once.
+        # We'll use a custom Trainer hook or just re-initialize the train_loader each epoch.
+        train_loader = None # Will be initialized inside Trainer
+    else:
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=micro_batch, 
+            shuffle=True, 
+            num_workers=num_workers,
+            pin_memory=use_optimizations,
+            persistent_workers=use_optimizations,
+            prefetch_factor=prefetch_factor,
+            drop_last=True
+        )
+
     val_loader = DataLoader(
         val_dataset, 
         batch_size=micro_batch, 
@@ -312,6 +322,29 @@ def run_train(stage_idx, config, device):
         lr=stage_cfg["learning_rate"],
         checkpoint_prefix=stage_prefix
     )
+
+    # --- STAGE 0 EPOCH SUBSETTING HOOK ---
+    if stage_idx == 0:
+        def stage0_epoch_callback(epoch):
+            num_total = len(train_dataset)
+            indices = np.random.permutation(num_total)
+            subset_indices = indices[:num_total // 2]
+            sampler = SubsetRandomSampler(subset_indices)
+            
+            new_loader = DataLoader(
+                train_dataset,
+                batch_size=micro_batch,
+                sampler=sampler,
+                num_workers=num_workers,
+                pin_memory=use_optimizations,
+                persistent_workers=use_optimizations,
+                prefetch_factor=prefetch_factor,
+                drop_last=True
+            )
+            return new_loader
+            
+        trainer.epoch_loader_callback = stage0_epoch_callback
+
     
     if resume_from_last and stage_idx > 0:
         last_stage_model = f"checkpoints/stage{stage_idx-1}_final.pth"

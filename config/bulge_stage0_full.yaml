@@ -17,10 +17,108 @@ curriculum:
       mosaic_size: 4088
 
 data_params:
-  num_train_samples: 50000
+  num_train_samples: 100000
   num_val_samples: 2000
   min_stars: 500
   max_stars: 1500
   image_size: 256
   max_capacity_per_cell: 3
   shape_size: 9
+ # Stage 1: Multi-Telescope Foundation (Direct GalSim)
+  # Parameterized LF (Apparent Magnitudes) + Continuous Domain Randomization
+  stage1:
+    name: "Multi-Telescope Foundation (Direct GalSim)"
+    data_dir: "data/stage1_multitel"
+    epochs: 50
+    batch_size: 512
+    learning_rate: 0.0001
+    num_workers: 4
+    resume_from_last_stage: true
+    loss_params:
+      lambda_diffraction_reg: 0.0
+    optical_randomization:
+      pixel_scale_min: 0.05  
+      pixel_scale_max: 0.4   
+      fwhm_min: 0.8  
+      fwhm_max: 5.0  
+      max_shear: 0.15 
+      moffat_beta_min: 2.0 
+      moffat_beta_max: 4.5 
+      obscuration_min: 0.0   
+      obscuration_max: 0.4   
+      strut_thick_max: 0.08 
+      zernike_max: 0.15      
+      jitter_sigma_max: 0.5  
+      read_noise_min: 2.0
+      read_noise_max: 15.0
+      sky_mag_min: 20.0
+      sky_mag_max: 23.0
+
+  # Stage 2: Roman-specific High-Fidelity Fine-tuning (Romanisim)
+  stage2:
+    name: "Roman High-Fidelity Fine-tuning"
+    data_dir: "data/stage2_romanisim"
+    epochs: 50
+    batch_size: 512
+    learning_rate: 0.00001
+    num_workers: 4
+    resume_from_last_stage: true
+
+data_params:
+  # Samples to cover the unique parameter states
+  num_train_samples: 100000 
+  num_val_samples: 5000
+  
+  # Massive unified population to hit VVV background levels
+  # Referenced to 1024x1024 at 0.11"/px if using static scaling
+  min_stars: 50000
+  max_stars: 300000
+  
+  # New density-based scaling (stars/sq deg brighter than 26th mag)
+  # These bounds will be dynamically adjusted by the generator to target
+  # a safe cell occupancy (avg 0.5 - 2.5 stars per cell)
+  density_26_min: 500_000
+  density_26_max: 50_000_000
+
+  
+  image_size: 256
+  
+  # Model-dependent constants (Aligned with castor.constants)
+  max_capacity_per_cell: 3
+  shape_size: 129
+  GLOBAL_STRETCH_SCALE: 10.0
+  
+  # Rendering & PSF Generation
+  min_snr: 5.0
+  
+  # Instrument & Observation Physics (Roman WFI Defaults)
+  physics_params:
+    pixel_scale: 0.11
+    sigma_fixed: 1.5
+    zp: 26.5
+    sky_mag: 22.0
+    read_noise: 5.0
+    exp_time_min: 30.0
+    exp_time_max: 60.0
+    
+  # Bulge Luminosity Function Simulation Bounds
+  lf_params:
+    m_min: 12.0
+    m_max: 32.0
+    rc_loc_min: 14.5
+    rc_loc_max: 16.5
+    rc_scale_min: 0.2
+    rc_scale_max: 0.5
+    rc_enh_min: 5.0
+    rc_enh_max: 15.0
+    gamma_min: 0.25
+    gamma_max: 0.35
+  
+loss_params:
+  lambda_prob: 1.0
+  lambda_pos: 1.0
+  lambda_flux: 1.0
+  lambda_bg: 1.0
+  lambda_diffraction_reg: 10.0
+  focal_alpha: 0.50
+  focal_gamma: 2.0

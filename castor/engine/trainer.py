@@ -327,6 +327,11 @@ class Trainer:
         K = self.config["data_params"].get("max_capacity_per_cell", MAX_CAPACITY_PER_CELL)
 
         for epoch in range(self.start_epoch, self.epochs):
+            # --- EPOCH-WISE DATA RE-SAMPLING ---
+            if self.epoch_loader_callback is not None:
+                self.train_loader = self.epoch_loader_callback(epoch)
+                print(f"🔄 Re-subsetted training data for epoch {epoch+1} ({len(self.train_loader.sampler)} samples)")
+
             self.model.train(); epoch_loss, start_time = 0, time.time()
             self.optimizer.zero_grad(set_to_none=True)
             
@@ -338,6 +343,37 @@ class Trainer:
                     images, targets = batch
                     images, targets = images.to(self.device, non_blocking=True), targets.to(self.device, non_blocking=True).float()
                 
+                # --- APPLY D4 SPATIAL SYMMETRY (Stage 0 Only) ---
+                if self.checkpoint_prefix == "stage0":
+                    # targets shape: [B, GH, GW, K*5 + 1]
+                    B, GH, GW, C = targets.shape
+                    K_aug = self.config["data_params"].get("max_capacity_per_cell", 3)
+                    num_params_aug = (C - 1) // K_aug
+                    
+                    # 1. Horizontal Flip
+                    if torch.rand(1).item() < 0.5:
+                        images = torch.flip(images, dims=[-1])
+                        targets = torch.flip(targets, dims=[2])
+                        star_view = targets[..., :-1].view(B, GH, GW, K_aug, num_params_aug)
+                        star_view[..., 1] = 1.0 - star_view[..., 1] # Invert dx
+
+                    # 2. Vertical Flip
+                    if torch.rand(1).item() < 0.5:
+                        images = torch.flip(images, dims=[-2])
+                        targets = torch.flip(targets, dims=[1])
+                        star_view = targets[..., :-1].view(B, GH, GW, K_aug, num_params_aug)
+                        star_view[..., 2] = 1.0 - star_view[..., 2] # Invert dy
+
+                    # 3. Transpose (Diagonal Flip)
+                    if torch.rand(1).item() < 0.5:
+                        images = torch.transpose(images, -2, -1)
+                        targets = torch.transpose(targets, 1, 2)
+                        star_view = targets[..., :-1].view(B, GH, GW, K_aug, num_params_aug)
+                        # Swap dx and dy
+                        dx_temp = star_view[..., 1].clone()
+                        star_view[..., 1] = star_view[..., 2]
+                        star_view[..., 2] = dx_temp
+
                 # --- LIVE NOISE INJECTION ---
                 images_positive = torch.clamp(images, min=0.0) 
                 images_noisy = torch.poisson(images_positive)
