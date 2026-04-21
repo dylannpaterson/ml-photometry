@@ -417,6 +417,21 @@ class Trainer:
                 
                 images_final = torch.asinh((images_noisy - batch_medians) / self.loss_params["stretch_scale"])
                 
+                # --- DYNAMIC TARGET STRETCHING ---
+                # 1. Stretch Star Fluxes (Index 3 in the [p, dx, dy, flux, snr] layout)
+                # Ensure we handle non-contiguous tensors from augmentation with .reshape
+                B_idx, GH_idx, GW_idx, C_idx = targets.shape
+                num_params_idx = (C_idx - 1) // K_aug
+                star_view = targets[..., :-1].reshape(B_idx, GH_idx, GW_idx, K_aug, num_params_idx)
+                
+                # Arcsinh stretch the flux
+                star_view[..., 3] = torch.asinh(star_view[..., 3] / self.loss_params["stretch_scale"])
+                
+                # 2. Stretch Background (Subtract median, then stretch)
+                bg_raw = targets[..., -1:]
+                bg_network = torch.asinh((bg_raw - batch_medians) / self.loss_params["stretch_scale"])
+                targets[..., -1:] = bg_network
+                
                 # --- LIVE CONFIDENCE PRIOR GENERATION ---
                 with torch.no_grad():
                     B, GH, GW, _ = targets.shape
@@ -568,6 +583,9 @@ class Trainer:
         num_batches = len(self.val_loader)
         if num_batches == 0: return 0.0
         
+        # Get K for stretching
+        K_val = self.config["data_params"].get("max_capacity_per_cell", 3)
+        
         with torch.no_grad():
             for batch in self.val_loader:
                 if isinstance(batch, dict):
@@ -599,6 +617,16 @@ class Trainer:
                 else:
                     batch_medians = images_noisy.view(images_noisy.shape[0], -1).median(dim=1)[0].view(-1, 1, 1, 1)
                 images_final = torch.asinh((images_noisy - batch_medians) / self.loss_params["stretch_scale"])
+                
+                # --- DYNAMIC TARGET STRETCHING (MATCH TRAINING) ---
+                B_v, GH_v, GW_v, C_v = targets.shape
+                num_params_v = (C_v - 1) // K_val
+                star_view = targets[..., :-1].reshape(B_v, GH_v, GW_v, K_val, num_params_v)
+                star_view[..., 3] = torch.asinh(star_view[..., 3] / self.loss_params["stretch_scale"])
+                
+                bg_raw = targets[..., -1:]
+                bg_network = torch.asinh((bg_raw - batch_medians) / self.loss_params["stretch_scale"])
+                targets[..., -1:] = bg_network
                 
                 # Use 1-channel zero prior
                 prior_zeros = torch.zeros_like(images_final)

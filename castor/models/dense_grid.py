@@ -540,8 +540,7 @@ def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=1.0, lambda_pos=
         
         # Align flux loss with Arcsinh stretching
         asinh_flux_pred = preds["raw_asinh_flux"][obj_mask]
-        flux_target = star_targets[..., 3:4][obj_mask]
-        asinh_flux_target = torch.asinh(flux_target / float(stretch_scale))
+        asinh_flux_target = star_targets[..., 3:4][obj_mask] # Stretched by Trainer
         log_var_flux = star_preds[..., 6:7][obj_mask]
         
         reg_weights = p_target[obj_mask]
@@ -578,6 +577,6 @@ def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=1.0, lambda_pos=
     else:
         # Fallback
         total_loss = (raw_prob_loss + raw_pos_loss + raw_flux_loss + raw_bg_loss + raw_curvature_loss + raw_entropy_loss)
-        prob_loss, pos_loss, flux_loss, bg_loss, ent_loss = raw_prob_loss, raw_pos_loss, raw_flux_loss, raw_bg_loss, raw_entropy_loss
+        prob_loss, pos_loss, flux_loss, bg_loss, curv_loss, ent_loss = raw_prob_loss, raw_pos_loss, raw_flux_loss, raw_bg_loss, raw_curvature_loss, raw_entropy_loss
                   
     return total_loss, prob_loss, pos_loss, flux_loss, bg_loss, ent_loss

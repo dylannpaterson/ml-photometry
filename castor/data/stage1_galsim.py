@@ -133,7 +133,6 @@ def generate_single_chunk(idx, config, psf_queue):
     cell_size = s1_cfg.get('cell_size', DEFAULT_CELL_SIZE)
     grid_size = image_size // cell_size
     K = d_cfg['max_capacity_per_cell']
-    transform = AstroSpaceTransform(stretch_scale=GLOBAL_STRETCH_SCALE)
 
     # --- 🛰️ CONSUME PSF FROM QUEUE ---
     psf_data = psf_queue.get()
@@ -253,9 +252,10 @@ def generate_single_chunk(idx, config, psf_queue):
     g1, g2 = psf_params['g1'], psf_params['g2']
     meta = np.array([exp_time, zp, sky_mag, psf_params['fwhm'], np.sqrt(g1**2 + g2**2), psf_params['obscuration'], float(psf_params['num_struts']), random_pixel_scale, psf_params['defocus'], np.sqrt(psf_params['astig1']**2 + psf_params['astig2']**2), np.sqrt(psf_params['coma1']**2 + psf_params['coma2']**2), psf_params['jitter_sigma'], read_noise, max_extinction, gamma, rc_loc, rc_enhancement], dtype=np.float32)
 
+    # REFACTORED: Save the absolute, linear background expectation (Physical Space)
     target_grid_full = np.concatenate([
         target_grid.reshape(grid_size, grid_size, -1), 
-        transform.target_bg_to_network(bg_downsampled - chunk_median)[:, :, None]
+        bg_downsampled[:, :, None]
     ], axis=-1).astype(np.float32)
     
     del full_image_obj, convolved_bg_array, bg_downsampled, total_sky_map
