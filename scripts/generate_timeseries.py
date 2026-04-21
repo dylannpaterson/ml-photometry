@@ -10,7 +10,7 @@ from tqdm import tqdm
 from castor.cloud.config_utils import load_config
 from castor.data.stage0_gaussian import (
     sample_bulge_magnitudes, 
-    generate_stpsf_roman_psf,
+    get_oversampled_gaussian_psf,
     calculate_safe_magnitude_cutoff
 )
 from castor.constants import GLOBAL_STRETCH_SCALE, SHAPE_SIZE
@@ -94,8 +94,9 @@ def render_tiled(px, py, fluxes, mosaic_size, psf_1x, tile_size=1024):
             
             # Paint to local grid
             def paint(x, y, w):
-                flat_idx = y * tw + x
-                local_grid.flat += np.bincount(flat_idx, weights=t_fluxes * w, minlength=local_grid.size)
+                mask = (x >= 0) & (x < tw) & (y >= 0) & (y < th)
+                flat_idx = y[mask] * tw + x[mask]
+                local_grid.flat += np.bincount(flat_idx, weights=t_fluxes[mask] * w[mask], minlength=local_grid.size)
             
             paint(ix, iy, w00)
             paint(ix+1, iy, w10)
@@ -147,9 +148,8 @@ def main():
     sca_center_x, sca_center_y = (mosaic_size - 1) / 2.0, (mosaic_size - 1) / 2.0
 
     print(f"🛰️  Generating realistic Roman PSF on-the-fly...")
-    repr_psf_4x = generate_stpsf_roman_psf(grid_size=SHAPE_SIZE, oversample=O)
-    psf_1x = repr_psf_4x.reshape(SHAPE_SIZE, O, SHAPE_SIZE, O).mean(axis=(1, 3))
-    psf_1x /= (np.sum(psf_1x) + 1e-9)
+    # Baseline Roman Gaussian: sigma_detector = 0.405
+    psf_1x = get_oversampled_gaussian_psf(sigma_detector=0.405, grid_size=SHAPE_SIZE, oversample=O)
 
     cadence_days = args.cadence / 24.0
     times = (args.t0 - (args.num_epochs // 2) * cadence_days) + np.arange(args.num_epochs) * cadence_days

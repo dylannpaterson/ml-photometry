@@ -1,0 +1,62 @@
+run_config:
+  resume_from_checkpoint: false
+  force_regenerate_data: true
+
+curriculum:
+  stage1:
+    name: "Debug Stage 1"
+    data_dir: "data/debug_stage1"
+    epochs: 1
+    batch_size: 16
+    learning_rate: 0.0001
+    num_workers: 4
+    resume_from_last_stage: false
+    cell_size: 4
+    optical_randomization:
+      pixel_scale_min: 0.05  
+      pixel_scale_max: 0.4   
+      fwhm_min: 0.8  
+      fwhm_max: 5.0  
+      max_shear: 0.15 
+      moffat_beta_min: 2.0 
+      moffat_beta_max: 4.5 
+      obscuration_min: 0.0   
+      obscuration_max: 0.4   
+      strut_thick_max: 0.08 
+      zernike_max: 0.15      
+      jitter_sigma_max: 0.5  
+      read_noise_min: 2.0
+      read_noise_max: 15.0
+      sky_mag_min: 20.0
+      sky_mag_max: 23.0
+
+data_params:
+  num_train_samples: 10
+  num_val_samples: 5
+  min_stars: 1000
+  max_stars: 2000
+  density_26_min: 500_000
+  density_26_max: 50_000_000
+  image_size: 256
+  max_capacity_per_cell: 3
+  shape_size: 129
+  min_snr: 5.0
+  physics_params:
+    pixel_scale: 0.11
+    sigma_fixed: 1.5
+    zp: 26.5
+    sky_mag: 22.0
+    read_noise: 5.0
+    exp_time_min: 30.0
+    exp_time_max: 60.0
+  lf_params:
+    m_min: 12.0
+    m_max: 32.0
+    rc_loc_min: 14.5
+    rc_loc_max: 16.5
+    rc_scale_min: 0.2
+    rc_scale_max: 0.5
+    rc_enh_min: 5.0
+    rc_enh_max: 15.0
+    gamma_min: 0.25
+    gamma_max: 0.35

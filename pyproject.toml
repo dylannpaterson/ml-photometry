@@ -19,7 +19,6 @@ dependencies = [
     "tqdm",
     "scipy",
     "pyarrow",
-    "jax[cuda12]",
     "numba",
     "h5py",
     "galsim",

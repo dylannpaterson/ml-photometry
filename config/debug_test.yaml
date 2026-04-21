@@ -83,8 +83,7 @@ Instead of simple regression, the model minimizes the **Gaussian Negative Log-Li
 ## 6. Implementation Strategy: The Data Pipeline
 To achieved maximum throughput and minimum disk footprint, the pipeline uses a hybrid rendering and standardization strategy.
 
-*   **JAX-Accelerated Generation (Two-Tier Speed Hack):** To generate the massive Stage 0 mosaics (up to 8 million stars), the pipeline can use a fused JAX GPU operation (`lax.conv_general_dilated`). This allows for ultra-fast, sub-pixel accurate phase rendering of the point sources directly on the GPU.
-*   **NumPy-Optimized Rendering:** For CPU-heavy environments or pre-training, generation is also driven by highly optimized NumPy and SciPy operations (e.g., `fftconvolve`, `map_coordinates`), using **Numba (@njit)** for fast sub-pixel grid painting.
+*   **NumPy-Optimized Rendering:** For CPU-heavy environments or pre-training, generation is driven by highly optimized NumPy and SciPy operations (e.g., `fftconvolve`, `map_coordinates`), using **Numba (@njit)** for fast sub-pixel grid painting.
 *   **HDF5 Conversion with Compression:** Raw mosaics are converted into HDF5 files using **LZF compression** and **float32 precision** for targets. An incremental "sample-and-delete" strategy is used during conversion to minimize the peak disk footprint.
 *   **JIT Live Noise:** During training, the PyTorch `Dataset` dynamically injects sky background, Poisson noise, and Gaussian read noise on the GPU, ensuring infinite noise realizations and preventing overfitting.
 
@@ -93,7 +92,7 @@ The pipeline uses a multi-stage curriculum to build a robust foundation model fo
 
 ### Stage 0: Gaussian Pre-training (The "Physics & Crowding Prior" Phase)
 *   **Objective:** Teach the model the Dense Grid prediction format, sub-pixel localization, and crowding recoverability using realistic Roman PSFs generated on-the-fly.
-*   **Data:** Vectorized synthetic images generated via a NumPy/Numba or JAX renderer. Star fluxes and counts are drawn from a realistic Dynamic Bulge Luminosity Function.
+*   **Data:** Vectorized synthetic images generated via a NumPy/Numba renderer. Star fluxes and counts are drawn from a realistic Dynamic Bulge Luminosity Function.
 *   **Goal:** Reach competency in detection and flux recovery in hyper-dense fields before introducing complex optical diffraction artifacts.
 
 ### Stage 1: Multi-Telescope Foundation Training (The "Universal Photometrist" Phase)

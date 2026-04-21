@@ -38,7 +38,7 @@ def load_config(config_path="config/config.yaml"):
             raise ValueError(f"Missing required section in config: '{section}'")
 
     # Validate data_params (needed for generation)
-    data_req = ["num_train_samples", "num_val_samples", "min_stars", "max_stars", "image_size"]
+    data_req = ["num_train_samples", "num_val_samples", "image_size"]
     for field in data_req:
         if field not in config["data_params"]:
             raise ValueError(f"Missing field in data_params: '{field}'")

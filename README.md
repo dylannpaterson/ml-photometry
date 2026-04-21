@@ -45,7 +45,7 @@ To maintain a virtually negligible disk footprint while preserving extremely hig
 The pipeline is structured around curriculum learning stages, starting with synthetic Gaussian profiles (Stage 0) before advancing to realistic multi-telescope and `romanisim` data.
 
 ### 1. Data Pre-generation
-Generate synthetic training and validation chunks. For Stage 0, this utilizes a dynamic Galactic Bulge Luminosity Function and leverages JAX-accelerated GPU rendering to rapidly generate extremely crowded fields (up to 8 million stars).
+Generate synthetic training and validation chunks. For Stage 0, this utilizes a dynamic Galactic Bulge Luminosity Function and leverages highly optimized NumPy and Numba-accelerated rendering to rapidly generate extremely crowded fields (up to 8 million stars).
 ```bash
 python scripts/pregenerate_data.py 0 --config config/config.yaml
 ```

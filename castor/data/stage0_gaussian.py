@@ -14,101 +14,73 @@ from castor.constants import DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL, GLOBAL_ST
 
 # Ensure STPSF_PATH is set for stpsf tool
 if 'STPSF_PATH' not in os.environ:
-    # Default location where stpsf downloads data if not found
-    default_path = os.path.expanduser('~/data/stpsf-data')
-    if os.path.exists(default_path):
-        os.environ['STPSF_PATH'] = default_path
+    # Try common cluster and local paths
+    candidate_paths = [
+        os.path.expanduser('~/project_amber/stpsf-data'),
+        os.path.expanduser('~/data/stpsf-data'),
+        '/fs/project/gaudi.1/amber/stpsf-data',
+    ]
+    for path in candidate_paths:
+        if os.path.exists(os.path.join(path, 'version.txt')):
+            os.environ['STPSF_PATH'] = path
+            print(f"🛰️ Auto-detected STPSF_PATH: {path}")
+            break
 
-def generate_stpsf_roman_psf(grid_size=129, oversample=4):
+# --- CENTRALIZED RENDERING LOGIC ---
+
+def get_gaussian_psf(sigma=0.405, kernel_size=25):
     """
-    Generates a realistic Roman PSF on the fly using the stpsf tool.
-
-    Randomizes the detector (SCA) and position for variety. Falls back to 
-    an analytical model if stpsf is not available.
-
-    Parameters
-    ----------
-    grid_size : int, optional
-        The number of detector pixels for the PSF FOV, by default 129.
-    oversample : int, optional
-        The oversampling factor for the PSF calculation, by default 4.
-
-    Returns
-    -------
-    numpy.ndarray
-        The generated PSF data, normalized to sum to 1.
+    Generates a perfectly centered analytical 2D Gaussian PSF kernel.
+    Ensures the peak is at the exact center.
+    Sigma 0.405 derived from F146 FWHM=0.105" and scale=0.11"/px.
     """
-    try:
-        import stpsf
-    except ImportError:
-        # Fallback to a simplified analytical model if stpsf is not available
-        return _generate_fallback_psf(grid_size, oversample)
+    center = (kernel_size - 1) / 2.0
+    yy, xx = np.indices((kernel_size, kernel_size)) - center
+    psf = np.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+    return (psf / (psf.sum() + 1e-9)).astype(np.float32)
 
-    inst = stpsf.WFI()
-    
-    # Randomize Filter (Common Roman NIR filters)
-    filters = ['F062', 'F087', 'F106', 'F129', 'F146', 'F158', 'F184', 'F213']
-    inst.filter = np.random.choice(filters)
-    
-    # Randomize Detector (WFI01 to WFI18)
-    inst.detector = np.random.choice(inst.detector_list)
-    
-    # Randomize Position on the 4096x4096detector
-    inst.detector_position = (np.random.uniform(4, 4092), np.random.uniform(4, 4092))
-    
-    # Calculate PSF
-    # fov_pixels=grid_size means the FOV will match grid_size detector pixels
-    psf_hdu = inst.calc_psf(fov_pixels=grid_size, oversample=oversample)
-    psf_data = psf_hdu[0].data.astype(np.float32)
-    
-    # Ensure exact expected shape (grid_size * oversample)
-    expected_s = grid_size * oversample
-    if psf_data.shape[0] != expected_s:
-        # Crop or pad to match
-        s = psf_data.shape[0]
-        if s > expected_s:
-            start = (s - expected_s) // 2
-            psf_data = psf_data[start:start+expected_s, start:start+expected_s]
-        else:
-            pad = (expected_s - s) // 2
-            psf_data = np.pad(psf_data, ((pad, expected_s-s-pad), (pad, expected_s-s-pad)))
-
-    return psf_data / (psf_data.sum() + 1e-9)
-
-def _generate_fallback_psf(grid_size, oversample):
+def get_oversampled_gaussian_psf(sigma_detector, grid_size=129, oversample=4):
     """
-    Simplified Roman-like PSF with core and diffraction spikes.
-
-    Parameters
-    ----------
-    grid_size : int
-        The size of the grid in detector pixels.
-    oversample : int
-        The oversampling factor.
-
-    Returns
-    -------
-    numpy.ndarray
-        The generated fallback PSF data.
+    Generates a Gaussian PSF on an oversampled grid and block-reduces to 1x.
+    Accepts sigma in detector pixel units.
     """
-    S = grid_size * oversample
-    center = (S - 1) / 2.0
-    y, x = np.meshgrid(np.arange(S) - center, np.arange(S) - center, indexing='ij')
+    S_oversampled = grid_size * oversample
+    sigma_oversampled = sigma_detector * oversample
     
-    sigma = np.random.uniform(1.6, 2.0)
-    q = np.random.uniform(0.9, 1.0)
-    theta = np.random.uniform(0, np.pi)
-    cos, sin = np.cos(theta), np.sin(theta)
-    xp, yp = x * cos + y * sin, -x * sin + y * cos
-    psf = np.exp(-(xp**2 / (2 * sigma**2) + yp**2 / (2 * (sigma * q)**2)))
+    # Generate in oversampled space (e.g. 516x516 for 129x129 @ 4x)
+    psf_oversampled = get_gaussian_psf(sigma=sigma_oversampled, kernel_size=S_oversampled)
     
-    spike_angles = [theta + i * np.pi / 3 for i in range(3)]
-    for angle in spike_angles:
-        dist_to_line = np.abs(x * np.sin(angle) - y * np.cos(angle))
-        psf += np.exp(-dist_to_line / 0.8) * 0.05
+    # Block reduce to 1x detector resolution
+    psf_1x = psf_oversampled.reshape(grid_size, oversample, grid_size, oversample).mean(axis=(1, 3))
+    psf_1x /= (psf_1x.sum() + 1e-9)
+    return psf_1x.astype(np.float32)
+
+def render_gaussian_stars(height, width, px, py, fluxes, sigma=0.405, psf_kernel=None):
+    """
+    Vectorized star renderer using bilinear splatting followed by convolution.
+    """
+    if psf_kernel is None:
+        psf_kernel = get_gaussian_psf(sigma=sigma)
         
-    psf = np.maximum(0, psf)
-    return psf / (psf.sum() + 1e-9)
+    grid = np.zeros((height, width), dtype=np.float32)
+    if len(fluxes) == 0:
+        return grid
+        
+    x0, y0 = np.floor(px).astype(int), np.floor(py).astype(int)
+    dx, dy = px - x0, py - y0
+    w00, w10, w01, w11 = (1 - dx) * (1 - dy), dx * (1 - dy), (1 - dx) * dy, dx * dy
+    
+    def paint(gr, xi, yi, wi, fi):
+        mask = (xi >= 0) & (xi < width) & (yi >= 0) & (yi < height)
+        flat = yi[mask] * width + xi[mask]
+        gr.flat += np.bincount(flat, weights=fi[mask] * wi[mask], minlength=gr.size)
+    
+    paint(grid, x0, y0, w00, fluxes)
+    paint(grid, x0+1, y0, w10, fluxes)
+    paint(grid, x0, y0+1, w01, fluxes)
+    paint(grid, x0+1, y0+1, w11, fluxes)
+    
+    return fftconvolve(grid, psf_kernel, mode='same')
 
 def fast_paint_grid(lx, ly, fluxes, snrs, sort_idx, min_snr, grid_size, cell_size, K):
     """
@@ -216,7 +188,7 @@ def sample_bulge_magnitudes(n_total, rc_mag, rc_sigma, rc_enhancement=3.0, m_min
     np.random.shuffle(m_all)
     return m_all
 
-def calculate_safe_magnitude_cutoff(exp_time, zp, sky_mag, read_noise=5.0, sigma=1.5, snr_cutoff=1.0):
+def calculate_safe_magnitude_cutoff(exp_time, zp, sky_mag, read_noise=5.0, sigma=0.405, snr_cutoff=1.0):
     """
     Calculate the magnitude cutoff for a given SNR.
 
@@ -231,7 +203,7 @@ def calculate_safe_magnitude_cutoff(exp_time, zp, sky_mag, read_noise=5.0, sigma
     read_noise : float, optional
         Read noise in electrons, by default 5.0.
     sigma : float, optional
-        Gaussian sigma for PSF, by default 1.5.
+        Gaussian sigma for PSF, by default 0.405.
     snr_cutoff : float, optional
         SNR threshold for the cutoff, by default 1.0.
 
@@ -290,253 +262,150 @@ def generate_dust_cirrus(img_size, amplitude, exponent=None):
     dust_map /= (dust_map.max() + 1e-9)
     return dust_map * amplitude
 
-def generate_mosaic_data(mosaic_size, params):
-    """
-    Generates a full mosaic simulation including stars, dust, and sky.
-
-    This function uses a random Roman PSF, power-law luminosity function, 
-    fractal dust extinction, and additive sky noise.
-
-    Parameters
-    ----------
-    mosaic_size : int
-        The size of the output mosaic image.
-    params : dict
-        Parameters for the simulation (e.g., 'image_size', 'min_stars', 'max_stars').
-
-    Returns
-    -------
-    tuple
-        A tuple (full_image, truth_bg_map, structured_cat, meta, psf_1x).
-    """
-    area_ratio = (mosaic_size / params['image_size'])**2
-    exp_time, zp, sky_mag = np.random.uniform(30.0, 90.0), 26.5, 22.0
-    mag_limit = calculate_safe_magnitude_cutoff(exp_time, zp, sky_mag, snr_cutoff=1.0)
-    
-    n_stars_total = int(10 ** np.random.uniform(np.log10(params['min_stars'] * area_ratio), np.log10(params['max_stars'] * area_ratio)))
-    mags = sample_bulge_magnitudes(n_stars_total, np.random.uniform(14.5, 16.5), np.random.uniform(0.2, 0.5), np.random.uniform(5.0, 15.0), m_min=12.0, m_max=32.0, gamma=np.random.uniform(0.25, 0.35))
-    fluxes = exp_time * (10 ** (-0.4 * (mags - zp)))
-    
-    O = 4 
-    
-    # 1. Generate a random Roman PSF on the fly using Space Telescope tools (stpsf)
-    repr_psf_4x = generate_stpsf_roman_psf(SHAPE_SIZE, oversample=O)
-    psf_1x = repr_psf_4x.reshape(SHAPE_SIZE, O, SHAPE_SIZE, O).mean(axis=(1, 3))
-    psf_1x /= (np.sum(psf_1x) + 1e-9)
-
-    # 2. Placement
-    px, py = np.random.uniform(0.5, mosaic_size-1.5, len(fluxes)), np.random.uniform(0.5, mosaic_size-1.5, len(fluxes))
-    
-    # 3. Dust Extinction
-    sky_level = (10 ** (-0.4 * (sky_mag - zp))) * (0.11**2) * exp_time
-    if np.random.rand() < 0.7:
-        print("🌫️ Adding realistic Interstellar Cirrus (Dust) to mosaic...")
-        raw_dust = generate_dust_cirrus(mosaic_size, 1.0)
-        
-        # 🚀 NEW: Random clumping factor to create sharper cloud edges and more 'clear' regions
-        # Gamma > 1 creates 'wispy' structures, Gamma = 1 is standard Gaussian
-        gamma = np.random.uniform(1.0, 5.0)
-        clumpy_dust = raw_dust ** gamma
-        
-        max_extinction = np.random.uniform(0.2, 5.0)
-        transmission_map = 10 ** (-0.4 * clumpy_dust * max_extinction)
-        
-        star_transmissions = map_coordinates(transmission_map, [py, px], order=1, mode='nearest')
-        apparent_fluxes = fluxes * star_transmissions
-        apparent_mags = mags - 2.5 * np.log10(star_transmissions + 1e-9)
-        
-        frac_bg = 0.60
-        sky_foreground = sky_level * (1.0 - frac_bg)
-        sky_background_attenuated = (sky_level * frac_bg) * transmission_map
-        total_sky_map = sky_foreground + sky_background_attenuated
-        additive_dust_emission = clumpy_dust * np.random.uniform(20, 100)
-    else:
-        transmission_map = np.ones((mosaic_size, mosaic_size), dtype=np.float32)
-        apparent_fluxes = fluxes.copy()
-        apparent_mags = mags.copy()
-        total_sky_map = np.full((mosaic_size, mosaic_size), sky_level, dtype=np.float32)
-        additive_dust_emission = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
-    
-    v_mask = apparent_mags < mag_limit
-    
-    fg_grid = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
-    bg_grid = np.zeros((mosaic_size, mosaic_size), dtype=np.float32)
-    
-    x0, y0 = np.floor(px).astype(int), np.floor(py).astype(int)
-    dx, dy = px - x0, py - y0
-    w00, w10, w01, w11 = (1 - dx) * (1 - dy), dx * (1 - dy), (1 - dx) * dy, dx * dy
-    
-    def paint_flux(grid, x, y, w, f):
-        flat_indices = y * mosaic_size + x
-        grid.flat += np.bincount(flat_indices, weights=f * w, minlength=grid.size)
-
-    paint_flux(fg_grid, x0[v_mask], y0[v_mask], w00[v_mask], apparent_fluxes[v_mask])
-    paint_flux(fg_grid, x0[v_mask] + 1, y0[v_mask], w10[v_mask], apparent_fluxes[v_mask])
-    paint_flux(fg_grid, x0[v_mask], y0[v_mask] + 1, w01[v_mask], apparent_fluxes[v_mask])
-    paint_flux(fg_grid, x0[v_mask] + 1, y0[v_mask] + 1, w11[v_mask], apparent_fluxes[v_mask])
-
-    paint_flux(bg_grid, x0[~v_mask], y0[~v_mask], w00[~v_mask], apparent_fluxes[~v_mask])
-    paint_flux(bg_grid, x0[~v_mask] + 1, y0[~v_mask], w10[~v_mask], apparent_fluxes[~v_mask])
-    paint_flux(bg_grid, x0[~v_mask], y0[~v_mask] + 1, w01[~v_mask], apparent_fluxes[~v_mask])
-    paint_flux(bg_grid, x0[~v_mask] + 1, y0[~v_mask] + 1, w11[~v_mask], apparent_fluxes[~v_mask])
-
-    fg_image = fftconvolve(fg_grid, psf_1x, mode='same')
-    bg_image = fftconvolve(bg_grid, psf_1x, mode='same')
-
-    # 6. Final Image Composition
-    full_image = np.maximum(0, fg_image + bg_image + total_sky_map + additive_dust_emission)
-    
-    # 7. SNR and Truth
-    half = SHAPE_SIZE // 2
-    N_eff = 1.0 / (np.sum(psf_1x**2) + 1e-9)
-    star_peak_val = psf_1x[half, half]
-    
-    local_sky = map_coordinates(total_sky_map + additive_dust_emission, [py[v_mask], px[v_mask]], order=1, mode='nearest')
-    actual_pixel_values = full_image[np.clip(y0[v_mask], 0, mosaic_size-1), np.clip(x0[v_mask], 0, mosaic_size-1)]
-    confusion_light = np.maximum(0.0, actual_pixel_values - (apparent_fluxes[v_mask] * star_peak_val))
-    noise_variance = apparent_fluxes[v_mask] + N_eff * (local_sky + confusion_light + 25.0)
-    snrs = apparent_fluxes[v_mask] / np.sqrt(noise_variance)
-    
-    cat_dtype = [('x', 'f4'), ('y', 'f4'), ('flux', 'f4'), ('mag', 'f4'), ('snr', 'f4')]
-    sort_y = np.argsort(py[v_mask])
-    structured_cat = np.zeros(np.sum(v_mask), dtype=cat_dtype)
-    structured_cat['x'] = px[v_mask][sort_y]
-    structured_cat['y'] = py[v_mask][sort_y]
-    structured_cat['flux'] = apparent_fluxes[v_mask][sort_y]
-    structured_cat['mag'] = apparent_mags[v_mask][sort_y]
-    structured_cat['snr'] = snrs[sort_y]
-    
-    meta = np.array([exp_time, zp, sky_mag, 0.0, 0.0, 0.0])
-    truth_bg_map = bg_image + total_sky_map + additive_dust_emission
-
-    return full_image, truth_bg_map, structured_cat, meta, psf_1x
-
 def generate_single_sample_stage0(idx, params):
     """
     Worker function to generate a single 256x256 Stage 0 sample.
-    Essentially a self-contained version of generate_mosaic_data but for a 256x256 chunk.
+    Uses Predictive Initialization: Reverse-engineers the input density 
+    required to hit a target 'active' occupancy (SNR > 1) naturally.
     """
     img_size = params['image_size']
-    exp_time, zp, sky_mag = np.random.uniform(30.0, 90.0), 26.5, 22.0
+    exp_time = np.random.uniform(params['exp_time_min'], params['exp_time_max'])
+    zp, sky_mag = params['zp'], params['sky_mag']
     
-    # 1. PSF
-    O = 4
-    psf_4x = _generate_fallback_psf(SHAPE_SIZE, oversample=O) # Use fallback for speed in pre-training
-    psf_1x = psf_4x.reshape(SHAPE_SIZE, O, SHAPE_SIZE, O).mean(axis=(1, 3))
-    psf_1x /= (psf_1x.sum() + 1e-9)
+    # 1. Physics & Limits
+    mag_limit_snr1 = calculate_safe_magnitude_cutoff(exp_time, zp, sky_mag, snr_cutoff=1.0)
     
-    # 2. Stars
-    n_stars = int(10 ** np.random.uniform(np.log10(params['min_stars_chunk']), np.log10(params['max_stars_chunk'])))
-    mags = sample_bulge_magnitudes(n_stars, np.random.uniform(14.5, 16.5), np.random.uniform(0.2, 0.5), np.random.uniform(5.0, 15.0), gamma=np.random.uniform(0.25, 0.35))
-    fluxes = exp_time * (10 ** (-0.4 * (mags - zp)))
-    px, py = np.random.uniform(0, img_size, n_stars), np.random.uniform(0, img_size, n_stars)
-    
-    # 3. Dust & Sky
-    sky_level = (10 ** (-0.4 * (sky_mag - zp))) * (0.11**2) * exp_time
-    raw_dust = generate_dust_cirrus(img_size, 1.0)
-    gamma_clump = np.random.uniform(1.0, 5.0)
-    clumpy_dust = raw_dust ** gamma_clump
-    max_ext = np.random.uniform(0.2, 5.0)
-    transmission = 10 ** (-0.4 * clumpy_dust * max_ext)
-    
-    star_transmissions = map_coordinates(transmission, [py, px], order=1, mode='nearest')
-    apparent_fluxes = fluxes * star_transmissions
-    apparent_mags = mags - 2.5 * np.log10(star_transmissions + 1e-9)
-    
-    frac_bg = 0.60
-    sky_map = (sky_level * (1.0 - frac_bg)) + (sky_level * frac_bg * transmission) + (clumpy_dust * np.random.uniform(20, 100))
-    
-    # 4. Rendering
-    mag_limit = calculate_safe_magnitude_cutoff(exp_time, zp, sky_mag, snr_cutoff=1.0)
-    v_mask = apparent_mags < mag_limit
-    
-    fg_grid = np.zeros((img_size, img_size), dtype=np.float32)
-    bg_grid = np.zeros((img_size, img_size), dtype=np.float32)
-    
-    x0, y0 = np.floor(px).astype(int), np.floor(py).astype(int)
-    dx, dy = px - x0, py - y0
-    w00, w10, w01, w11 = (1 - dx) * (1 - dy), dx * (1 - dy), (1 - dx) * dy, dx * dy
-    
-    def paint(grid, x, y, w, f):
-        flat_indices = y * img_size + x
-        grid.flat += np.bincount(flat_indices, weights=f * w, minlength=grid.size)
-
-    paint(fg_grid, x0[v_mask], y0[v_mask], w00[v_mask], apparent_fluxes[v_mask])
-    paint(fg_grid, x0[v_mask]+1, y0[v_mask], w10[v_mask], apparent_fluxes[v_mask])
-    paint(fg_grid, x0[v_mask], y0[v_mask]+1, w01[v_mask], apparent_fluxes[v_mask])
-    paint(fg_grid, x0[v_mask]+1, y0[v_mask]+1, w11[v_mask], apparent_fluxes[v_mask])
-
-    paint(bg_grid, x0[~v_mask], y0[~v_mask], w00[~v_mask], apparent_fluxes[~v_mask])
-    paint(bg_grid, x0[~v_mask]+1, y0[~v_mask], w10[~v_mask], apparent_fluxes[~v_mask])
-    paint(bg_grid, x0[~v_mask], y0[~v_mask]+1, w01[~v_mask], apparent_fluxes[~v_mask])
-    paint(bg_grid, x0[~v_mask]+1, y0[~v_mask]+1, w11[~v_mask], apparent_fluxes[~v_mask])
-    
-    img = fftconvolve(fg_grid, psf_1x, mode='same')
-    bg_img = fftconvolve(bg_grid, psf_1x, mode='same') + sky_map
-    full_img = img + bg_img
-    
-    # 5. Target Grid
+    # 2. ML Target Definition
     cell_size, K = DEFAULT_CELL_SIZE, MAX_CAPACITY_PER_CELL
     grid_size = img_size // cell_size
     
-    half = SHAPE_SIZE // 2
-    N_eff = 1.0 / (np.sum(psf_1x**2) + 1e-9)
-    star_peak_val = psf_1x[half, half]
+    # Target 0.2 to 3.0 stars per cell (average)
+    # Sampling up to K ensures we cover the network's full capacity
+    target_lambda = np.random.uniform(0.2, 3.0)
+    target_n_active = int(target_lambda * (grid_size ** 2))
     
-    local_sky = map_coordinates(sky_map, [py[v_mask], px[v_mask]], order=1, mode='nearest')
-    confusion = np.maximum(0.0, full_img[np.clip(y0[v_mask], 0, img_size-1), np.clip(x0[v_mask], 0, img_size-1)] - (apparent_fluxes[v_mask] * star_peak_val))
-    snrs = apparent_fluxes[v_mask] / np.sqrt(apparent_fluxes[v_mask] + N_eff * (local_sky + confusion + 25.0))
+    # 3. Super-Population Predictive Initialization
+    gamma = np.random.uniform(0.25, 0.35)
+    m_min, m_max_total = 12.0, 32.0
+    m_rc = np.random.uniform(14.5, 16.5)
+    rc_sigma = np.random.uniform(0.2, 0.5)
+    rc_enh = np.random.uniform(5.0, 15.0)
+
+    # Analytic fraction calculation: N(<m) ~ 10^(gamma*m)
+    def get_lf_frac(m_limit):
+        return (10**(gamma * m_limit) - 10**(gamma * m_min)) / (10**(gamma * m_max_total) - 10**(gamma * m_min))
     
-    sort_idx = np.argsort(apparent_fluxes[v_mask])[::-1]
-    target_grid = fast_paint_grid(px[v_mask], py[v_mask], apparent_fluxes[v_mask], snrs, sort_idx, 5.0, grid_size, cell_size, K)
+    f_active_base = get_lf_frac(mag_limit_snr1)
+    # RC stars are in a +/- 0.5 mag bin and are always active (bright)
+    f_rc_bin = get_lf_frac(m_rc + 0.5) - get_lf_frac(m_rc - 0.5)
+    
+    # expected_active_per_base_star = (prob base star is active) + (prob extra RC star is added)
+    expected_active_per_star = f_active_base + (f_rc_bin * rc_enh)
+    
+    n_pool = int(target_n_active / np.maximum(expected_active_per_star, 1e-6))
+    n_pool = np.clip(n_pool, 100, 1_000_000) 
+    
+    # 4. Population Generation (No Culling)
+    mags = sample_bulge_magnitudes(n_pool, m_rc, rc_sigma, rc_enh, m_min=m_min, m_max=m_max_total, gamma=gamma)
+    px, py = np.random.uniform(0, img_size, len(mags)), np.random.uniform(0, img_size, len(mags))
+    fluxes = exp_time * (10 ** (-0.4 * (mags - zp)))
+
+    # 5. PSF (Randomized per chunk)
+    sigma_detector = np.random.uniform(0.25, 1.0)
+    psf_kernel = get_gaussian_psf(sigma=sigma_detector, kernel_size=25)
+    chunk_fwhm = sigma_detector * 2.355
+
+    # 6. Dust & Sky
+    sky_level = (10 ** (-0.4 * (sky_mag - zp))) * (0.11**2) * exp_time
+    raw_dust = generate_dust_cirrus(img_size, 1.0)
+    transmission = 10 ** (-0.4 * (raw_dust ** np.random.uniform(1.0, 5.0)) * np.random.uniform(0.2, 5.0))
+    
+    star_transmissions = map_coordinates(transmission, [py, px], order=1, mode='nearest')
+    apparent_fluxes = fluxes * star_transmissions
+    
+    sky_map = (sky_level * 0.4) + (sky_level * 0.6 * transmission) + (raw_dust * np.random.uniform(20, 100))
+    
+    # 7. Final Rendering & SNR Calculation
+    def get_snrs(f, x, y, sm):
+        render = render_gaussian_stars(img_size, img_size, x, y, f, psf_kernel=psf_kernel) + sm
+        half = psf_kernel.shape[0] // 2
+        star_peak = psf_kernel[half, half]
+        N_eff = 1.0 / (np.sum(psf_kernel**2) + 1e-9)
+        l_sky = map_coordinates(sm, [y, x], order=1, mode='nearest')
+        l_full = map_coordinates(render, [y, x], order=1, mode='nearest')
+        conf = np.maximum(0.0, l_full - (f * star_peak))
+        s = f / np.sqrt(np.maximum(1.0, f + N_eff * (l_sky + conf + 25.0)))
+        return s, render
+
+    final_snrs, full_img = get_snrs(apparent_fluxes, px, py, sky_map)
+    fg_mask = mags < mag_limit_snr1
+
+    # Render background image (unresolved population)
+    bg_img = render_gaussian_stars(img_size, img_size, px[~fg_mask], py[~fg_mask], apparent_fluxes[~fg_mask], psf_kernel=psf_kernel) + sky_map
+
+    target_grid = fast_paint_grid(px[fg_mask], py[fg_mask], apparent_fluxes[fg_mask], final_snrs[fg_mask], np.argsort(apparent_fluxes[fg_mask])[::-1], 5.0, grid_size, cell_size, K)
     
     transform = AstroSpaceTransform(stretch_scale=GLOBAL_STRETCH_SCALE)
     chunk_median = np.median(full_img)
     bg_downsampled = bg_img.reshape(grid_size, cell_size, grid_size, cell_size).mean(axis=(1, 3))
-    target_grid_full = np.concatenate([target_grid.reshape(grid_size, grid_size, -1), transform.target_bg_to_network(bg_downsampled - chunk_median)[:, :, None]], axis=-1)
     
-    meta = np.array([exp_time, zp, sky_mag, 0.0, 0.0, 0.0], dtype=np.float32)
+    target_grid_full = np.concatenate([
+        target_grid.reshape(grid_size, grid_size, -1), 
+        transform.target_bg_to_network(bg_downsampled - chunk_median)[:, :, None]
+    ], axis=-1)
+    
+    meta = np.zeros(17, dtype=np.float32)
+    meta[0], meta[1], meta[2], meta[3] = exp_time, zp, sky_mag, float(chunk_fwhm)
+    meta[7], meta[12] = 0.11, 5.0 
+    
     return full_img.astype(np.float32), target_grid_full.astype(np.float32), chunk_median.astype(np.float32), meta
 
-def run_stage0_parallel_generation(config, split='train'):
+def run_stage0_parallel_generation(config, num_samples=None, num_workers=None):
     s0_cfg = config['curriculum']['stage0']
     d_cfg = config['data_params']
-    num_samples = d_cfg['num_train_samples'] if split == 'train' else d_cfg['num_val_samples']
-    output_path = os.path.join(s0_cfg['data_dir'], f"stage0_{split}.h5")
+    total_samples = num_samples if num_samples is not None else (d_cfg['num_train_samples'] + d_cfg['num_val_samples'])
+    output_path = os.path.join(s0_cfg['data_dir'], "stage0_data.h5")
     os.makedirs(s0_cfg['data_dir'], exist_ok=True)
     
-    # Scaling density to 256x256 chunk
-    # min_stars was for 1024x1024
-    area_scale = (256.0 / 1024.0)**2
     params = {
-        'image_size': 256,
-        'min_stars_chunk': d_cfg['min_stars'] * area_scale,
-        'max_stars_chunk': d_cfg['max_stars'] * area_scale
+        'image_size': d_cfg.get('image_size', 256),
+        'exp_time_min': d_cfg['physics_params']['exp_time_min'],
+        'exp_time_max': d_cfg['physics_params']['exp_time_max'],
+        'zp': d_cfg['physics_params']['zp'],
+        'sky_mag': d_cfg['physics_params']['sky_mag']
     }
     
-    num_workers = mp.cpu_count()
-    # 1. Leave 1 core free for HDF5 I/O
-    pool_workers = max(1, num_workers - 1)
-    print(f"🔥 Stage 0 [{split}]: Parallelizing with {pool_workers} workers (1 core reserved for I/O)...")
+    if num_workers is None:
+        num_workers = mp.cpu_count()
+        
+    # --- 🏗️ HDF5 SERIALIZATION BUDGET ---
+    # Leave 1 worker for the main process to handle HDF5 writing and UI
+    n_rendering_workers = max(1, num_workers - 1)
+        
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+
+    print(f"🔥 Stage 0 Unified Generation: {n_rendering_workers} Rendering Workers + 1 HDF5 Writer")
     
     with h5py.File(output_path, 'w') as f:
-        dset_img = f.create_dataset("images", (num_samples, 1, 256, 256), dtype='f4', chunks=(1, 1, 256, 256), compression="lzf")
-        dset_tgt = f.create_dataset("targets", (num_samples, 64, 64, MAX_CAPACITY_PER_CELL*5 + 1), dtype='f4', chunks=(1, 64, 64, MAX_CAPACITY_PER_CELL*5 + 1), compression="lzf")
-        dset_med = f.create_dataset("chunk_medians", (num_samples,), dtype='f4')
-        dset_meta = f.create_dataset("metas", (num_samples, 6), dtype='f4')
+        dset_img = f.create_dataset("images", (total_samples, 256, 256), dtype='f4', chunks=(1, 256, 256), compression="lzf")
+        dset_tgt = f.create_dataset("targets", (total_samples, 64, 64, MAX_CAPACITY_PER_CELL*5 + 1), dtype='f4', chunks=(1, 64, 64, MAX_CAPACITY_PER_CELL*5 + 1), compression="lzf")
+        dset_med = f.create_dataset("chunk_medians", (total_samples,), dtype='f4')
+        dset_meta = f.create_dataset("metas", (total_samples, 17), dtype='f4')
         
         worker_func = partial(generate_single_sample_stage0, params=params)
-        with mp.Pool(pool_workers) as pool:
-            # 2. Use imap_unordered for zero-latency writing
-            for i, (img, tgt, med, meta) in enumerate(tqdm(pool.imap_unordered(worker_func, range(num_samples)), total=num_samples)):
-                dset_img[i, 0] = img
+        with mp.Pool(n_rendering_workers) as pool:
+            # imap_unordered for maximum throughput while main process writes
+            results = pool.imap_unordered(worker_func, range(total_samples), chunksize=4)
+            for i, (img, tgt, med, meta) in enumerate(tqdm(results, total=total_samples)):
+                dset_img[i] = img
                 dset_tgt[i] = tgt
                 dset_med[i] = med
                 dset_meta[i] = meta
 
-class HDF5MosaicDataset(Dataset):
+class HDF5ChunkDataset(Dataset):
     """
-    PyTorch Dataset for reading simulated mosaics from an HDF5 file.
+    PyTorch Dataset for reading simulated training chunks from an HDF5 file.
 
     Attributes
     ----------
@@ -560,7 +429,7 @@ class HDF5MosaicDataset(Dataset):
 
     def __init__(self, h5_path, image_size=256):
         """
-        Initialize the HDF5MosaicDataset.
+        Initialize the HDF5ChunkDataset.
 
         Parameters
         ----------
@@ -606,13 +475,20 @@ class HDF5MosaicDataset(Dataset):
         img = torch.from_numpy(self.file['images'][idx]).float()
         target = torch.from_numpy(self.file['targets'][idx]).float()
         median = float(self.file['chunk_medians'][idx])
-        meta = self.file['metas'][idx] if 'metas' in self.file else np.zeros(6, dtype=np.float32)
+        meta = self.file['metas'][idx] if 'metas' in self.file else np.zeros(17, dtype=np.float32)
         # Return a single mean PSF or None if we don't need it per-sample here
         return {"image": img, "target": target, "chunk_median": median, "meta": meta}
 
 if __name__ == "__main__":
     import yaml
-    with open("config/config.yaml", 'r') as f:
+    import argparse
+    parser = argparse.ArgumentParser(description="Generate Unified Stage 0 Gaussian Data")
+    parser.add_argument("--config", type=str, default="config/config.yaml")
+    parser.add_argument("--num_workers", type=int, default=None)
+    parser.add_argument("--num_samples", type=int, default=None)
+    args = parser.parse_args()
+
+    with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
-    run_stage0_parallel_generation(config, split='train')
-    run_stage0_parallel_generation(config, split='val')
+    
+    run_stage0_parallel_generation(config, num_samples=args.num_samples, num_workers=args.num_workers)

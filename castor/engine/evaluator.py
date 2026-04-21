@@ -151,7 +151,7 @@ class Evaluator:
         
         # Stage-specific data generation
         if self.stage_idx == 0:
-            from castor.data.stage0_gaussian import HDF5MosaicDataset
+            from castor.data.stage0_gaussian import HDF5ChunkDataset
             data_cfg = self.config["data_params"]
             stage_cfg = self.config["curriculum"]["stage0"]
             val_h5 = os.path.join(stage_cfg["data_dir"], "stage0_val.h5")
@@ -160,7 +160,7 @@ class Evaluator:
                 print(f"❌ Error: Validation HDF5 not found at {val_h5}. Run 'train' first.")
                 return
                 
-            dataset = HDF5MosaicDataset(val_h5)
+            dataset = HDF5ChunkDataset(val_h5)
             num_to_eval = min(num_chunks, len(dataset))
             
             for i in range(num_to_eval):
@@ -204,8 +204,8 @@ class Evaluator:
                         for k in range(K):
                             slot = target_reshaped[y, x, k]
                             tp, tdx, tdy, raw_flux_target = slot[:4]
-                            # NEW: For evaluation, we only consider stars with high SNR labels as targets
-                            if tp > 0.5:
+                            # NEW: For evaluation, we only consider stars with high SNR labels as targets (SNR >= 2.0)
+                            if tp >= 0.43:
                                 star_info = ((x * cell_size) + tdx, (y * cell_size) + tdy, float(raw_flux_target))
                                 true_stars.append(star_info)
                 

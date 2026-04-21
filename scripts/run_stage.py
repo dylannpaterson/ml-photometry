@@ -100,9 +100,9 @@ def load_stage_model(stage_idx, device, config, checkpoint_path=None):
         
     return model, psf_library
 
-def ensure_stage0_data(stage_cfg, data_cfg, config_path):
+def ensure_stage0_data(stage_cfg, data_cfg, config):
     """
-    Checks for HDF5 data and generates a small amount if missing.
+    Checks for HDF5 data and generates a small amount if missing using parallel logic.
 
     Parameters
     ----------
@@ -110,36 +110,33 @@ def ensure_stage0_data(stage_cfg, data_cfg, config_path):
         Configuration for the current stage.
     data_cfg : dict
         Data-specific configuration.
-    config_path : str
-        Path to the configuration file for sub-script execution.
+    config : dict
+        The full configuration dictionary.
 
     Returns
     -------
     bool
         True if data is available or successfully generated, False otherwise.
     """
-    train_mos_dir = os.path.join(stage_cfg["data_dir"], "mosaics_train")
-    val_mos_dir = os.path.join(stage_cfg["data_dir"], "mosaics_val")
     val_h5 = os.path.join(stage_cfg["data_dir"], "stage0_val.h5")
     
     if not os.path.exists(val_h5):
-        print("🔍 Local Stage 0 data not found. Triggering small-scale generation for inference/analysis...")
-        os.makedirs(train_mos_dir, exist_ok=True)
-        os.makedirs(val_mos_dir, exist_ok=True)
+        print("🔍 Local Stage 0 data not found. Triggering parallel generation for inference/analysis...")
+        from castor.data.stage0_gaussian import run_stage0_parallel_generation
         
-        # Generate small sets for quick local testing
-        os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/generate_mosaics.py --num 1 --stage 0 --config {config_path} --output_dir {train_mos_dir}")
-        os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/generate_mosaics.py --num 1 --stage 0 --config {config_path} --output_dir {val_mos_dir}")
+        # Override sample counts for quick local inference setup
+        # 200 samples is plenty for a few diagnostic visuals
+        orig_val_samples = config["data_params"]["num_val_samples"]
+        config["data_params"]["num_val_samples"] = 200
         
-        # Convert to a small HDF5 (100 samples is plenty for a few inference visuals)
-        os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 scripts/convert_to_hdf5.py --train_dir {train_mos_dir} --val_dir {val_mos_dir} --output_dir {stage_cfg['data_dir']} --train_samples 100 --val_samples 100")
-        
-        # Cleanup
-        shutil.rmtree(train_mos_dir, ignore_errors=True)
-        shutil.rmtree(val_mos_dir, ignore_errors=True)
+        try:
+            run_stage0_parallel_generation(config, split='val')
+        finally:
+            # Restore original config values
+            config["data_params"]["num_val_samples"] = orig_val_samples
 
         if not os.path.exists(val_h5):
-            print("❌ Error: Failed to generate local data fallback.")
+            print("❌ Error: Failed to generate local parallel data fallback.")
             return False
             
     return True
@@ -217,51 +214,48 @@ def run_train(stage_idx, config, device):
     stretch_scale = data_cfg.get("GLOBAL_STRETCH_SCALE", GLOBAL_STRETCH_SCALE)
 
     if stage_idx == 0:
-        train_h5 = os.path.join(stage_cfg["data_dir"], "stage0_train.h5")
-        val_h5 = os.path.join(stage_cfg["data_dir"], "stage0_val.h5")
+        data_h5 = os.path.join(stage_cfg["data_dir"], "stage0_data.h5")
         
-        # 1. Check if we actually NEED to generate anything
-        needs_gen = force_gen or not os.path.exists(train_h5) or not os.path.exists(val_h5)
-        
-        if needs_gen:
-            print("🛠️ Generating Stage 0 Data (Parallel HDF5)...")
+        if force_gen or not os.path.exists(data_h5):
+            print("🛠️ Generating Stage 0 Data (Unified Parallel HDF5)...")
             from castor.data.stage0_gaussian import run_stage0_parallel_generation
-            
-            # Generate Train and Val splits using the new parallel logic
-            run_stage0_parallel_generation(config, split='train')
-            run_stage0_parallel_generation(config, split='val')
+            run_stage0_parallel_generation(config)
 
-        from castor.data.stage0_gaussian import HDF5MosaicDataset
-        print(f"🛠️ Using HDF5 Dataset: {train_h5}")
-        train_dataset = HDF5MosaicDataset(train_h5)
-        val_dataset = HDF5MosaicDataset(val_h5)
-    elif stage_idx == 1:
-        # Stage 1 Multi-Telescope Foundation (Direct GalSim HDF5)
-        train_h5 = os.path.join(stage_cfg["data_dir"], "stage1_data.h5")
+        from castor.data.stage0_gaussian import HDF5ChunkDataset
+        from torch.utils.data import Subset
+        print(f"🛠️ Using Unified HDF5 Dataset: {data_h5}")
+        full_dataset = HDF5ChunkDataset(data_h5)
         
-        # Check if we need to generate data
-        if force_gen or not os.path.exists(train_h5):
+        # 90/10 Train/Val Split
+        num_total = len(full_dataset)
+        num_train = int(0.9 * num_total)
+        # Use fixed indices for reproducibility
+        train_dataset = Subset(full_dataset, range(0, num_train))
+        val_dataset = Subset(full_dataset, range(num_train, num_total))
+        
+    elif stage_idx == 1:
+        # Stage 1 Multi-Telescope Foundation (Unified GalSim HDF5)
+        data_h5 = os.path.join(stage_cfg["data_dir"], "stage1_data.h5")
+        
+        if force_gen or not os.path.exists(data_h5):
             print("🛠️ Generating Stage 1 High-Fidelity GalSim Data (Parallel)...")
             cfg_path = config.get("config_path", "config/config.yaml")
-            
-            # Use the direct GalSim generator we implemented
-            # It generates a single unified HDF5 file
             ret = os.system(f"export PYTHONPATH=$PYTHONPATH:. && python3 castor/data/stage1_galsim.py --config {cfg_path}")
-            
-            if ret != 0 or not os.path.exists(train_h5):
-                print("❌ Error: Stage 1 data generation failed.")
-                return
+            if ret != 0 or not os.path.exists(data_h5):
+                print("❌ Error: Stage 1 data generation failed."); return
 
-        from castor.data.stage0_gaussian import HDF5MosaicDataset
-        print(f"🛠️ Using Stage 1 HDF5 Dataset: {train_h5}")
-        # Stage 1 uses the exact same HDF5 structure as Stage 0, just with more meta columns
-        train_dataset = HDF5MosaicDataset(train_h5)
-        # For Stage 1, we often use the same file for val or a split if implemented. 
-        # For now, we'll use the same dataset object as the generator handles total samples.
-        val_dataset = train_dataset 
+        from castor.data.stage0_gaussian import HDF5ChunkDataset
+        from torch.utils.data import Subset
+        print(f"🛠️ Using Stage 1 Unified HDF5 Dataset: {data_h5}")
+        full_dataset = HDF5ChunkDataset(data_h5)
+        
+        num_total = len(full_dataset)
+        num_train = int(0.9 * num_total)
+        train_dataset = Subset(full_dataset, range(0, num_train))
+        val_dataset = Subset(full_dataset, range(num_train, num_total))
     else:
         print(f"❌ Error: Stage {stage_idx} data loading via PregeneratedDataset is obsolete.")
-        print(f"   Please implement HDF5MosaicDataset support for Stage {stage_idx}.")
+        print(f"   Please implement HDF5ChunkDataset support for Stage {stage_idx}.")
         return
 
     
@@ -393,7 +387,7 @@ def run_eval(stage_idx, config, device, checkpoint=None):
         stage_cfg = config["curriculum"]["stage0"]
         data_cfg = config["data_params"]
         config_path = config.get("config_path", "config/config.yaml")
-        if not ensure_stage0_data(stage_cfg, data_cfg, config_path):
+        if not ensure_stage0_data(stage_cfg, data_cfg, config):
             return
             
         evaluator = Evaluator(model, device, config)
@@ -428,16 +422,16 @@ def run_infer(stage_idx, config, device, checkpoint=None):
     engine = InferenceEngine(model, device, config)
     
     if stage_idx == 0:
-        from castor.data.stage0_gaussian import HDF5MosaicDataset
+        from castor.data.stage0_gaussian import HDF5ChunkDataset
         data_cfg = config["data_params"]
         stage_cfg = config["curriculum"]["stage0"]
         config_path = config.get("config_path", "config/config.yaml")
         
-        if not ensure_stage0_data(stage_cfg, data_cfg, config_path):
+        if not ensure_stage0_data(stage_cfg, data_cfg, config):
             return
             
         val_h5 = os.path.join(stage_cfg["data_dir"], "stage0_val.h5")
-        dataset = HDF5MosaicDataset(val_h5)
+        dataset = HDF5ChunkDataset(val_h5)
         
         # Respect CLI --num_chunks argument if provided
         num_chunks_to_infer = config.get("num_chunks_override", min(20, len(dataset)))
@@ -465,8 +459,10 @@ def run_infer(stage_idx, config, device, checkpoint=None):
             img_pos = torch.clamp(image_tensor, min=0.0)
             img_noisy = torch.poisson(img_pos)
             img_noisy += torch.randn_like(img_noisy) * 5.0
-            noisy_median = img_noisy.median().item()
-            img_stretched = torch.arcsinh((img_noisy - noisy_median) / stretch_scale)
+            # Robust Background Estimation: Use 10th percentile to avoid bright star contamination
+            # This matches the new robust fallback in InferenceEngine.predict
+            robust_median = float(torch.quantile(img_noisy.view(-1), 0.10))
+            img_stretched = torch.arcsinh((img_noisy - robust_median) / stretch_scale)
 
             # Extract Truth for this chunk
             true_stars_chunk = []
@@ -482,28 +478,30 @@ def run_infer(stage_idx, config, device, checkpoint=None):
                             true_stars_chunk.append((slot[0], (x * cell_size) + slot[1], (y * cell_size) + slot[2], float(slot[3])))
 
             # 1. Standard Prediction (Flat Prior)
-            pred_stars_flat, bg_map_flat = engine.predict(img_noisy, threshold=0.0)
+            # Use threshold=0.0 to get all candidates, filter later for metrics
+            pred_stars_flat, bg_map_flat = engine.predict(img_noisy, threshold=0.0, chunk_median=robust_median)
             
             # 2. Oracle Prediction (Perfect Prior - All Stars)
-            # Use ground truth p value (s[0]) for amplitude and sigma=1.0 to match training
+            # Use ground truth p value (s[0]) for amplitude and sigma=0.405 to match training
             perfect_catalog = [(s[1], s[2], s[0]) for s in true_stars_chunk]
-            oracle_prior_map = generate_custom_inference_prior(perfect_catalog, img_size=image_tensor.shape[-1], sigma=1.0, device=device)
-            pred_stars_oracle, bg_map_oracle = engine.predict(img_noisy, threshold=0.0, prior_map=oracle_prior_map)
+            oracle_prior_map = generate_custom_inference_prior(perfect_catalog, img_size=image_tensor.shape[-1], sigma=0.405, device=device)
+            pred_stars_oracle, bg_map_oracle = engine.predict(img_noisy, threshold=0.0, prior_map=oracle_prior_map, chunk_median=robust_median)
 
             # 3. Oracle Prediction (p >= 0.43)
             perfect_catalog_p43 = [(s[1], s[2], s[0]) for s in true_stars_chunk if s[0] >= 0.43]
-            oracle_prior_map_p43 = generate_custom_inference_prior(perfect_catalog_p43, img_size=image_tensor.shape[-1], sigma=1.0, device=device)
-            pred_stars_oracle_p43, bg_map_oracle_p43 = engine.predict(img_noisy, threshold=0.0, prior_map=oracle_prior_map_p43)
+            oracle_prior_map_p43 = generate_custom_inference_prior(perfect_catalog_p43, img_size=image_tensor.shape[-1], sigma=0.405, device=device)
+            pred_stars_oracle_p43, bg_map_oracle_p43 = engine.predict(img_noisy, threshold=0.0, prior_map=oracle_prior_map_p43, chunk_median=robust_median)
 
             # 4. Oracle Prediction (p >= 1.0)
             perfect_catalog_p100 = [(s[1], s[2], s[0]) for s in true_stars_chunk if s[0] >= 1.0]
-            oracle_prior_map_p100 = generate_custom_inference_prior(perfect_catalog_p100, img_size=image_tensor.shape[-1], sigma=1.0, device=device)
-            pred_stars_oracle_p100, bg_map_oracle_p100 = engine.predict(img_noisy, threshold=0.0, prior_map=oracle_prior_map_p100)
+            oracle_prior_map_p100 = generate_custom_inference_prior(perfect_catalog_p100, img_size=image_tensor.shape[-1], sigma=0.405, device=device)
+            pred_stars_oracle_p100, bg_map_oracle_p100 = engine.predict(img_noisy, threshold=0.0, prior_map=oracle_prior_map_p100, chunk_median=robust_median)
 
             # Aggregate with Global Offset to prevent overlap during global matching
             offset = idx * 10000.0
             for s in true_stars_chunk:
                 global_true.append((s[0], s[1] + offset, s[2] + offset, s[3]))
+            
             for s in pred_stars_flat:
                 global_pred_flat.append((s[0] + offset, s[1] + offset, s[2], s[3], s[4]))
             for s in pred_stars_oracle:
@@ -521,7 +519,7 @@ def run_infer(stage_idx, config, device, checkpoint=None):
                     "pred_stars": pred_stars_flat,
                     "bg_map": bg_map_flat,
                     "gt_bg_map": gt_bg_map,
-                    "chunk_median": noisy_median
+                    "chunk_median": robust_median
                 }
                 hero_data_oracle = hero_data_flat.copy()
                 hero_data_oracle["pred_stars"] = pred_stars_oracle
@@ -575,17 +573,17 @@ def run_analyze(stage_idx, config, device, checkpoint=None):
     if not model: return
 
     if stage_idx == 0:
-        from castor.data.stage0_gaussian import HDF5MosaicDataset
+        from castor.data.stage0_gaussian import HDF5ChunkDataset
         stage_cfg = config["curriculum"]["stage0"]
         data_cfg = config["data_params"]
         config_path = config.get("config_path", "config/config.yaml")
         
         # Ensure data exists fallback
-        if not ensure_stage0_data(stage_cfg, data_cfg, config_path):
+        if not ensure_stage0_data(stage_cfg, data_cfg, config):
             return
             
         val_h5 = os.path.join(stage_cfg["data_dir"], "stage0_val.h5")
-        dataset = HDF5MosaicDataset(val_h5)
+        dataset = HDF5ChunkDataset(val_h5)
         num_chunks = config.get("num_chunks_override", 20)
         analyzer = ThresholdAnalyzer(model, device, dataset)
         analyzer.run_analysis(num_chunks=num_chunks)

@@ -3,24 +3,55 @@ run_config:
   force_regenerate_data: true
 
 curriculum:
+  # Stage 0: Gaussian Pre-training (Analytical PSF)
   stage0:
-    name: "Smoke Test Stage 0"
+    name: "Roman Bulge Stage 0 (Gaussian)"
     data_dir: "data/smoke_test"
-    epochs: 1
+    epochs: 2
     batch_size: 16
     learning_rate: 0.0001
     num_workers: 0
     resume_from_last_stage: false
-    cell_size: 4
-    mosaic_params:
-      num_mosaics: 1
-      mosaic_size: 1024
 
 data_params:
-  num_train_samples: 100
-  num_val_samples: 50
-  min_stars: 100
-  max_stars: 200
+  # Small sample count for smoke test
+  num_train_samples: 100 
+  num_val_samples: 20
+  
   image_size: 256
   max_capacity_per_cell: 3
-  shape_size: 129
+  GLOBAL_STRETCH_SCALE: 10.0
+  min_snr: 5.0
+  
+  # Instrument & Observation Physics (Roman WFI Defaults)
+  physics_params:
+    pixel_scale: 0.11
+    sigma_fixed: 0.405
+    zp: 26.5
+    sky_mag: 22.0
+    read_noise: 5.0
+    exp_time_min: 30.0
+    exp_time_max: 90.0
+    
+  # Bulge Luminosity Function Simulation Bounds
+  lf_params:
+    m_min: 12.0
+    m_max: 32.0
+    rc_loc_min: 14.5
+    rc_loc_max: 16.5
+    rc_scale_min: 0.2
+    rc_scale_max: 0.5
+    rc_enh_min: 5.0
+    rc_enh_max: 15.0
+    gamma_min: 0.25
+    gamma_max: 0.35
+  
+loss_params:
+  lambda_prob: 1.0
+  lambda_pos: 1.0
+  lambda_flux: 1.0
+  lambda_bg: 1.0
+  lambda_curvature: 1.0
+  lambda_diffraction_reg: 10.0
+  focal_alpha: 0.50
+  focal_gamma: 2.0

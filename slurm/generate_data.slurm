@@ -23,6 +23,12 @@ mamba activate /home/malpas.1/project_amber/castor_model/castor_env
 # Ensure the root project dir is in PYTHONPATH
 export PYTHONPATH=$PYTHONPATH:.
 
+# Set STPSF_PATH (mostly for consistency, Stage 0 training uses HDF5)
+if [ -z "$STPSF_PATH" ]; then
+    export STPSF_PATH="/home/malpas.1/project_amber/stpsf-data"
+    echo "🛰️  Setting STPSF_PATH to $STPSF_PATH"
+fi
+
 # 2. Execute Parallel Generation
 # Directly call the stage0_gaussian script which now handles parallel HDF5 generation
 python -u castor/data/stage0_gaussian.py

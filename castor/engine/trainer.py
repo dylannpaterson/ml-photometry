@@ -139,9 +139,10 @@ def render_confidence_prior(targets, img_size, cell_size, K, max_jitter=0.4, fwh
     all_cy = all_cy + jitter_y
 
     # Anchors and sub-pixel remainders
-    # We must ensure anchors are in [0, img_size-2] for 2x2 splat
-    all_cx = torch.clamp(all_cx, 0, img_size - 1.001)
-    all_cy = torch.clamp(all_cy, 0, img_size - 1.001)
+    # 🚀 SAFE CLAMPING: We need a 2x2 splat starting at (x0, y0)
+    # So anchors x0 must be in [0, img_size - 2]
+    all_cx = torch.clamp(all_cx, 0.0, float(img_size - 2.0))
+    all_cy = torch.clamp(all_cy, 0.0, float(img_size - 2.0))
     
     x0 = torch.floor(all_cx).long()
     y0 = torch.floor(all_cy).long()
@@ -158,6 +159,7 @@ def render_confidence_prior(targets, img_size, cell_size, K, max_jitter=0.4, fwh
     img_stride = img_size
     batch_stride = img_size * img_size
     
+    # Index = batch_offset + y_offset + x_offset
     idx00 = all_batch_idx * batch_stride + y0 * img_stride + x0
     idx10 = idx00 + 1
     idx01 = idx00 + img_stride
@@ -166,10 +168,11 @@ def render_confidence_prior(targets, img_size, cell_size, K, max_jitter=0.4, fwh
     prior_flat = torch.zeros(B * batch_stride, device=device)
     
     # Scatter add handles overlapping stars naturally
-    prior_flat.scatter_add_(0, idx00, w00)
-    prior_flat.scatter_add_(0, idx10, w10)
-    prior_flat.scatter_add_(0, idx01, w01)
-    prior_flat.scatter_add_(0, idx11, w11)
+    # Ensure 1D to prevent "Index tensor must have the same number of dimensions as self tensor"
+    prior_flat.scatter_add_(0, idx00.view(-1), w00.view(-1))
+    prior_flat.scatter_add_(0, idx10.view(-1), w10.view(-1))
+    prior_flat.scatter_add_(0, idx01.view(-1), w01.view(-1))
+    prior_flat.scatter_add_(0, idx11.view(-1), w11.view(-1))
     
     return prior_flat.view(B, 1, img_size, img_size)
 
@@ -197,7 +200,7 @@ class Trainer:
         Prefix for saved checkpoint files.
     """
 
-    def __init__(self, model, train_loader, val_loader, config, device, epochs=100, lr=0.0001, checkpoint_prefix="stage0"):
+    def __init__(self, model, train_loader, val_loader, config, device, epochs=100, lr=0.0001, checkpoint_prefix="stage0", epoch_loader_callback=None):
         """
         Initialize the Trainer.
 
@@ -219,10 +222,13 @@ class Trainer:
             Learning rate, by default 0.0001.
         checkpoint_prefix : str, optional
             Prefix for checkpoint filenames, by default "stage0".
+        epoch_loader_callback : callable, optional
+            Function to re-subset data every epoch, by default None.
         """
         self.model, self.train_loader, self.val_loader = model, train_loader, val_loader
         self.config, self.device, self.checkpoint_prefix = config, device, checkpoint_prefix
         self.epochs, self.lr = epochs, lr
+        self.epoch_loader_callback = epoch_loader_callback
         
         self.use_cuda = self.device.type == 'cuda'
         self.scaler = torch.amp.GradScaler('cuda') if self.use_cuda else None
@@ -232,7 +238,7 @@ class Trainer:
         self.optimizer = optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=1e-4)
         
         # NEW: Memory-Aware Dynamic Batch Scaling
-        self.target_batch_size = config.get("training_params", {}).get("BATCH_SIZE", 32)
+        self.target_batch_size = config.get("curriculum", {}).get(self.checkpoint_prefix, {}).get("batch_size", 32)
         self.micro_batch_size = self.target_batch_size # Default
         self.accumulation_steps = 1
         
@@ -256,13 +262,24 @@ class Trainer:
 
         # 2. OneCycleLR Scheduler
         # FIX: Calculate actual steps the scheduler will see per epoch due to accumulation
-        actual_steps_per_epoch = (len(self.train_loader) + self.accumulation_steps - 1) // self.accumulation_steps
-        
+        if self.train_loader is not None:
+            actual_steps_per_epoch = (len(self.train_loader) + self.accumulation_steps - 1) // self.accumulation_steps
+        else:
+            # Fallback for Stage 0 where loader is initialized in callback
+            # We assume a subset of half the dataset as per scripts/run_stage.py
+            train_cfg = config.get("curriculum", {}).get("stage0", {})
+            num_train = config.get("data_params", {}).get("num_train_samples", 100000)
+            subset_size = num_train // 2
+            actual_steps_per_epoch = (subset_size // self.micro_batch_size + self.accumulation_steps - 1) // self.accumulation_steps
+
+        # Use a safe minimum of 1 step per epoch to avoid total_steps=0
+        actual_steps_per_epoch = max(1, actual_steps_per_epoch)
+        total_steps = actual_steps_per_epoch * self.epochs
+
         self.scheduler = optim.lr_scheduler.OneCycleLR(
             self.optimizer,
             max_lr=self.lr * 2.0,
-            steps_per_epoch=actual_steps_per_epoch,
-            epochs=self.epochs,
+            total_steps=total_steps,
             pct_start=0.1, # 10% warmup
             div_factor=25.0,
             final_div_factor=10000.0
@@ -343,36 +360,41 @@ class Trainer:
                     images, targets = batch
                     images, targets = images.to(self.device, non_blocking=True), targets.to(self.device, non_blocking=True).float()
                 
-                # --- APPLY D4 SPATIAL SYMMETRY (Stage 0 Only) ---
-                if self.checkpoint_prefix == "stage0":
-                    # targets shape: [B, GH, GW, K*5 + 1]
-                    B, GH, GW, C = targets.shape
-                    K_aug = self.config["data_params"].get("max_capacity_per_cell", 3)
-                    num_params_aug = (C - 1) // K_aug
-                    
-                    # 1. Horizontal Flip
-                    if torch.rand(1).item() < 0.5:
-                        images = torch.flip(images, dims=[-1])
-                        targets = torch.flip(targets, dims=[2])
-                        star_view = targets[..., :-1].view(B, GH, GW, K_aug, num_params_aug)
-                        star_view[..., 1] = 1.0 - star_view[..., 1] # Invert dx
+                # Ensure channel dimension [B, 1, H, W]
+                if images.dim() == 3:
+                    images = images.unsqueeze(1)
+                
+                # --- APPLY D4 SPATIAL SYMMETRY ---
+                # targets shape: [B, GH, GW, C]
+                B, GH, GW, C = targets.shape
+                K_aug = self.config["data_params"].get("max_capacity_per_cell", 3)
+                num_params_aug = (C - 1) // K_aug
+                
+                # 1. Horizontal Flip
+                if torch.rand(1).item() < 0.5:
+                    images = torch.flip(images, dims=[-1])
+                    targets = torch.flip(targets, dims=[2])
+                    star_view = targets[..., :-1].reshape(B, GH, GW, K_aug, num_params_aug)
+                    # 🚀 ALIGNMENT FIX: x -> (W-1) - x for discrete array flips
+                    star_view[..., 1] = (cell_size - 1.0) - star_view[..., 1]
 
-                    # 2. Vertical Flip
-                    if torch.rand(1).item() < 0.5:
-                        images = torch.flip(images, dims=[-2])
-                        targets = torch.flip(targets, dims=[1])
-                        star_view = targets[..., :-1].view(B, GH, GW, K_aug, num_params_aug)
-                        star_view[..., 2] = 1.0 - star_view[..., 2] # Invert dy
+                # 2. Vertical Flip
+                if torch.rand(1).item() < 0.5:
+                    images = torch.flip(images, dims=[-2])
+                    targets = torch.flip(targets, dims=[1])
+                    star_view = targets[..., :-1].reshape(B, GH, GW, K_aug, num_params_aug)
+                    # 🚀 ALIGNMENT FIX: y -> (H-1) - y for discrete array flips
+                    star_view[..., 2] = (cell_size - 1.0) - star_view[..., 2]
 
-                    # 3. Transpose (Diagonal Flip)
-                    if torch.rand(1).item() < 0.5:
-                        images = torch.transpose(images, -2, -1)
-                        targets = torch.transpose(targets, 1, 2)
-                        star_view = targets[..., :-1].view(B, GH, GW, K_aug, num_params_aug)
-                        # Swap dx and dy
-                        dx_temp = star_view[..., 1].clone()
-                        star_view[..., 1] = star_view[..., 2]
-                        star_view[..., 2] = dx_temp
+                # 3. Transpose (Diagonal Flip)
+                if torch.rand(1).item() < 0.5:
+                    images = torch.transpose(images, -2, -1)
+                    targets = torch.transpose(targets, 1, 2)
+                    star_view = targets[..., :-1].reshape(B, GH, GW, K_aug, num_params_aug)
+                    # Swap dx and dy
+                    dx_temp = star_view[..., 1].clone()
+                    star_view[..., 1] = star_view[..., 2]
+                    star_view[..., 2] = dx_temp
 
                 # --- LIVE NOISE INJECTION ---
                 images_positive = torch.clamp(images, min=0.0) 
@@ -410,12 +432,12 @@ class Trainer:
                     st_view[~prior_mask] = 0.0
                     
                     # Render bilinear splat prior map (1 channel)
-                    # Stage 1: Use dynamic FWHM from metadata [index 3]
-                    if isinstance(batch, dict) and "meta" in batch and batch["meta"].shape[1] >= 17:
+                    # Stage 1 & Updated Stage 0: Use dynamic FWHM from metadata [index 3]
+                    if isinstance(batch, dict) and "meta" in batch and batch["meta"].shape[1] >= 4:
                         calculated_fwhm = batch["meta"][:, 3].to(self.device, non_blocking=True).float().view(-1, 1, 1, 1)
                     else:
-                        # Stage 0: Fallback to static config default
-                        sigma_fixed = self.config.get("data_params", {}).get("physics_params", {}).get("sigma_fixed", 1.5)
+                        # Fallback to static config default (Roman baseline)
+                        sigma_fixed = self.config.get("data_params", {}).get("physics_params", {}).get("sigma_fixed", 0.405)
                         calculated_fwhm = sigma_fixed * 2.355
 
                     prior_map = render_confidence_prior(
@@ -554,6 +576,10 @@ class Trainer:
                 else:
                     images, targets = batch
                     images, targets = images.to(self.device, non_blocking=True), targets.to(self.device, non_blocking=True).float()
+                
+                # Ensure channel dimension [B, 1, H, W]
+                if images.dim() == 3:
+                    images = images.unsqueeze(1)
                 
                 images_positive = torch.clamp(images, min=0.0) 
                 images_noisy = torch.poisson(images_positive)

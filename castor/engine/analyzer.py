@@ -86,11 +86,11 @@ class ThresholdAnalyzer:
             # --- Apply Live Noise and Stretch ---
             img_pos = torch.clamp(image_tensor, min=0.0)
             img_noisy = torch.poisson(img_pos)
-            img_noisy += torch.randn_like(img_noisy) * 5.0 
-            
-            noisy_median = img_noisy.median().item()
-            img_stretched = torch.arcsinh((img_noisy - noisy_median) / self.stretch_scale)
+            img_noisy += torch.randn_like(img_noisy) * 5.0
 
+            # Robust Background Estimation: Use 10th percentile to avoid bright star contamination
+            robust_median = float(torch.quantile(img_noisy.view(-1), 0.10))
+            img_stretched = torch.arcsinh((img_noisy - robust_median) / self.stretch_scale)
             with torch.no_grad():
                 input_tensor = img_stretched.to(self.device)
                 if input_tensor.dim() == 3:

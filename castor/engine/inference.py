@@ -103,6 +103,8 @@ def generate_custom_inference_prior(star_catalog, img_size, sigma=1.0, device='c
     
     return prior_map.cpu().numpy()
 
+from castor.data.stage0_gaussian import render_gaussian_stars, get_gaussian_psf
+
 class InferenceEngine:
     """
     Handles model inference and visualization of results.
@@ -146,6 +148,8 @@ class InferenceEngine:
         self.transform = AstroSpaceTransform(stretch_scale=self.stretch_scale)
         # Get cell_size from config, fallback to default
         self.cell_size = config.get("curriculum", {}).get("stage0", {}).get("cell_size", DEFAULT_CELL_SIZE)
+        # Get sigma from config, fallback to realistic default
+        self.sigma = config.get("data_params", {}).get("physics_params", {}).get("sigma_fixed", 0.405)
 
     def _get_centered_psf(self):
         """
@@ -156,14 +160,10 @@ class InferenceEngine:
         numpy.ndarray
             A centered Gaussian PSF of size SHAPE_SIZE.
         """
-        S = SHAPE_SIZE
-        # Default diagnostic Gaussian core (sigma ~ 0.94 pixels)
-        y, x = np.meshgrid(np.arange(S), np.arange(S))
-        center = (S - 1) / 2.0
-        base_psf = np.exp(-((x - center)**2 + (y - center)**2) / (2 * 0.94**2))
-        return base_psf / (base_psf.sum() + 1e-9)
+        # Centralized Source of Truth (Uses value from config)
+        return get_gaussian_psf(sigma=self.sigma, kernel_size=SHAPE_SIZE)
 
-    def predict(self, image_tensor, threshold=0.1, prior_map=None):
+    def predict(self, image_tensor, threshold=0.1, prior_map=None, chunk_median=None):
         """
         Runs inference on a single 2D image tensor.
 
@@ -175,6 +175,8 @@ class InferenceEngine:
             Probability threshold for detecting stars, by default 0.1.
         prior_map : numpy.ndarray or torch.Tensor, optional
             Optional prior map to guide inference, by default None.
+        chunk_median : float, optional
+            Optional pre-calculated median for subtraction, by default None.
 
         Returns
         -------
@@ -185,8 +187,12 @@ class InferenceEngine:
         self.model.eval()
         
         with torch.no_grad():
-            # 1. Pre-processing: Median Subtraction and Arcsinh Stretch
-            chunk_median = image_tensor.median().item()
+            # 1. Pre-processing: Robust Median Subtraction and Arcsinh Stretch
+            if chunk_median is None:
+                # Use a lower percentile for robust background estimation in dense fields
+                # This prevents bright stars from skewing the median and destroying faint sources.
+                chunk_median = float(torch.quantile(image_tensor.view(-1), 0.10))
+            
             stretched_tensor = torch.arcsinh((image_tensor - chunk_median) / self.stretch_scale)
             
             if stretched_tensor.dim() == 2:
