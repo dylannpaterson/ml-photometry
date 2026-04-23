@@ -54,7 +54,7 @@ curriculum:
 
 data_params:
   # Samples to cover the unique parameter states
-  num_train_samples: 100000 
+  num_train_samples: 110000 
   num_val_samples: 10000
   
 
@@ -87,11 +87,25 @@ data_params:
     gamma_max: 0.35
   
 loss_params:
-  lambda_prob: 1.0
-  lambda_pos: 1.0
-  lambda_flux: 1.0
-  lambda_bg: 1.0
-  lambda_curvature: 1.0
+  # Focal loss values are naturally tiny. Multiply by 20 to bring 
+  # the initial loss from ~0.08 up to ~1.6, forcing the network to care about detection.
+  lambda_prob: 20.0 
+  
+  # Pos starts around ~2.0, which is healthy. Leave at 1.0.
+  lambda_pos: 1.0   
+  
+  # Flux starts massive (~9.5). Scale it down to 0.2 to bring its initial 
+  # impact down to ~1.9. This prevents Flux from hijacking the early gradients.
+  lambda_flux: 0.2  
+  
+  # Background starts around 0.6. Scale by 2.0 to bring it to ~1.2.
+  lambda_bg: 2.0    
+  
+  # Curvature and Entropy are microscopic (~0.003). They need a massive boost 
+  # to actually enforce spatial smoothness on the background.
+  lambda_curvature: 100.0
+  lambda_entropy: 100.0
+  
   lambda_diffraction_reg: 10.0
   focal_alpha: 0.50
   focal_gamma: 2.0

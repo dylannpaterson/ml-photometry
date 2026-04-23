@@ -254,11 +254,21 @@ def generate_single_sample_stage0(idx, params):
     
     return full_img.astype(np.float32), target_grid_full.astype(np.float32), chunk_median.astype(np.float32), meta
 
-def run_stage0_parallel_generation(config, num_samples=None, num_workers=None):
+def run_stage0_parallel_generation(config, num_samples=None, num_workers=None, split=None):
     s0_cfg = config['curriculum']['stage0']
     d_cfg = config['data_params']
-    total_samples = num_samples if num_samples is not None else (d_cfg['num_train_samples'] + d_cfg['num_val_samples'])
-    output_path = os.path.join(s0_cfg['data_dir'], "stage0_data.h5")
+    
+    if split is not None:
+        filename = f"stage0_{split}.h5"
+        if num_samples is None:
+            num_samples = d_cfg.get(f'num_{split}_samples', 0)
+    else:
+        filename = "stage0_data.h5"
+        if num_samples is None:
+            num_samples = d_cfg.get('num_train_samples', 0) + d_cfg.get('num_val_samples', 0)
+            
+    total_samples = num_samples
+    output_path = os.path.join(s0_cfg['data_dir'], filename)
     os.makedirs(s0_cfg['data_dir'], exist_ok=True)
     
     params = {

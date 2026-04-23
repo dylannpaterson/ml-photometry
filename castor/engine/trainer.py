@@ -439,7 +439,9 @@ class Trainer:
                     st_view_orig = targets[..., :-1].view(B, GH, GW, K, num_params)
                     p_targets = st_view_orig[..., 0]
                     
-                    survival_chance = p_targets * 0.9 + 0.05 
+                    # 🚀 ROBUSTNESS FIX: Drop out 30% of true stars to simulate an incomplete catalog.
+                    # This forces the network to look at the image to find the missing ones.
+                    survival_chance = p_targets * 0.7 
                     prior_mask = torch.rand_like(p_targets) < survival_chance
                     
                     partial_targets = targets.clone()
@@ -460,8 +462,9 @@ class Trainer:
                         max_jitter=0.4, fwhm=calculated_fwhm, sys_floor=0.01
                     )
 
-                # 15% chance to drop the entire prior map
-                if torch.rand(1).item() < 0.15:
+                # 🚀 ROBUSTNESS FIX: 50% chance to drop the entire prior map.
+                # Forces the network to learn blind detection half the time!
+                if torch.rand(1).item() < 0.50:
                     prior_map = torch.zeros_like(prior_map)
 
                 if self.use_cuda:
@@ -472,9 +475,9 @@ class Trainer:
                 
                 preds_fp32 = {k: v.float() for k, v in preds.items()}
                 
-                loss, p_loss, po_loss, f_loss, b_loss, e_loss = compute_grid_loss(
-                    preds_fp32, targets, **self.loss_params,
-                    log_task_vars=preds.get("log_task_vars")
+                loss, p_loss, po_loss, f_loss, b_loss, c_loss, e_loss = compute_grid_loss(
+                    preds_fp32, targets, 
+                    **self.loss_params
                 )
                 
                 # Scale loss by accumulation steps
@@ -523,7 +526,10 @@ class Trainer:
                 
                 if i % 100 == 0:
                     current_lr = self.optimizer.param_groups[0]['lr']
-                    print(f"Epoch [{epoch+1}/{self.epochs}], Step [{i}/{len(self.train_loader)}], LR: {current_lr:.6f}, Loss: {loss.item()*self.accumulation_steps:.4f} (P:{p_loss.item():.4f}, Pos:{po_loss.item():.4f}, F:{f_loss.item():.4f}, B:{b_loss.item():.4f}, E:{e_loss.item():.4f}, DReg:{reg_loss_val:.6f})")
+                    # Component losses p_loss, po_loss, etc. are already scaled inside compute_grid_loss
+                    # reg_loss is calculated locally and also scaled by lambda_diffraction
+                    scaled_reg = reg_loss.item() * self.accumulation_steps
+                    print(f"Epoch [{epoch+1}/{self.epochs}], Step [{i}/{len(self.train_loader)}], LR: {current_lr:.6f}, Loss: {loss.item()*self.accumulation_steps:.4f} (P:{p_loss.item():.4f}, Pos:{po_loss.item():.4f}, F:{f_loss.item():.4f}, B:{b_loss.item():.4f}, Curv:{c_loss.item():.4f}, Ent:{e_loss.item():.4f}, DReg:{scaled_reg:.6f})")
 
             avg_epoch_loss = epoch_loss/len(self.train_loader)
             print(f"==> Epoch {epoch+1} Complete | Avg Loss: {avg_epoch_loss:.4f} | Time: {time.time()-start_time:.1f}s")
@@ -583,8 +589,10 @@ class Trainer:
         num_batches = len(self.val_loader)
         if num_batches == 0: return 0.0
         
-        # Get K for stretching
-        K_val = self.config["data_params"].get("max_capacity_per_cell", 3)
+        # Get params for prior rendering (Match training)
+        img_size = self.config["data_params"]["image_size"]
+        cell_size = self.config["curriculum"].get(self.checkpoint_prefix, {}).get("cell_size", DEFAULT_CELL_SIZE)
+        K = self.config["data_params"].get("max_capacity_per_cell", MAX_CAPACITY_PER_CELL)
         
         with torch.no_grad():
             for batch in self.val_loader:
@@ -595,6 +603,9 @@ class Trainer:
                     images, targets = batch
                     images, targets = images.to(self.device, non_blocking=True), targets.to(self.device, non_blocking=True).float()
                 
+                # 🚀 FIX: Clone targets to prevent in-place mutation of the validation set
+                targets = targets.clone()
+
                 # Ensure channel dimension [B, 1, H, W]
                 if images.dim() == 3:
                     images = images.unsqueeze(1)
@@ -604,10 +615,8 @@ class Trainer:
                 
                 # Defensive check: Stage 1 has 17 elements (read_noise is at index 12). Stage 0 has 6.
                 if isinstance(batch, dict) and "meta" in batch and batch["meta"].shape[1] >= 17:
-                    # Stage 1: Inject exact dynamic read noise for this domain
                     batch_read_noise = batch["meta"][:, 12].to(self.device, non_blocking=True).float().view(-1, 1, 1, 1)
                 else:
-                    # Stage 0: Fallback to static config default
                     batch_read_noise = 5.0
                 
                 images_noisy += torch.randn_like(images_noisy) * batch_read_noise
@@ -620,27 +629,49 @@ class Trainer:
                 
                 # --- DYNAMIC TARGET STRETCHING (MATCH TRAINING) ---
                 B_v, GH_v, GW_v, C_v = targets.shape
-                num_params_v = (C_v - 1) // K_val
-                star_view = targets[..., :-1].reshape(B_v, GH_v, GW_v, K_val, num_params_v)
+                num_params_v = (C_v - 1) // K
+                star_view = targets[..., :-1].reshape(B_v, GH_v, GW_v, K, num_params_v)
                 star_view[..., 3] = torch.asinh(star_view[..., 3] / self.loss_params["stretch_scale"])
                 
                 bg_raw = targets[..., -1:]
                 bg_network = torch.asinh((bg_raw - batch_medians) / self.loss_params["stretch_scale"])
                 targets[..., -1:] = bg_network
                 
-                # Use 1-channel zero prior
-                prior_zeros = torch.zeros_like(images_final)
+                # --- ALIGNMENT FIX: Generate validation priors exactly like training ---
+                # This prevents the BatchNorm "zero-input" explosion.
+                p_targets = star_view[..., 0]
+                # During validation, we simulate an incomplete catalog too (70% survival)
+                survival_chance = p_targets * 0.7
+                prior_mask = torch.rand_like(p_targets) < survival_chance
+                
+                partial_targets = targets.clone()
+                st_view = partial_targets[..., :-1].view(B_v, GH_v, GW_v, K, num_params_v)
+                st_view[~prior_mask] = 0.0
+                
+                if isinstance(batch, dict) and "meta" in batch and batch["meta"].shape[1] >= 4:
+                    calculated_fwhm = batch["meta"][:, 3].to(self.device, non_blocking=True).float().view(-1, 1, 1, 1)
+                else:
+                    sigma_fixed = self.config.get("data_params", {}).get("physics_params", {}).get("sigma_fixed", 0.405)
+                    calculated_fwhm = sigma_fixed * 2.355
+
+                prior_map = render_confidence_prior(
+                    partial_targets, img_size, cell_size, K, 
+                    max_jitter=0.4, fwhm=calculated_fwhm, sys_floor=0.01
+                )
+
+                # Keep the same 50% dropout as training for consistency and BN stability
+                if torch.rand(1).item() < 0.50:
+                    prior_map = torch.zeros_like(prior_map)
 
                 if self.use_cuda:
                     with torch.autocast(device_type='cuda', dtype=torch.float16):
-                        preds = self.model(images_final, prior=prior_zeros)
+                        preds = self.model(images_final, prior=prior_map)
                 else:
-                    preds = self.model(images_final, prior=prior_zeros)
+                    preds = self.model(images_final, prior=prior_map)
                 
                 preds_fp32 = {k: v.float() for k, v in preds.items()}
-                loss, _, _, _, _, _ = compute_grid_loss(
-                    preds_fp32, targets, **self.loss_params,
-                    log_task_vars=preds.get("log_task_vars")
+                loss, _, _, _, _, _, _ = compute_grid_loss(
+                    preds_fp32, targets, **self.loss_params
                 )
                 val_loss += loss.item()
 

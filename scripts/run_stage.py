@@ -468,7 +468,14 @@ def run_infer(stage_idx, config, device, checkpoint=None):
             true_stars_chunk = []
             cell_size, grid_size, K = dataset.cell_size, dataset.grid_size, dataset.K
             target_grid = target[:, :, :-1].view(grid_size, grid_size, K, -1).numpy()
-            gt_bg_map = target[:, :, -1:].numpy()
+            gt_bg_map_linear = target[:, :, -1:].numpy()
+            
+            # --- BUG FIX: STRETCH GT BACKGROUND ---
+            # InferenceEngine.visualize expects ALL backgrounds in hero_data 
+            # to be in 'network space' (arcsinh residual).
+            # Passing linear absolute photons here was causing a double-unstretch (sinh of a sinh) 
+            # leading to 1e33 range values.
+            gt_bg_map_stretched = np.arcsinh((gt_bg_map_linear - robust_median) / stretch_scale)
             
             for y in range(grid_size):
                 for x in range(grid_size):
@@ -518,7 +525,7 @@ def run_infer(stage_idx, config, device, checkpoint=None):
                     "true_stars": true_stars_chunk,
                     "pred_stars": pred_stars_flat,
                     "bg_map": bg_map_flat,
-                    "gt_bg_map": gt_bg_map,
+                    "gt_bg_map": gt_bg_map_stretched,
                     "chunk_median": robust_median
                 }
                 hero_data_oracle = hero_data_flat.copy()

@@ -262,14 +262,24 @@ def generate_single_chunk(idx, config, psf_queue):
     gc.collect()
     return full_image.astype(np.float32), target_grid_full, chunk_median.astype(np.float32), meta
 
-def run_stage1_generation(config_path="config/config.yaml", num_samples=None, num_workers=None):
+def run_stage1_generation(config_path="config/config.yaml", num_samples=None, num_workers=None, split=None):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     s1_cfg, d_cfg = config['curriculum']['stage1'], config['data_params']
-    total_samples = num_samples if num_samples is not None else (d_cfg['num_train_samples'] + d_cfg['num_val_samples'])
+    
+    if split is not None:
+        filename = f"stage1_{split}.h5"
+        if num_samples is None:
+            num_samples = d_cfg.get(f'num_{split}_samples', 0)
+    else:
+        filename = "stage1_data.h5"
+        if num_samples is None:
+            num_samples = d_cfg.get('num_train_samples', 0) + d_cfg.get('num_val_samples', 0)
+            
+    total_samples = num_samples
     os.makedirs(s1_cfg['data_dir'], exist_ok=True)
     
-    output_path = os.path.join(s1_cfg['data_dir'], "stage1_data.h5")
+    output_path = os.path.join(s1_cfg['data_dir'], filename)
     
     if num_workers is None: 
         num_workers = mp.cpu_count()

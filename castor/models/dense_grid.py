@@ -189,6 +189,20 @@ class DiffractionAwareFilter(nn.Module):
         # Output shape: [Batch, 2, H, W]
         return torch.cat([x, self.conv(x)], dim=1)
 
+def convert_bn_to_gn(module, num_groups=32):
+    """
+    Recursively replaces BatchNorm2d with GroupNorm.
+    """
+    for name, child in module.named_children():
+        if isinstance(child, nn.BatchNorm2d):
+            num_channels = child.num_features
+            # Ensure num_channels is divisible by groups. 32 is standard.
+            # If channels < 32 (like 16 or 8), use channels as groups (InstanceNorm).
+            groups = 32 if num_channels >= 32 else num_channels
+            setattr(module, name, nn.GroupNorm(groups, num_channels))
+        else:
+            convert_bn_to_gn(child, num_groups)
+
 class DenseGridModel(nn.Module):
     """
     The main Castor neural network model using a dense grid output.
@@ -211,8 +225,6 @@ class DenseGridModel(nn.Module):
         FPN neck components.
     head : nn.Sequential
         Prediction head with CoordConv.
-    log_task_vars : nn.Parameter
-        Learnable parameters for homoscedastic task uncertainty.
     """
     def __init__(self, K=MAX_CAPACITY_PER_CELL, shape_size=SHAPE_SIZE, cell_size=DEFAULT_CELL_SIZE, stretch_scale=GLOBAL_STRETCH_SCALE):
         """
@@ -224,7 +236,7 @@ class DenseGridModel(nn.Module):
             Stars per cell, by default MAX_CAPACITY_PER_CELL.
         shape_size : int, optional
             Size of input image (not used directly in init), by default SHAPE_SIZE.
-        cell_size : int, optional
+            cell_size : int, optional
             Size of each cell, by default DEFAULT_CELL_SIZE.
         stretch_scale : float, optional
             Flux stretch scale, by default GLOBAL_STRETCH_SCALE.
@@ -239,19 +251,23 @@ class DenseGridModel(nn.Module):
         # 1. Physics Prior Filter
         self.diffraction_filter = DiffractionAwareFilter(kernel_size=21)
 
-        # 2. Backbone: Full ResNet-34
+        # 2. Backbone: ResNet-34 with GroupNorm
         resnet = models.resnet34(weights=None)
+        
+        # 🚀 BN -> GN Conversion: Prevent training/eval stats explosion
+        convert_bn_to_gn(resnet)
+
         self.initial = nn.Sequential(
             # 3 Channels: Raw Image, Physics Filter response, Confidence Prior
             nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
-            resnet.bn1,
+            resnet.bn1, # This is now GroupNorm
             resnet.relu,
             resnet.maxpool, # Stride 4, Output 64x64
         )
-        self.layer1 = resnet.layer1 # 64x64, 64ch
-        self.layer2 = resnet.layer2 # 32x32, 128ch
-        self.layer3 = resnet.layer3 # 16x16, 256ch
-        self.layer4 = resnet.layer4 # 8x8, 512ch
+        self.layer1 = resnet.layer1 
+        self.layer2 = resnet.layer2 
+        self.layer3 = resnet.layer3 
+        self.layer4 = resnet.layer4 
 
         # 3. FPN Neck: Merge deep context back to the 64x64 prediction grid
         self.top_layer = nn.Conv2d(512, 128, kernel_size=1) # 8x8
@@ -265,10 +281,6 @@ class DenseGridModel(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(256, self.num_output_channels, kernel_size=1)
         )
-        
-        # NEW: Homoscedastic Task Uncertainty Parameters
-        # Indices: 0:Prob, 1:Pos, 2:Flux, 3:BG, 4:Curvature, 5:Entropy
-        self.log_task_vars = nn.Parameter(torch.zeros(6))
 
     def forward(self, x, prior=None):
         """
@@ -357,8 +369,7 @@ class DenseGridModel(nn.Module):
                 "p_logits": p_logits,
                 "raw_asinh_flux": raw_asinh_flux,
                 "log_vars": log_vars,
-                "background": bg,
-                "log_task_vars": self.log_task_vars # Export learnable weights
+                "background": bg
             }
 
 def compute_nll_loss(pred, target, log_var, beta=0.5, weights=None):
@@ -470,8 +481,10 @@ def compute_relative_entropy_loss(bg_pred):
     # d > 0 when bg_pred < prior_mesh (the moat)
     diff = (prior_mesh - x)
     
-    # Clamp diff for numerical stability before exp (max 10.0 -> ~22000 penalty)
-    diff_clamped = torch.clamp(diff, max=10.0)
+    # 🚀 STABILITY FIX: Clamp diff on BOTH sides. 
+    # Max=10.0 prevents exp() explosion for "moats".
+    # Min=-10.0 prevents linear explosion for "walls" (extremely high bg predictions).
+    diff_clamped = torch.clamp(diff, min=-10.0, max=10.0)
     
     # Formulation: exp(d) - d - 1
     # This is 0 when x == prior_mesh, explodes when x << prior_mesh.
@@ -479,7 +492,7 @@ def compute_relative_entropy_loss(bg_pred):
     
     return penalty_map.mean()
 
-def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=1.0, lambda_pos=1.0, lambda_flux=1.0, lambda_bg=1.0, lambda_curvature=1.0, focal_alpha=0.50, focal_gamma=2.0, stretch_scale=GLOBAL_STRETCH_SCALE, log_task_vars=None):
+def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=1.0, lambda_pos=1.0, lambda_flux=1.0, lambda_bg=1.0, lambda_curvature=1.0, focal_alpha=0.50, focal_gamma=2.0, stretch_scale=GLOBAL_STRETCH_SCALE, **kwargs):
     """
     Refactored loss using Aleatoric Uncertainty Estimation (NLL).
 
@@ -497,13 +510,13 @@ def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=1.0, lambda_pos=
         Focal loss parameters, by default 0.50 and 2.0.
     stretch_scale : float, optional
         Arcsinh stretch scale, by default GLOBAL_STRETCH_SCALE.
-    log_task_vars : torch.Tensor, optional
-        Task uncertainty weights, by default None.
+    **kwargs : dict
+        Additional parameters like lambda_entropy.
 
     Returns
     -------
     tuple
-        Tuple of (total_loss, prob_loss, pos_loss, flux_loss, bg_loss, ent_loss).
+        Tuple of (total_loss, prob_loss, pos_loss, flux_loss, bg_loss, curv_loss, ent_loss).
     """
     star_preds = preds["stars"]
     bg_preds = preds["background"]
@@ -516,11 +529,11 @@ def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=1.0, lambda_pos=
     K = MAX_CAPACITY_PER_CELL
     star_targets = star_targets_flat.view(B, H, W, K, -1)
     
-    # Object mask uses target p > 0 (Soft Labels)
-    obj_mask = star_targets[..., 0] > 0.0
+    # Probability target for Detection Head
     p_target = star_targets[..., 0]
     
     # 2. Probability Loss (p) with Focal Loss
+    # We keep computing this for ALL stars so the network learns to suppress faint ones.
     p_pred_probs = torch.clamp(star_preds[..., 0], 1e-7, 1.0 - 1e-7)
     p_pred_logits = preds["p_logits"].squeeze(-1) 
     
@@ -531,19 +544,33 @@ def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=1.0, lambda_pos=
     
     raw_prob_loss = (alpha_t * focal_weight * bce_loss).mean()
     
-    # 3. Regression Losses (Masked & Weighted by p_target)
-    if obj_mask.sum() > 0:
-        # Unpack predictions
-        pos_pred = star_preds[..., 1:3][obj_mask]
-        pos_target = star_targets[..., 1:3][obj_mask]
-        log_var_pos = star_preds[..., 4:6][obj_mask]
+    # --- THE FIX: STRICT REGRESSION MASK ---
+    # Only regress positions/fluxes for stars that are physically detectable.
+    # We use SNR >= 3.0 as the cutoff for localization training.
+    # The target SNR is at index 4 of the [p, dx, dy, flux, snr] layout.
+    snr_target_full = star_targets[..., 4]
+    regression_mask = (p_target > 0.0) & (snr_target_full >= 3.0)
+    
+    # 3. Regression Losses (Masked & Weighted)
+    if regression_mask.sum() > 0:
+        # Unpack predictions using the STRICT mask
+        pos_pred = star_preds[..., 1:3][regression_mask]
+        pos_target = star_targets[..., 1:3][regression_mask]
+        log_var_pos = star_preds[..., 4:6][regression_mask]
         
         # Align flux loss with Arcsinh stretching
-        asinh_flux_pred = preds["raw_asinh_flux"][obj_mask]
-        asinh_flux_target = star_targets[..., 3:4][obj_mask] # Stretched by Trainer
-        log_var_flux = star_preds[..., 6:7][obj_mask]
+        asinh_flux_pred = preds["raw_asinh_flux"][regression_mask]
+        asinh_flux_target = star_targets[..., 3:4][regression_mask] # Stretched by Trainer
+        log_var_flux = star_preds[..., 6:7][regression_mask]
         
-        reg_weights = p_target[obj_mask]
+        # Extract SNR for the valid stars
+        snr_target = snr_target_full[regression_mask]
+        
+        # Log10 weighting (minimum clamped to 10.0 to act as the 1x baseline)
+        snr_weight = torch.log10(torch.clamp(snr_target, min=10.0))
+        
+        # Final weights: Probability label * SNR Weight
+        reg_weights = p_target[regression_mask] * snr_weight
 
         # Calculate Weighted NLL Losses
         raw_pos_loss = compute_nll_loss(pos_pred, pos_target, log_var_pos, weights=reg_weights)
@@ -557,26 +584,17 @@ def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=1.0, lambda_pos=
     raw_curvature_loss = compute_curvature_loss(bg_preds)
     raw_entropy_loss = compute_relative_entropy_loss(bg_preds)
     
-    # --- TASK UNCERTAINTY WEIGHTING ---
-    if log_task_vars is not None:
-        # HARD FIX: To prevent the homoscedastic "cheat code", we must ensure log_task_vars 
-        # do not become too negative when their respective raw losses are negative.
-        # We clamp log_task_vars to a floor of -4.0 (variance ~0.018).
-        safe_log_task_vars = torch.clamp(log_task_vars, min=-4.0)
-        
-        # Weights: 0:Prob, 1:Pos, 2:Flux, 3:BG, 4:Curvature, 5:Entropy
-        prob_loss = torch.exp(-safe_log_task_vars[0]) * raw_prob_loss + safe_log_task_vars[0]
-        pos_loss = torch.exp(-safe_log_task_vars[1]) * raw_pos_loss + safe_log_task_vars[1]
-        flux_loss = torch.exp(-safe_log_task_vars[2]) * raw_flux_loss + safe_log_task_vars[2]
-        bg_loss = torch.exp(-safe_log_task_vars[3]) * raw_bg_loss + safe_log_task_vars[3]
-        curv_loss = torch.exp(-safe_log_task_vars[4]) * raw_curvature_loss + safe_log_task_vars[4]
-        ent_loss = torch.exp(-safe_log_task_vars[5]) * raw_entropy_loss + safe_log_task_vars[5]
-        
-        # Final weighted sum (base scales set to 1.0)
-        total_loss = (prob_loss + pos_loss + flux_loss + bg_loss + curv_loss + ent_loss)
-    else:
-        # Fallback
-        total_loss = (raw_prob_loss + raw_pos_loss + raw_flux_loss + raw_bg_loss + raw_curvature_loss + raw_entropy_loss)
-        prob_loss, pos_loss, flux_loss, bg_loss, curv_loss, ent_loss = raw_prob_loss, raw_pos_loss, raw_flux_loss, raw_bg_loss, raw_curvature_loss, raw_entropy_loss
+    # --- STATIC WEIGHTING ---
+    prob_loss = lambda_prob * raw_prob_loss
+    pos_loss = lambda_pos * raw_pos_loss
+    flux_loss = lambda_flux * raw_flux_loss
+    bg_loss = lambda_bg * raw_bg_loss
+    curv_loss = lambda_curvature * raw_curvature_loss
+    
+    # Pull lambda_entropy from config (defaults to 1.0 if not found)
+    lambda_entropy = kwargs.get("lambda_entropy", 1.0)
+    ent_loss = lambda_entropy * raw_entropy_loss
+    
+    total_loss = (prob_loss + pos_loss + flux_loss + bg_loss + curv_loss + ent_loss)
                   
-    return total_loss, prob_loss, pos_loss, flux_loss, bg_loss, ent_loss
+    return total_loss, prob_loss, pos_loss, flux_loss, bg_loss, curv_loss, ent_loss

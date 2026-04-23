@@ -183,6 +183,10 @@ class Evaluator:
                 # Predict
                 with torch.no_grad():
                     input_tensor = img_stretched.unsqueeze(0).to(self.device)
+                    # Ensure channel dimension [B, 1, H, W]
+                    if input_tensor.dim() == 3:
+                        input_tensor = input_tensor.unsqueeze(1)
+                        
                     # FIX: Match Training Mixed Precision Context
                     with torch.autocast(device_type=self.device.type, dtype=torch.float16):
                         prediction_dict = self.model(input_tensor)
