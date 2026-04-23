@@ -364,44 +364,6 @@ class Trainer:
                 if images.dim() == 3:
                     images = images.unsqueeze(1)
                 
-                # --- APPLY D4 SPATIAL SYMMETRY ---
-                # targets shape: [B, GH, GW, C]
-                B, GH, GW, C = targets.shape
-                K_aug = self.config["data_params"].get("max_capacity_per_cell", 3)
-                num_params_aug = (C - 1) // K_aug
-                
-                # 1. Horizontal Flip
-                if torch.rand(1).item() < 0.5:
-                    images = torch.flip(images, dims=[-1])
-                    targets = torch.flip(targets, dims=[2])
-                    star_view = targets[..., :-1].reshape(B, GH, GW, K_aug, num_params_aug)
-                    # 🚀 ALIGNMENT FIX: x -> (W-1) - x for discrete array flips
-                    star_view[..., 1] = (cell_size - 1.0) - star_view[..., 1]
-                    # ✅ WRITE BACK TO TARGETS (Handles non-contiguous copy from reshape)
-                    targets[..., :-1] = star_view.reshape(B, GH, GW, -1)
-
-                # 2. Vertical Flip
-                if torch.rand(1).item() < 0.5:
-                    images = torch.flip(images, dims=[-2])
-                    targets = torch.flip(targets, dims=[1])
-                    star_view = targets[..., :-1].reshape(B, GH, GW, K_aug, num_params_aug)
-                    # 🚀 ALIGNMENT FIX: y -> (H-1) - y for discrete array flips
-                    star_view[..., 2] = (cell_size - 1.0) - star_view[..., 2]
-                    # ✅ WRITE BACK TO TARGETS
-                    targets[..., :-1] = star_view.reshape(B, GH, GW, -1)
-
-                # 3. Transpose (Diagonal Flip)
-                if torch.rand(1).item() < 0.5:
-                    images = torch.transpose(images, -2, -1)
-                    targets = torch.transpose(targets, 1, 2)
-                    star_view = targets[..., :-1].reshape(B, GH, GW, K_aug, num_params_aug)
-                    # Swap dx and dy
-                    dx_temp = star_view[..., 1].clone()
-                    star_view[..., 1] = star_view[..., 2]
-                    star_view[..., 2] = dx_temp
-                    # ✅ WRITE BACK TO TARGETS
-                    targets[..., :-1] = star_view.reshape(B, GH, GW, -1)
-
                 # --- LIVE NOISE INJECTION ---
                 images_positive = torch.clamp(images, min=0.0) 
                 images_noisy = torch.poisson(images_positive)
@@ -425,10 +387,9 @@ class Trainer:
                 
                 # --- DYNAMIC TARGET STRETCHING ---
                 # 1. Stretch Star Fluxes (Index 3 in the [p, dx, dy, flux, snr] layout)
-                # Ensure we handle non-contiguous tensors from augmentation with .reshape
                 B_idx, GH_idx, GW_idx, C_idx = targets.shape
-                num_params_idx = (C_idx - 1) // K_aug
-                star_view = targets[..., :-1].reshape(B_idx, GH_idx, GW_idx, K_aug, num_params_idx)
+                num_params_idx = (C_idx - 1) // K
+                star_view = targets[..., :-1].reshape(B_idx, GH_idx, GW_idx, K, num_params_idx)
                 
                 # Arcsinh stretch the flux
                 star_view[..., 3] = torch.asinh(star_view[..., 3] / self.loss_params["stretch_scale"])
