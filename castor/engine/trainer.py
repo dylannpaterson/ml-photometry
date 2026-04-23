@@ -377,6 +377,8 @@ class Trainer:
                     star_view = targets[..., :-1].reshape(B, GH, GW, K_aug, num_params_aug)
                     # 🚀 ALIGNMENT FIX: x -> (W-1) - x for discrete array flips
                     star_view[..., 1] = (cell_size - 1.0) - star_view[..., 1]
+                    # ✅ WRITE BACK TO TARGETS (Handles non-contiguous copy from reshape)
+                    targets[..., :-1] = star_view.reshape(B, GH, GW, -1)
 
                 # 2. Vertical Flip
                 if torch.rand(1).item() < 0.5:
@@ -385,6 +387,8 @@ class Trainer:
                     star_view = targets[..., :-1].reshape(B, GH, GW, K_aug, num_params_aug)
                     # 🚀 ALIGNMENT FIX: y -> (H-1) - y for discrete array flips
                     star_view[..., 2] = (cell_size - 1.0) - star_view[..., 2]
+                    # ✅ WRITE BACK TO TARGETS
+                    targets[..., :-1] = star_view.reshape(B, GH, GW, -1)
 
                 # 3. Transpose (Diagonal Flip)
                 if torch.rand(1).item() < 0.5:
@@ -395,6 +399,8 @@ class Trainer:
                     dx_temp = star_view[..., 1].clone()
                     star_view[..., 1] = star_view[..., 2]
                     star_view[..., 2] = dx_temp
+                    # ✅ WRITE BACK TO TARGETS
+                    targets[..., :-1] = star_view.reshape(B, GH, GW, -1)
 
                 # --- LIVE NOISE INJECTION ---
                 images_positive = torch.clamp(images, min=0.0) 
@@ -426,6 +432,8 @@ class Trainer:
                 
                 # Arcsinh stretch the flux
                 star_view[..., 3] = torch.asinh(star_view[..., 3] / self.loss_params["stretch_scale"])
+                # ✅ WRITE BACK TO TARGETS
+                targets[..., :-1] = star_view.reshape(B_idx, GH_idx, GW_idx, -1)
                 
                 # 2. Stretch Background (Subtract median, then stretch)
                 bg_raw = targets[..., -1:]
@@ -632,6 +640,8 @@ class Trainer:
                 num_params_v = (C_v - 1) // K
                 star_view = targets[..., :-1].reshape(B_v, GH_v, GW_v, K, num_params_v)
                 star_view[..., 3] = torch.asinh(star_view[..., 3] / self.loss_params["stretch_scale"])
+                # ✅ WRITE BACK TO TARGETS
+                targets[..., :-1] = star_view.reshape(B_v, GH_v, GW_v, -1)
                 
                 bg_raw = targets[..., -1:]
                 bg_network = torch.asinh((bg_raw - batch_medians) / self.loss_params["stretch_scale"])
