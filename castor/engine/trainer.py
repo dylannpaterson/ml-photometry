@@ -430,9 +430,13 @@ class Trainer:
                         max_jitter=0.4, fwhm=calculated_fwhm, sys_floor=0.01
                     )
 
-                # 🚀 ROBUSTNESS FIX: 50% chance to drop the entire prior map.
+                # 🚀 ROBUSTNESS FIX: Temporarily Disable Prior Map (Epoch 0-14)
+                # Force the network to learn detection from raw pixels first.
+                if epoch < 15:
+                    prior_map = torch.zeros_like(prior_map)
+                # 🚀 ROBUSTNESS FIX: 50% chance to drop the entire prior map (Epoch 15+).
                 # Forces the network to learn blind detection half the time!
-                if torch.rand(1).item() < 0.50:
+                elif torch.rand(1).item() < 0.50:
                     prior_map = torch.zeros_like(prior_map)
 
                 if self.use_cuda:
@@ -445,6 +449,7 @@ class Trainer:
                 
                 loss, p_loss, po_loss, f_loss, b_loss, c_loss, e_loss = compute_grid_loss(
                     preds_fp32, targets, 
+                    current_epoch=epoch,
                     **self.loss_params
                 )
                 
@@ -494,7 +499,7 @@ class Trainer:
 
             avg_epoch_loss = epoch_loss/len(self.train_loader)
             print(f"==> Epoch {epoch+1} Complete | Avg Loss: {avg_epoch_loss:.4f} | Time: {time.time()-start_time:.1f}s")
-            val_loss = self.validate(); print(f"Validation Loss: {val_loss:.4f}")
+            val_loss = self.validate(epoch); print(f"Validation Loss: {val_loss:.4f}")
             
             if np.isnan(avg_epoch_loss) or np.isnan(val_loss):
                 print(f"❌ NaN detected in loss. Skipping checkpoint saving.")
@@ -537,9 +542,14 @@ class Trainer:
                 try: os.remove(os.path.join(checkpoint_dir, checkpoints[i][1]))
                 except OSError: pass
 
-    def validate(self):
+    def validate(self, current_epoch=None):
         """
         Evaluate the model on the validation set.
+
+        Parameters
+        ----------
+        current_epoch : int, optional
+            The current training epoch, by default None.
 
         Returns
         -------
@@ -622,8 +632,10 @@ class Trainer:
                     max_jitter=0.4, fwhm=calculated_fwhm, sys_floor=0.01
                 )
 
-                # Keep the same 50% dropout as training for consistency and BN stability
-                if torch.rand(1).item() < 0.50:
+                # Keep the same logic as training for prior map dropout
+                if current_epoch is not None and current_epoch < 15:
+                    prior_map = torch.zeros_like(prior_map)
+                elif torch.rand(1).item() < 0.50:
                     prior_map = torch.zeros_like(prior_map)
 
                 if self.use_cuda:
@@ -634,7 +646,7 @@ class Trainer:
                 
                 preds_fp32 = {k: v.float() for k, v in preds.items()}
                 loss, _, _, _, _, _, _ = compute_grid_loss(
-                    preds_fp32, targets, **self.loss_params
+                    preds_fp32, targets, current_epoch=current_epoch, **self.loss_params
                 )
                 val_loss += loss.item()
 

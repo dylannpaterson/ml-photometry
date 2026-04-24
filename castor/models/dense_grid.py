@@ -325,9 +325,9 @@ class DenseGridModel(nn.Module):
                 "background": bg
             }
 
-def compute_nll_loss(pred, target, log_var, beta=0.5, weights=None):
+def compute_nll_loss(pred, target, log_var, beta=0.5, weights=None, current_epoch=None):
     """
-    Calculates Beta-NLL with optional per-sample weighting.
+    Calculates Beta-NLL with optional per-sample weighting and epoch-based warm-up.
 
     Parameters
     ----------
@@ -341,22 +341,32 @@ def compute_nll_loss(pred, target, log_var, beta=0.5, weights=None):
         Power for variance scaling (Beta-NLL), by default 0.5.
     weights : torch.Tensor, optional
         Per-sample weights for the loss, by default None.
+    current_epoch : int, optional
+        Current training epoch for warm-up logic, by default None.
 
     Returns
     -------
     torch.Tensor
         The calculated NLL loss.
     """
-    precision = torch.exp(-log_var)
-    # 1. Standard Gaussian NLL
-    # Note: Adding a small constant or clamping log_var here helps prevent the "cheat code" 
-    # where the model minimizes the penalty term instead of the error.
-    loss = 0.5 * (precision * (pred - target)**2 + log_var)
+    # 1. Warm-up: Use standard MSE for the first 10 epochs
+    if current_epoch is not None and current_epoch < 10:
+        loss = 0.5 * ((pred - target)**2)
+    else:
+        precision = torch.exp(-log_var)
+        # 2. Shift NLL Floor: Offset by the minimum possible log_var (ln(1e-4) ~= -9.21)
+        # to ensure the loss remains positive and well-behaved.
+        nll_floor = -9.21034
+        loss = 0.5 * (precision * (pred - target)**2 + (log_var - nll_floor))
     
-    # 2. Scale by detached variance^beta
-    var_detached = torch.exp(log_var.detach())
-    beta_scale = var_detached ** beta
-    weighted_loss = loss * beta_scale
+    # 3. Scale by detached variance^beta (Beta-NLL)
+    # We only do this after warm-up
+    if current_epoch is None or current_epoch >= 10:
+        var_detached = torch.exp(log_var.detach())
+        beta_scale = var_detached ** beta
+        weighted_loss = loss * beta_scale
+    else:
+        weighted_loss = loss
     
     if weights is not None:
         # Ensure weights match coordinate dimensions
@@ -445,7 +455,7 @@ def compute_relative_entropy_loss(bg_pred):
     
     return penalty_map.mean()
 
-def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=1.0, lambda_pos=1.0, lambda_flux=1.0, lambda_bg=1.0, lambda_curvature=1.0, focal_alpha=0.50, focal_gamma=2.0, stretch_scale=GLOBAL_STRETCH_SCALE, **kwargs):
+def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=1.0, lambda_pos=1.0, lambda_flux=1.0, lambda_bg=1.0, lambda_curvature=1.0, focal_alpha=0.50, focal_gamma=2.0, stretch_scale=GLOBAL_STRETCH_SCALE, current_epoch=None, **kwargs):
     """
     Refactored loss using Aleatoric Uncertainty Estimation (NLL).
 
@@ -463,6 +473,8 @@ def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=1.0, lambda_pos=
         Focal loss parameters, by default 0.50 and 2.0.
     stretch_scale : float, optional
         Arcsinh stretch scale, by default GLOBAL_STRETCH_SCALE.
+    current_epoch : int, optional
+        Current training epoch, by default None.
     **kwargs : dict
         Additional parameters like lambda_entropy.
 
@@ -528,8 +540,8 @@ def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=1.0, lambda_pos=
         reg_weights = p_target[regression_mask] * snr_weight
 
         # Calculate Weighted NLL Losses
-        raw_pos_loss = compute_nll_loss(pos_pred, pos_target, log_var_pos, weights=reg_weights)
-        raw_flux_loss = compute_nll_loss(asinh_flux_pred, asinh_flux_target, log_var_flux, weights=reg_weights)
+        raw_pos_loss = compute_nll_loss(pos_pred, pos_target, log_var_pos, weights=reg_weights, current_epoch=current_epoch)
+        raw_flux_loss = compute_nll_loss(asinh_flux_pred, asinh_flux_target, log_var_flux, weights=reg_weights, current_epoch=current_epoch)
     else:
         raw_pos_loss = torch.tensor(0.0, device=star_preds.device)
         raw_flux_loss = torch.tensor(0.0, device=star_preds.device)
