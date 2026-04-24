@@ -566,8 +566,10 @@ def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=1.0, lambda_pos=
         # Extract SNR for the valid stars
         snr_target = snr_target_full[regression_mask]
         
-        # Log10 weighting (minimum clamped to 10.0 to act as the 1x baseline)
-        snr_weight = torch.log10(torch.clamp(snr_target, min=10.0))
+        # NEW: Linear SNR weighting (minimum clamped to 3.0 to match regression mask)
+        # Brightest stars (SNR 1500) now carry 500x more weight than faint ones,
+        # forcing precise recovery of high-flux sources.
+        snr_weight = torch.clamp(snr_target, min=3.0)
         
         # Final weights: Probability label * SNR Weight
         reg_weights = p_target[regression_mask] * snr_weight
