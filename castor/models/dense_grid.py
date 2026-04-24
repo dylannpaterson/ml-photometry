@@ -205,6 +205,17 @@ def convert_bn_to_gn(module, num_groups=8):
         else:
             convert_bn_to_gn(child, num_groups)
 
+def swap_relu_with_gelu(module):
+    """
+    Recursively replaces all ReLU layers with GELU for better gradient flow
+    through negative noise troughs.
+    """
+    for name, child in module.named_children():
+        if isinstance(child, nn.ReLU):
+            setattr(module, name, nn.GELU())
+        else:
+            swap_relu_with_gelu(child)
+
 class DenseGridModel(nn.Module):
     """
     The main Castor neural network model using a dense grid output.
@@ -253,18 +264,22 @@ class DenseGridModel(nn.Module):
         # 1. Physics Prior Filter
         self.diffraction_filter = DiffractionAwareFilter(kernel_size=21)
 
-        # 2. Backbone: ResNet-34 with GroupNorm
+        # 2. Backbone: ResNet-34 with GroupNorm and GELU
         resnet = models.resnet34(weights=None)
         
-        # 🚀 BN -> GN Conversion: Prevent training/eval stats explosion
-        convert_bn_to_gn(resnet)
+        # 🚀 BN -> GN Conversion: Preserve global scale
+        convert_bn_to_gn(resnet, num_groups=8)
+        
+        # 🚀 ReLU -> GELU Conversion: Maintain gradients for negative noise troughs
+        swap_relu_with_gelu(resnet)
 
         self.initial = nn.Sequential(
             # 3 Channels: Raw Image, Physics Filter response, Confidence Prior
             nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
             resnet.bn1, # This is now GroupNorm
-            resnet.relu,
-            resnet.maxpool, # Stride 4, Output 64x64
+            nn.GELU(),
+            # Replace MaxPool with AvgPool to mathematically conserve flux during downsampling
+            nn.AvgPool2d(kernel_size=3, stride=2, padding=1)
         )
         self.layer1 = resnet.layer1 
         self.layer2 = resnet.layer2 
@@ -280,7 +295,7 @@ class DenseGridModel(nn.Module):
         # 4. Prediction Head with CoordConv for spatial awareness
         self.head = nn.Sequential(
             CoordConv(128, 256, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.Conv2d(256, self.num_output_channels, kernel_size=1)
         )
 
@@ -342,8 +357,10 @@ class DenseGridModel(nn.Module):
             p = torch.sigmoid(p_logits)   # Standard probability for inference
             # ------------------------
             
-            dx = torch.sigmoid(star_out[..., 1:2]) * self.cell_size
-            dy = torch.sigmoid(star_out[..., 2:3]) * self.cell_size
+            # 🚀 RELAXED SIGMOID: Expand range by 20% to keep gradients steep at boundaries
+            # and prevent "pixel-locking" centroids.
+            dx = (torch.sigmoid(star_out[..., 1:2]) * 1.2 - 0.1) * self.cell_size
+            dy = (torch.sigmoid(star_out[..., 2:3]) * 1.2 - 0.1) * self.cell_size
             
             # FIX: Use Arcsinh for flux instead of Log.
             # Predicted value is 'raw_asinh_flux'
