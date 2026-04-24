@@ -34,9 +34,33 @@ def get_gaussian_psf(sigma=0.405, kernel_size=25):
     Ensures the peak is at the exact center.
     Sigma 0.405 derived from F146 FWHM=0.105" and scale=0.11"/px.
     """
+    # DEPRECATED: Use get_oversampled_gaussian_psf for better physical accuracy
     center = (kernel_size - 1) / 2.0
     yy, xx = np.indices((kernel_size, kernel_size)) - center
     psf = np.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+    return (psf / (psf.sum() + 1e-9)).astype(np.float32)
+
+def get_oversampled_gaussian_psf(sigma_detector=0.405, grid_size=25, oversample=4):
+    """
+    Generates a high-fidelity Gaussian PSF by oversampling and then binning down.
+    This approximates the true integration of the Gaussian over pixel areas,
+    which is critical for sharp PSFs (small sigma) where central sampling is inaccurate.
+    """
+    hr_size = grid_size * oversample
+    # Center consistent with the (grid_size-1)/2.0 convention
+    hr_center = (hr_size - 1) / 2.0
+    
+    yy, xx = np.indices((hr_size, hr_size)) - hr_center
+    sigma_hr = sigma_detector * oversample
+    
+    # Analytical Gaussian on high-res grid
+    psf_hr = np.exp(-(xx**2 + yy**2) / (2 * sigma_hr**2))
+    
+    # Bin down: sum over blocks to conserve flux
+    # Reshape to (grid_size, oversample, grid_size, oversample) then sum over oversample axes
+    psf = psf_hr.reshape(grid_size, oversample, grid_size, oversample).sum(axis=(1, 3))
+    
+    # Normalize to unity sum to ensure flux conservation during convolution
     return (psf / (psf.sum() + 1e-9)).astype(np.float32)
 
 def render_gaussian_stars(height, width, px, py, fluxes, sigma=0.405, psf_kernel=None):
@@ -44,7 +68,7 @@ def render_gaussian_stars(height, width, px, py, fluxes, sigma=0.405, psf_kernel
     Vectorized star renderer using bilinear splatting followed by convolution.
     """
     if psf_kernel is None:
-        psf_kernel = get_gaussian_psf(sigma=sigma)
+        psf_kernel = get_oversampled_gaussian_psf(sigma_detector=sigma, grid_size=25, oversample=4)
         
     grid = np.zeros((height, width), dtype=np.float32)
     if len(fluxes) == 0:
@@ -208,7 +232,8 @@ def generate_single_sample_stage0(idx, params):
 
     # 5. PSF (Randomized per chunk)
     sigma_detector = np.random.uniform(0.25, 1.0)
-    psf_kernel = get_gaussian_psf(sigma=sigma_detector, kernel_size=25)
+    # Use oversampled PSF for high-fidelity rendering
+    psf_kernel = get_oversampled_gaussian_psf(sigma_detector=sigma_detector, grid_size=25, oversample=4)
     chunk_fwhm = sigma_detector * 2.355
 
     # 6. Dust & Sky
@@ -223,6 +248,7 @@ def generate_single_sample_stage0(idx, params):
     def get_snrs(f, x, y, sm):
         render = render_gaussian_stars(img_size, img_size, x, y, f, psf_kernel=psf_kernel) + sm
         half = psf_kernel.shape[0] // 2
+        # Use the central pixel of the binned oversampled PSF as the effective peak for SNR calculation
         star_peak = psf_kernel[half, half]
         N_eff = 1.0 / (np.sum(psf_kernel**2) + 1e-9)
         l_sky = map_coordinates(sm, [y, x], order=1, mode='nearest')

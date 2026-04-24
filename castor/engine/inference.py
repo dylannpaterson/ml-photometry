@@ -103,7 +103,7 @@ def generate_custom_inference_prior(star_catalog, img_size, sigma=1.0, device='c
     
     return prior_map.cpu().numpy()
 
-from castor.data.stage0_gaussian import render_gaussian_stars, get_gaussian_psf
+from castor.data.stage0_gaussian import render_gaussian_stars, get_gaussian_psf, get_oversampled_gaussian_psf
 
 class InferenceEngine:
     """
@@ -161,7 +161,7 @@ class InferenceEngine:
             A centered Gaussian PSF of size SHAPE_SIZE.
         """
         # Centralized Source of Truth (Uses value from config)
-        return get_gaussian_psf(sigma=self.sigma, kernel_size=SHAPE_SIZE)
+        return get_oversampled_gaussian_psf(sigma_detector=self.sigma, grid_size=SHAPE_SIZE, oversample=4)
 
     def predict(self, image_tensor, threshold=0.1, prior_map=None, chunk_median=None):
         """
@@ -238,11 +238,19 @@ class InferenceEngine:
                 for k in range(K):
                     p, dx, dy, physical_flux = prediction[y, x, k, :4]
                     if p > threshold:
+                        # physical_flux is already linear!
+                        
                         # Uncertainty Estimates (Log-variance)
                         log_vars = prediction[y, x, k, 4:7]
                         sigmas = np.exp(0.5 * log_vars)
                         
-                        predicted_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, float(physical_flux), p, sigmas))
+                        # Fix the Photometric Sigma propagation for your plots
+                        # cosh(arcsinh(F/S)) = sqrt(1 + (F/S)^2)
+                        scaled_f = physical_flux / self.stretch_scale
+                        sigma_f_linear = self.stretch_scale * np.sqrt(1 + scaled_f**2) * sigmas[2]
+                        linear_sigmas = np.array([sigmas[0], sigmas[1], sigma_f_linear])
+                        
+                        predicted_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, float(physical_flux), float(p), linear_sigmas))
                             
         return predicted_stars, bg_map
 
