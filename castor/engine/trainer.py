@@ -450,11 +450,6 @@ class Trainer:
                 
                 # Scale loss by accumulation steps
                 loss = loss / self.accumulation_steps
-                
-                diffraction_reg = self.model.diffraction_filter.get_regularization_loss()
-                reg_loss_val = diffraction_reg.item()
-                reg_loss = (self.lambda_diffraction * diffraction_reg) / self.accumulation_steps
-                loss += reg_loss
 
                 if torch.isnan(loss):
                     print(f"⚠️ NaN detected at step {i}"); continue
@@ -495,9 +490,7 @@ class Trainer:
                 if i % 100 == 0:
                     current_lr = self.optimizer.param_groups[0]['lr']
                     # Component losses p_loss, po_loss, etc. are already scaled inside compute_grid_loss
-                    # reg_loss is calculated locally and also scaled by lambda_diffraction
-                    scaled_reg = reg_loss.item() * self.accumulation_steps
-                    print(f"Epoch [{epoch+1}/{self.epochs}], Step [{i}/{len(self.train_loader)}], LR: {current_lr:.6f}, Loss: {loss.item()*self.accumulation_steps:.4f} (P:{p_loss.item():.4f}, Pos:{po_loss.item():.4f}, F:{f_loss.item():.4f}, B:{b_loss.item():.4f}, Curv:{c_loss.item():.4f}, Ent:{e_loss.item():.4f}, DReg:{scaled_reg:.6f})")
+                    print(f"Epoch [{epoch+1}/{self.epochs}], Step [{i}/{len(self.train_loader)}], LR: {current_lr:.6f}, Loss: {loss.item()*self.accumulation_steps:.4f} (P:{p_loss.item():.4f}, Pos:{po_loss.item():.4f}, F:{f_loss.item():.4f}, B:{b_loss.item():.4f}, Curv:{c_loss.item():.4f}, Ent:{e_loss.item():.4f})")
 
             avg_epoch_loss = epoch_loss/len(self.train_loader)
             print(f"==> Epoch {epoch+1} Complete | Avg Loss: {avg_epoch_loss:.4f} | Time: {time.time()-start_time:.1f}s")
