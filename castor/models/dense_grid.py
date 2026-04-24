@@ -105,88 +105,22 @@ class FPNBlock(nn.Module):
         # low_res comes from deeper in the network, needs upsampling
         return self.smooth(self.lateral(high_res) + self.up(low_res))
 
-class DiffractionAwareFilter(nn.Module):
+class LearnedOpticalStem(nn.Module):
     """
-    Mexican Hat (Laplacian of Gaussian) filter for diffraction-aware preprocessing.
-
-    Attributes
-    ----------
-    conv : nn.Conv2d
-        The convolutional layer with the LoG kernel.
-    init_weight : torch.Tensor
-        The initial analytical LoG kernel preserved for regularization.
+    A 16-channel physics-agnostic front end. 
+    Learns a dictionary of optical shapes (spikes, cores, blobs) directly from the data.
     """
-    def __init__(self, kernel_size=21, sigma=3.0):
-        """
-        Initialize DiffractionAwareFilter.
-
-        Parameters
-        ----------
-        kernel_size : int, optional
-            Size of the filter kernel, by default 21.
-        sigma : float, optional
-            Gaussian sigma for the Mexican Hat, by default 3.0.
-        """
-        super(DiffractionAwareFilter, self).__init__()
-
-        # 1 in channel (raw flux), 1 out channel (filter response)
-        self.conv = nn.Conv2d(1, 1, kernel_size=kernel_size, padding=kernel_size//2, bias=False)
-
-        # Generate Analytical Mexican Hat Prior
-        kernel = self._generate_mexican_hat(kernel_size, sigma)
-        print("🛰️ DiffractionAwareFilter: Initialized with Analytical Mexican Hat")
-
-        # Zero-mean and normalize (Acts as a high-pass/edge-like detector)
-        kernel = kernel - kernel.mean()
-        kernel = kernel / (torch.max(torch.abs(kernel)) + 1e-9)
-
-        initial_weight = kernel.view(1, 1, kernel_size, kernel_size).float()
-        self.conv.weight.data = initial_weight.clone()
-        self.register_buffer("init_weight", initial_weight)
-        self.conv.weight.requires_grad = True
-
-    def _generate_mexican_hat(self, kernel_size, sigma):
-        """Generates the 2D Mexican Hat (Laplacian of Gaussian) kernel."""
-        device = self.conv.weight.device
-        grid = torch.arange(-kernel_size // 2 + 1., kernel_size // 2 + 1., device=device, dtype=torch.float32)
-        y, x = torch.meshgrid(grid, grid, indexing='ij')
-        r2 = x**2 + y**2
-
-        # LoG Formula
-        pi = torch.tensor(np.pi, device=device, dtype=torch.float32)
-        kernel = -(1.0 / (pi * sigma**4)) * (1.0 - r2 / (2 * sigma**2)) * torch.exp(-r2 / (2 * sigma**2))
-        return kernel
-
-    def get_regularization_loss(self):
-        """
-        Calculates the L2 distance from the initial LoG kernel.
-
-        This prevents the filter from drifting into a random conv layer 
-        during training.
-
-        Returns
-        -------
-        torch.Tensor
-            The L2 regularization loss value.
-        """
-        return torch.sum((self.conv.weight - self.init_weight) ** 2)
+    def __init__(self, kernel_size=21):
+        super(LearnedOpticalStem, self).__init__()
+        # 1 in channel, 16 out channels to capture diverse optical features
+        self.conv = nn.Conv2d(1, 16, kernel_size=kernel_size, padding=kernel_size//2, bias=False)
+        
+        # Standard Kaiming initialization allows it to organically adapt to any PSF
+        nn.init.kaiming_normal_(self.conv.weight, mode='fan_out', nonlinearity='relu')
 
     def forward(self, x):
-        """
-        Forward pass.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Raw input image tensor [B, 1, H, W].
-
-        Returns
-        -------
-        torch.Tensor
-            Concatenated original image and filtered response [B, 2, H, W].
-        """
-        # Concatenate the original raw image with the filtered response
-        # Output shape: [Batch, 2, H, W]
+        # Concatenate the 1 raw image channel with the 16 learned feature channels
+        # Output shape: [Batch, 17, H, W]
         return torch.cat([x, self.conv(x)], dim=1)
 
 def convert_bn_to_gn(module, num_groups=8):
@@ -230,8 +164,8 @@ class DenseGridModel(nn.Module):
         The scale used for arcsinh flux stretching.
     num_output_channels : int
         Total number of output channels in the prediction head.
-    diffraction_filter : DiffractionAwareFilter
-        Initial physics-aware filtering layer.
+    optical_stem : LearnedOpticalStem
+        Learned optical feature extraction stem.
     initial, layer1, layer2, layer3, layer4 : nn.Module
         ResNet backbone components.
     top_layer, fpn3, fpn2, fpn1 : nn.Module
@@ -261,8 +195,8 @@ class DenseGridModel(nn.Module):
         self.stretch_scale = float(stretch_scale)
         self.num_output_channels = self.K * 7 + 1
 
-        # 1. Physics Prior Filter
-        self.diffraction_filter = DiffractionAwareFilter(kernel_size=21)
+        # 1. Learned Optical Dictionary (Front Door)
+        self.optical_stem = LearnedOpticalStem(kernel_size=21)
 
         # 2. Backbone: ResNet-34 with GroupNorm and GELU
         resnet = models.resnet34(weights=None)
@@ -274,8 +208,8 @@ class DenseGridModel(nn.Module):
         swap_relu_with_gelu(resnet)
 
         self.initial = nn.Sequential(
-            # 3 Channels: Raw Image, Physics Filter response, Confidence Prior
-            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
+            # 18 Channels: 1 Raw + 16 Optical Stem + 1 Prior
+            nn.Conv2d(18, 64, kernel_size=7, stride=2, padding=3, bias=False),
             resnet.bn1, # This is now GroupNorm
             nn.GELU(),
             # Replace MaxPool with AvgPool to mathematically conserve flux during downsampling
@@ -317,16 +251,16 @@ class DenseGridModel(nn.Module):
             Dictionary containing predicted stars, background, and uncertainty.
         """
         # Bottom-up
-        # 1. Pass through trainable physics prior (Outputs 2 channels: Raw, Filtered)
-        x_physics = self.diffraction_filter(x)
+        # 1. Pass through learned optical stem (Outputs 17 channels: 1 Raw, 16 Features)
+        x_stem = self.optical_stem(x)
         
-        # 2. Add the 3rd channel: Confidence Prior
+        # 2. Add the 18th channel: Confidence Prior
         if prior is None:
             prior = torch.zeros_like(x)
         
-        x_combined = torch.cat([x_physics, prior], dim=1)
+        x_combined = torch.cat([x_stem, prior], dim=1)
         
-        # 3. Feed 3-channel input into ResNet
+        # 3. Feed 18-channel input into ResNet
         c0 = self.initial(x_combined)
         c1 = self.layer1(c0)
         c2 = self.layer2(c1)

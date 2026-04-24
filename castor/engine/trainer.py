@@ -295,7 +295,6 @@ class Trainer:
             self.loss_params.update(stage_cfg["loss_params"])
             
         self.loss_params["stretch_scale"] = config.get("data_params", {}).get("GLOBAL_STRETCH_SCALE", GLOBAL_STRETCH_SCALE)
-        self.lambda_diffraction = self.loss_params.pop("lambda_diffraction_reg", 10.0)
 
     def resume(self, checkpoint_path=None):
         """
