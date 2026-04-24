@@ -189,16 +189,18 @@ class DiffractionAwareFilter(nn.Module):
         # Output shape: [Batch, 2, H, W]
         return torch.cat([x, self.conv(x)], dim=1)
 
-def convert_bn_to_gn(module, num_groups=32):
+def convert_bn_to_gn(module, num_groups=8):
     """
     Recursively replaces BatchNorm2d with GroupNorm.
+    
+    Using fewer groups (8 instead of 32) helps preserve absolute intensity
+    information which is critical for photometric flux recovery.
     """
     for name, child in module.named_children():
         if isinstance(child, nn.BatchNorm2d):
             num_channels = child.num_features
-            # Ensure num_channels is divisible by groups. 32 is standard.
-            # If channels < 32 (like 16 or 8), use channels as groups (InstanceNorm).
-            groups = 32 if num_channels >= 32 else num_channels
+            # Ensure num_channels is divisible by groups. 8 is a good balance.
+            groups = num_groups if num_channels % num_groups == 0 else num_channels
             setattr(module, name, nn.GroupNorm(groups, num_channels))
         else:
             convert_bn_to_gn(child, num_groups)

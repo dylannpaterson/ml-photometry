@@ -238,17 +238,20 @@ class InferenceEngine:
                 for k in range(K):
                     p, dx, dy, physical_flux = prediction[y, x, k, :4]
                     if p > threshold:
-                        # physical_flux is already linear!
+                        # physical_flux is already linear (sinh'd by model)
                         
-                        # Uncertainty Estimates (Log-variance)
+                        # Uncertainty Estimates (Log-variance in arcsinh space)
                         log_vars = prediction[y, x, k, 4:7]
-                        sigmas = np.exp(0.5 * log_vars)
+                        sigmas_arcsinh = np.exp(0.5 * log_vars) # sigma_x, sigma_y, sigma_flux_arcsinh
                         
-                        # Fix the Photometric Sigma propagation for your plots
-                        # cosh(arcsinh(F/S)) = sqrt(1 + (F/S)^2)
+                        # Convert arcsinh flux uncertainty to linear space
+                        # d/dx sinh(x) = cosh(x)
+                        # sigma_linear = d_sinh(arcsinh_flux) * sigma_arcsinh * stretch_scale
+                        # cosh(arcsinh(f/S)) = sqrt(1 + (f/S)**2)
                         scaled_f = physical_flux / self.stretch_scale
-                        sigma_f_linear = self.stretch_scale * np.sqrt(1 + scaled_f**2) * sigmas[2]
-                        linear_sigmas = np.array([sigmas[0], sigmas[1], sigma_f_linear])
+                        sigma_f_linear = self.stretch_scale * np.sqrt(1 + scaled_f**2) * sigmas_arcsinh[2]
+                        
+                        linear_sigmas = np.array([sigmas_arcsinh[0], sigmas_arcsinh[1], sigma_f_linear])
                         
                         predicted_stars.append(((x * cell_size) + dx, (y * cell_size) + dy, float(physical_flux), float(p), linear_sigmas))
                             

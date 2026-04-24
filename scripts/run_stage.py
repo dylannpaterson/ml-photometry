@@ -80,8 +80,9 @@ def load_stage_model(stage_idx, device, config, checkpoint_path=None):
     S = data_cfg.get("shape_size", SHAPE_SIZE)
     # Get cell_size from stage config, default to DEFAULT_CELL_SIZE
     cell_size = stage_cfg.get("cell_size", DEFAULT_CELL_SIZE)
+    stretch_scale = data_cfg.get("GLOBAL_STRETCH_SCALE", GLOBAL_STRETCH_SCALE)
     
-    model = DenseGridModel(K=K, shape_size=S, cell_size=cell_size).to(device)
+    model = DenseGridModel(K=K, shape_size=S, cell_size=cell_size, stretch_scale=stretch_scale).to(device)
     
     # Handle full checkpoint dict or raw state dict
     ckpt = torch.load(checkpoint_path, map_location=device)
@@ -303,7 +304,7 @@ def run_train(stage_idx, config, device):
     )
 
     # Model Setup
-    model = DenseGridModel(K=K, shape_size=S, cell_size=cell_size).to(device)
+    model = DenseGridModel(K=K, shape_size=S, cell_size=cell_size, stretch_scale=stretch_scale).to(device)
     
     # Custom Trainer Setup
     trainer = Trainer(
