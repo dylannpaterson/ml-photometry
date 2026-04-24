@@ -315,13 +315,13 @@ class InferenceEngine:
         h_missed_stars = [hero_true[i] for i in range(len(hero_true)) if i not in h_matched_true_indices and hero_true[i][0] >= 0.1]
         h_rec_missed_linear = fftconvolve(draw_stars_on_grid(h_missed_stars, H, W, False), flipped_psf, mode='same')
 
-        # Convert backgrounds (properly un-stretching them)
-        full_bg_stretched = upsample_background(bg_map.squeeze(), (H, W))
-        full_gt_bg_stretched = upsample_background(gt_bg_map.squeeze(), (H, W))
+        # Convert low-res grid to absolute linear photons FIRST
+        bg_linear_lowres = self.transform.network_to_image(bg_map.squeeze(), chunk_median)
+        gt_bg_linear_lowres = self.transform.network_to_image(gt_bg_map.squeeze(), chunk_median)
 
-        # Pass through the transform to reverse arcsinh and add the median
-        full_bg_abs = self.transform.network_to_image(full_bg_stretched, chunk_median)
-        full_gt_bg_abs = self.transform.network_to_image(full_gt_bg_stretched, chunk_median)
+        # THEN upsample in linear physical space
+        full_bg_abs = upsample_background(bg_linear_lowres, (H, W))
+        full_gt_bg_abs = upsample_background(gt_bg_linear_lowres, (H, W))
 
         h_rec_abs = h_rec_stars_linear + full_bg_abs
         img_linear_abs = self.transform.network_to_image(img_stretched, chunk_median)
