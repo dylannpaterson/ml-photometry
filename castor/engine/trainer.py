@@ -138,41 +138,25 @@ def render_confidence_prior(targets, img_size, cell_size, K, max_jitter=0.4, fwh
     all_cx = all_cx + jitter_x
     all_cy = all_cy + jitter_y
 
-    # Anchors and sub-pixel remainders
-    # 🚀 SAFE CLAMPING: We need a 2x2 splat starting at (x0, y0)
-    # So anchors x0 must be in [0, img_size - 2]
-    all_cx = torch.clamp(all_cx, 0.0, float(img_size - 2.0))
-    all_cy = torch.clamp(all_cy, 0.0, float(img_size - 2.0))
+    # 🚀 FIX: Nearest-Neighbor Integer Snapping
+    # Round to the nearest integer pixel instead of flooring.
+    # This completely removes sub-pixel (dx, dy) information from the prior.
+    x_int = torch.round(all_cx).long()
+    y_int = torch.round(all_cy).long()
     
-    x0 = torch.floor(all_cx).long()
-    y0 = torch.floor(all_cy).long()
-    dx = all_cx - x0.float()
-    dy = all_cy - y0.float()
+    # Safe clamping to grid boundaries
+    x_int = torch.clamp(x_int, 0, img_size - 1)
+    y_int = torch.clamp(y_int, 0, img_size - 1)
     
-    # Bilinear weights scaled by P
-    w00 = (1 - dx) * (1 - dy) * all_p
-    w10 = dx * (1 - dy) * all_p
-    w01 = (1 - dx) * dy * all_p
-    w11 = dx * dy * all_p
-    
-    # Flattened indices for 4 corners
+    # Flattened indices for a single pixel
     img_stride = img_size
     batch_stride = img_size * img_size
-    
-    # Index = batch_offset + y_offset + x_offset
-    idx00 = all_batch_idx * batch_stride + y0 * img_stride + x0
-    idx10 = idx00 + 1
-    idx01 = idx00 + img_stride
-    idx11 = idx01 + 1
+    idx = all_batch_idx * batch_stride + y_int * img_stride + x_int
     
     prior_flat = torch.zeros(B * batch_stride, device=device)
     
-    # Scatter add handles overlapping stars naturally
-    # Ensure 1D to prevent "Index tensor must have the same number of dimensions as self tensor"
-    prior_flat.scatter_add_(0, idx00.view(-1), w00.view(-1))
-    prior_flat.scatter_add_(0, idx10.view(-1), w10.view(-1))
-    prior_flat.scatter_add_(0, idx01.view(-1), w01.view(-1))
-    prior_flat.scatter_add_(0, idx11.view(-1), w11.view(-1))
+    # Scatter the probability 'P' directly into the single rounded pixel
+    prior_flat.scatter_add_(0, idx.view(-1), all_p.view(-1))
     
     return prior_flat.view(B, 1, img_size, img_size)
 
@@ -450,6 +434,7 @@ class Trainer:
                 loss, p_loss, po_loss, f_loss, b_loss, c_loss, e_loss = compute_grid_loss(
                     preds_fp32, targets, 
                     current_epoch=epoch,
+                    optical_stem_reference=self.model.module.optical_stem if hasattr(self.model, 'module') else self.model.optical_stem,
                     **self.loss_params
                 )
                 
@@ -646,7 +631,9 @@ class Trainer:
                 
                 preds_fp32 = {k: v.float() for k, v in preds.items()}
                 loss, _, _, _, _, _, _ = compute_grid_loss(
-                    preds_fp32, targets, current_epoch=current_epoch, **self.loss_params
+                    preds_fp32, targets, current_epoch=current_epoch,
+                    optical_stem_reference=self.model.module.optical_stem if hasattr(self.model, 'module') else self.model.optical_stem,
+                    **self.loss_params
                 )
                 val_loss += loss.item()
 

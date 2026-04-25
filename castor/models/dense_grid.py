@@ -115,8 +115,10 @@ class LearnedOpticalStem(nn.Module):
         # 1 in channel, 16 out channels to capture diverse optical features
         self.conv = nn.Conv2d(1, 16, kernel_size=kernel_size, padding=kernel_size//2, bias=False)
         
-        # Standard Kaiming initialization allows it to organically adapt to any PSF
-        nn.init.kaiming_normal_(self.conv.weight, mode='fan_out', nonlinearity='relu')
+        # FIX: Tamed Initialization
+        # Instead of kaiming_normal_ (which creates loud random noise), 
+        # initialize near-zero so the raw image channel dominates early training.
+        nn.init.normal_(self.conv.weight, mean=0.0, std=0.01)
 
     def forward(self, x):
         # Concatenate the 1 raw image channel with the 16 learned feature channels
@@ -452,10 +454,18 @@ def compute_relative_entropy_loss(bg_pred):
     # Formulation: exp(d) - d - 1
     # This is 0 when x == prior_mesh, explodes when x << prior_mesh.
     penalty_map = torch.exp(diff_clamped) - diff_clamped - 1.0
-    
+
     return penalty_map.mean()
 
-def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=1.0, lambda_pos=1.0, lambda_flux=1.0, lambda_bg=1.0, lambda_curvature=1.0, focal_alpha=0.50, focal_gamma=2.0, stretch_scale=GLOBAL_STRETCH_SCALE, current_epoch=None, **kwargs):
+def compute_dreg_loss(optical_stem):
+    """
+    L2 penalty on the stem's convolution weights to keep them smooth.
+    """
+    if optical_stem is None:
+        return torch.tensor(0.0)
+    return torch.sum(optical_stem.conv.weight ** 2)
+
+def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=1.0, lambda_pos=1.0, lambda_flux=1.0, lambda_bg=1.0, lambda_curvature=1.0, focal_alpha=0.50, focal_gamma=2.0, stretch_scale=GLOBAL_STRETCH_SCALE, current_epoch=None, optical_stem_reference=None, **kwargs):
     """
     Refactored loss using Aleatoric Uncertainty Estimation (NLL).
 
@@ -475,6 +485,8 @@ def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=1.0, lambda_pos=
         Arcsinh stretch scale, by default GLOBAL_STRETCH_SCALE.
     current_epoch : int, optional
         Current training epoch, by default None.
+    optical_stem_reference : nn.Module, optional
+        The optical stem to regularize, by default None.
     **kwargs : dict
         Additional parameters like lambda_entropy.
 
@@ -551,6 +563,11 @@ def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=1.0, lambda_pos=
     raw_curvature_loss = compute_curvature_loss(bg_preds)
     raw_entropy_loss = compute_relative_entropy_loss(bg_preds)
     
+    # 5. Diffraction Regularization
+    raw_dreg_loss = compute_dreg_loss(optical_stem_reference)
+    if optical_stem_reference is not None:
+        raw_dreg_loss = raw_dreg_loss.to(star_preds.device)
+    
     # --- STATIC WEIGHTING ---
     prob_loss = lambda_prob * raw_prob_loss
     pos_loss = lambda_pos * raw_pos_loss
@@ -562,6 +579,9 @@ def compute_grid_loss(preds, targets, pca_std=None, lambda_prob=1.0, lambda_pos=
     lambda_entropy = kwargs.get("lambda_entropy", 1.0)
     ent_loss = lambda_entropy * raw_entropy_loss
     
-    total_loss = (prob_loss + pos_loss + flux_loss + bg_loss + curv_loss + ent_loss)
+    lambda_diffraction_reg = kwargs.get("lambda_diffraction_reg", 10.0)
+    dreg_loss = lambda_diffraction_reg * raw_dreg_loss
+    
+    total_loss = (prob_loss + pos_loss + flux_loss + bg_loss + curv_loss + ent_loss + dreg_loss)
                   
     return total_loss, prob_loss, pos_loss, flux_loss, bg_loss, curv_loss, ent_loss
