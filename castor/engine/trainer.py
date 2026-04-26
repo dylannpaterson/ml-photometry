@@ -127,8 +127,14 @@ def render_confidence_prior(targets, img_size, cell_size, K, max_jitter=0.4, fwh
     all_snr = torch.cat([all_snr, poison_snr])
     
     # --- DYNAMIC SNR-BASED JITTER (Cramér-Rao Lower Bound) ---
+    # 🚀 FIX: Handle per-batch FWHM tensor by indexing with all_batch_idx
+    if torch.is_tensor(fwhm) and fwhm.dim() > 0:
+        fwhm_per_star = fwhm.view(-1)[all_batch_idx]
+    else:
+        fwhm_per_star = fwhm
+
     snr_safe = torch.clamp(all_snr, min=1.0)
-    theoretical_sigma = fwhm / (2.355 * snr_safe)
+    theoretical_sigma = fwhm_per_star / (2.355 * snr_safe)
     dynamic_jitter = torch.sqrt(theoretical_sigma**2 + sys_floor**2)
     dynamic_jitter = torch.clamp(dynamic_jitter, max=max_jitter)
 
