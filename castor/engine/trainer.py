@@ -70,22 +70,23 @@ def render_confidence_prior(targets, img_size, cell_size, K, max_jitter=0.4, fwh
     torch.Tensor
         The rendered prior map of shape [B, 1, img_size, img_size].
     """
-    B, GH, GW, _ = targets.shape
+    B_actual = targets.size(0)
+    GH, GW = targets.shape[1], targets.shape[2]
     device = targets.device
     
     # 1. Extract targets
     num_params = (targets.shape[-1] - 1) // K
-    star_targets = targets[..., :-1].view(B, GH, GW, K, num_params)
+    star_targets = targets[..., :-1].view(B_actual, GH, GW, K, num_params)
     p_targets = star_targets[..., 0]
     dx_targets = star_targets[..., 1]
     dy_targets = star_targets[..., 2]
     snr_targets = star_targets[..., 4]
     
     # Flatten across spatial and K dimensions: [B, GH*GW*K]
-    p_flat = p_targets.reshape(B, -1)
-    dx_flat = dx_targets.reshape(B, -1)
-    dy_flat = dy_targets.reshape(B, -1)
-    snr_flat = snr_targets.reshape(B, -1)
+    p_flat = p_targets.reshape(B_actual, -1)
+    dx_flat = dx_targets.reshape(B_actual, -1)
+    dy_flat = dy_targets.reshape(B_actual, -1)
+    snr_flat = snr_targets.reshape(B_actual, -1)
     
     # 2. Create Global Coordinate Grid
     grid_y, grid_x = torch.meshgrid(
@@ -111,12 +112,12 @@ def render_confidence_prior(targets, img_size, cell_size, K, max_jitter=0.4, fwh
     
     # --- INJECT POISON (False Positives) ---
     num_poison = 5
-    poison_batch_idx = torch.arange(B, device=device).view(-1, 1).expand(-1, num_poison).reshape(-1)
-    poison_cx = torch.rand((B * num_poison,), device=device) * (img_size - 1)
-    poison_cy = torch.rand((B * num_poison,), device=device) * (img_size - 1)
-    poison_p = torch.empty((B * num_poison,), device=device).uniform_(0.5, 0.95)
+    poison_batch_idx = torch.arange(B_actual, device=device).view(-1, 1).expand(-1, num_poison).reshape(-1)
+    poison_cx = torch.rand((B_actual * num_poison,), device=device) * (img_size - 1)
+    poison_cy = torch.rand((B_actual * num_poison,), device=device) * (img_size - 1)
+    poison_p = torch.empty((B_actual * num_poison,), device=device).uniform_(0.5, 0.95)
     # Poison stars have low SNR for high uncertainty
-    poison_snr = torch.empty((B * num_poison,), device=device).uniform_(1.0, 3.0)
+    poison_snr = torch.empty((B_actual * num_poison,), device=device).uniform_(1.0, 3.0)
     
     # Combine
     all_batch_idx = torch.cat([batch_idx, poison_batch_idx])
@@ -153,12 +154,12 @@ def render_confidence_prior(targets, img_size, cell_size, K, max_jitter=0.4, fwh
     batch_stride = img_size * img_size
     idx = all_batch_idx * batch_stride + y_int * img_stride + x_int
     
-    prior_flat = torch.zeros(B * batch_stride, device=device)
+    prior_flat = torch.zeros(B_actual * batch_stride, device=device)
     
     # Scatter the probability 'P' directly into the single rounded pixel
     prior_flat.scatter_add_(0, idx.view(-1), all_p.view(-1))
     
-    return prior_flat.view(B, 1, img_size, img_size)
+    return prior_flat.view(B_actual, 1, img_size, img_size)
 
 class Trainer:
     """
@@ -337,118 +338,130 @@ class Trainer:
             
             for i, batch in enumerate(self.train_loader):
                 if isinstance(batch, dict):
-                    images = batch["image"].to(self.device, non_blocking=True)
-                    targets = batch["target"].to(self.device, non_blocking=True).float()
+                    images_full = batch["image"].to(self.device, non_blocking=True)
+                    targets_full = batch["target"].to(self.device, non_blocking=True).float()
                 else:
-                    images, targets = batch
-                    images, targets = images.to(self.device, non_blocking=True), targets.to(self.device, non_blocking=True).float()
+                    images_full, targets_full = batch
+                    images_full, targets_full = images_full.to(self.device, non_blocking=True), targets_full.to(self.device, non_blocking=True).float()
                 
-                # Ensure channel dimension [B, 1, H, W]
-                if images.dim() == 3:
-                    images = images.unsqueeze(1)
+                # --- GRADIENT ACCUMULATION / MICRO-BATCHING ---
+                B_total = images_full.size(0)
+                num_micro_batches = (B_total + self.micro_batch_size - 1) // self.micro_batch_size
                 
-                # --- LIVE NOISE INJECTION ---
-                images_positive = torch.clamp(images, min=0.0) 
-                images_noisy = torch.poisson(images_positive)
-                
-                # Defensive check: Stage 1 has 17 elements (read_noise is at index 12). Stage 0 has 6.
-                if isinstance(batch, dict) and "meta" in batch and batch["meta"].shape[1] >= 17:
-                    # Stage 1: Inject exact dynamic read noise for this domain
-                    batch_read_noise = batch["meta"][:, 12].to(self.device, non_blocking=True).float().view(-1, 1, 1, 1)
-                else:
-                    # Stage 0: Fallback to static config default
-                    batch_read_noise = 5.0
-                
-                images_noisy += torch.randn_like(images_noisy) * batch_read_noise
-                
-                if isinstance(batch, dict) and "chunk_median" in batch:
-                    batch_medians = batch["chunk_median"].to(self.device, non_blocking=True).float().view(-1, 1, 1, 1)
-                else:
-                    batch_medians = images_noisy.view(images_noisy.shape[0], -1).median(dim=1)[0].view(-1, 1, 1, 1)
-                
-                images_final = torch.asinh((images_noisy - batch_medians) / self.loss_params["stretch_scale"])
-                
-                # --- DYNAMIC TARGET STRETCHING ---
-                # 1. Stretch Star Fluxes (Index 3 in the [p, dx, dy, flux, snr] layout)
-                B_idx, GH_idx, GW_idx, C_idx = targets.shape
-                num_params_idx = (C_idx - 1) // K
-                star_view = targets[..., :-1].reshape(B_idx, GH_idx, GW_idx, K, num_params_idx)
-                
-                # Arcsinh stretch the flux
-                star_view[..., 3] = torch.asinh(star_view[..., 3] / self.loss_params["stretch_scale"])
-                # ✅ WRITE BACK TO TARGETS
-                targets[..., :-1] = star_view.reshape(B_idx, GH_idx, GW_idx, -1)
-                
-                # 2. Stretch Background (Subtract median, then stretch)
-                bg_raw = targets[..., -1:]
-                bg_network = torch.asinh((bg_raw - batch_medians) / self.loss_params["stretch_scale"])
-                targets[..., -1:] = bg_network
-                
-                # --- LIVE CONFIDENCE PRIOR GENERATION ---
-                with torch.no_grad():
-                    B, GH, GW, _ = targets.shape
-                    num_params = (targets.shape[-1] - 1) // K
-                    st_view_orig = targets[..., :-1].view(B, GH, GW, K, num_params)
-                    p_targets = st_view_orig[..., 0]
+                for mb in range(num_micro_batches):
+                    start = mb * self.micro_batch_size
+                    end = min(start + self.micro_batch_size, B_total)
                     
-                    # 🚀 ROBUSTNESS FIX: Drop out 30% of true stars to simulate an incomplete catalog.
-                    # This forces the network to look at the image to find the missing ones.
-                    survival_chance = p_targets * 0.7 
-                    prior_mask = torch.rand_like(p_targets) < survival_chance
+                    images = images_full[start:end]
+                    targets = targets_full[start:end]
                     
-                    partial_targets = targets.clone()
-                    st_view = partial_targets[..., :-1].view(B, GH, GW, K, num_params)
-                    st_view[~prior_mask] = 0.0
+                    # Ensure channel dimension [B, 1, H, W]
+                    if images.dim() == 3:
+                        images = images.unsqueeze(1)
                     
-                    # Render bilinear splat prior map (1 channel)
-                    # Stage 1 & Updated Stage 0: Use dynamic FWHM from metadata [index 3]
-                    if isinstance(batch, dict) and "meta" in batch and batch["meta"].shape[1] >= 4:
-                        calculated_fwhm = batch["meta"][:, 3].to(self.device, non_blocking=True).float().view(-1, 1, 1, 1)
+                    # --- LIVE NOISE INJECTION ---
+                    images_positive = torch.clamp(images, min=0.0) 
+                    images_noisy = torch.poisson(images_positive)
+                    
+                    # Defensive check: Stage 1 has 17 elements (read_noise is at index 12). Stage 0 has 6.
+                    if isinstance(batch, dict) and "meta" in batch and batch["meta"].shape[1] >= 17:
+                        # Stage 1: Inject exact dynamic read noise for this domain
+                        batch_read_noise = batch["meta"][start:end, 12].to(self.device, non_blocking=True).float().view(-1, 1, 1, 1)
                     else:
-                        # Fallback to static config default (Roman baseline)
-                        sigma_fixed = self.config.get("data_params", {}).get("physics_params", {}).get("sigma_fixed", 0.405)
-                        calculated_fwhm = sigma_fixed * 2.355
-
-                    prior_map = render_confidence_prior(
-                        partial_targets, img_size, cell_size, K, 
-                        max_jitter=0.4, fwhm=calculated_fwhm, sys_floor=0.01
-                    )
-
-                # 🚀 ROBUSTNESS FIX: Temporarily Disable Prior Map (Epoch 0-14)
-                # Force the network to learn detection from raw pixels first.
-                if epoch < 15:
-                    prior_map = torch.zeros_like(prior_map)
-                # 🚀 ROBUSTNESS FIX: 50% chance to drop the entire prior map (Epoch 15+).
-                # Forces the network to learn blind detection half the time!
-                elif torch.rand(1).item() < 0.50:
-                    prior_map = torch.zeros_like(prior_map)
-
-                if self.use_cuda:
-                    with torch.autocast(device_type='cuda', dtype=torch.float16):
-                        preds = self.model(images_final, prior=prior_map)
-                else:
-                    preds = self.model(images_final, prior=prior_map)
-                
-                preds_fp32 = {k: v.float() for k, v in preds.items()}
-                
-                loss, p_loss, po_loss, f_loss, b_loss, c_loss, e_loss = compute_grid_loss(
-                    preds_fp32, targets, 
-                    current_epoch=epoch,
-                    optical_stem_reference=self.model.module.optical_stem if hasattr(self.model, 'module') else self.model.optical_stem,
-                    **self.loss_params
-                )
-                
-                # Scale loss by accumulation steps
-                loss = loss / self.accumulation_steps
-
-                if torch.isnan(loss):
-                    print(f"⚠️ NaN detected at step {i}"); continue
+                        # Stage 0: Fallback to static config default
+                        batch_read_noise = 5.0
                     
-                # 3. Backward Pass
-                if self.scaler:
-                    self.scaler.scale(loss).backward()
-                else:
-                    loss.backward()
+                    images_noisy += torch.randn_like(images_noisy) * batch_read_noise
+                    
+                    if isinstance(batch, dict) and "chunk_median" in batch:
+                        batch_medians = batch["chunk_median"][start:end].to(self.device, non_blocking=True).float().view(-1, 1, 1, 1)
+                    else:
+                        batch_medians = images_noisy.view(images_noisy.shape[0], -1).median(dim=1)[0].view(-1, 1, 1, 1)
+                    
+                    images_final = torch.asinh((images_noisy - batch_medians) / self.loss_params["stretch_scale"])
+                    
+                    # --- DYNAMIC TARGET STRETCHING ---
+                    # 🚀 FIX: Clone targets for each micro-batch to prevent double-stretching during re-entry
+                    targets = targets.clone()
+                    B_mb, GH_idx, GW_idx, C_idx = targets.shape
+                    num_params_idx = (C_idx - 1) // K
+                    star_view = targets[..., :-1].reshape(B_mb, GH_idx, GW_idx, K, num_params_idx)
+                    
+                    # Arcsinh stretch the flux
+                    star_view[..., 3] = torch.asinh(star_view[..., 3] / self.loss_params["stretch_scale"])
+                    # ✅ WRITE BACK TO TARGETS
+                    targets[..., :-1] = star_view.reshape(B_mb, GH_idx, GW_idx, -1)
+                    
+                    # 2. Stretch Background (Subtract median, then stretch)
+                    bg_raw = targets[..., -1:]
+                    bg_network = torch.asinh((bg_raw - batch_medians) / self.loss_params["stretch_scale"])
+                    targets[..., -1:] = bg_network
+                    
+                    # --- LIVE CONFIDENCE PRIOR GENERATION ---
+                    with torch.no_grad():
+                        B_mb, GH, GW, _ = targets.shape
+                        num_params = (targets.shape[-1] - 1) // K
+                        st_view_orig = targets[..., :-1].view(B_mb, GH, GW, K, num_params)
+                        p_targets = st_view_orig[..., 0]
+                        
+                        # 🚀 ROBUSTNESS FIX: Drop out 30% of true stars to simulate an incomplete catalog.
+                        # This forces the network to look at the image to find the missing ones.
+                        survival_chance = p_targets * 0.7 
+                        prior_mask = torch.rand_like(p_targets) < survival_chance
+                        
+                        partial_targets = targets.clone()
+                        st_view = partial_targets[..., :-1].view(B_mb, GH, GW, K, num_params)
+                        st_view[~prior_mask] = 0.0
+                        
+                        # Render bilinear splat prior map (1 channel)
+                        # Stage 1 & Updated Stage 0: Use dynamic FWHM from metadata [index 3]
+                        if isinstance(batch, dict) and "meta" in batch and batch["meta"].shape[1] >= 4:
+                            calculated_fwhm = batch["meta"][start:end, 3].to(self.device, non_blocking=True).float().view(-1, 1, 1, 1)
+                        else:
+                            # Fallback to static config default (Roman baseline)
+                            sigma_fixed = self.config.get("data_params", {}).get("physics_params", {}).get("sigma_fixed", 0.405)
+                            calculated_fwhm = sigma_fixed * 2.355
+
+                        prior_map = render_confidence_prior(
+                            partial_targets, img_size, cell_size, K, 
+                            max_jitter=0.4, fwhm=calculated_fwhm, sys_floor=0.01
+                        )
+
+                    # 🚀 ROBUSTNESS FIX: Temporarily Disable Prior Map (Epoch 0-14)
+                    # Force the network to learn detection from raw pixels first.
+                    if epoch < 15:
+                        prior_map = torch.zeros_like(prior_map)
+                    # 🚀 ROBUSTNESS FIX: 50% chance to drop the entire prior map (Epoch 15+).
+                    # Forces the network to learn blind detection half the time!
+                    elif torch.rand(1).item() < 0.50:
+                        prior_map = torch.zeros_like(prior_map)
+
+                    if self.use_cuda:
+                        with torch.autocast(device_type='cuda', dtype=torch.float16):
+                            preds = self.model(images_final, prior=prior_map)
+                    else:
+                        preds = self.model(images_final, prior=prior_map)
+                    
+                    preds_fp32 = {k: v.float() for k, v in preds.items()}
+                    
+                    loss, p_loss, po_loss, f_loss, b_loss, c_loss, e_loss = compute_grid_loss(
+                        preds_fp32, targets, 
+                        current_epoch=epoch,
+                        optical_stem_reference=self.model.module.optical_stem if hasattr(self.model, 'module') else self.model.optical_stem,
+                        **self.loss_params
+                    )
+                    
+                    # Scale loss by accumulation steps * microbatches in this iteration
+                    loss = loss / (self.accumulation_steps * num_micro_batches)
+
+                    if torch.isnan(loss):
+                        print(f"⚠️ NaN detected at step {i}"); continue
+                        
+                    # 3. Backward Pass
+                    if self.scaler:
+                        self.scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
                 
                 # Optimizer Step (only every accumulation_steps)
                 if (i + 1) % self.accumulation_steps == 0 or (i + 1) == len(self.train_loader):
